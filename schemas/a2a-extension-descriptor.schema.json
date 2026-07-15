@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json",
+  "title": "A2AExtensionDescriptor",
+  "description": "Validates the two JSON shapes the AgentTrust A2A binding (RFC-0002) introduces: (a) the AgentExtension entry a provider declares under AgentCard.capabilities.extensions[], and (b) the trust metadata payload carried under Message.metadata['https://agenttrust.example/extensions/trust/v1']. The root schema accepts either shape; validate against #/definitions/agentExtension or #/definitions/trustMetadata to target one.",
+  "oneOf": [
+    { "$ref": "#/definitions/agentExtension" },
+    { "$ref": "#/definitions/trustMetadata" }
+  ],
+  "definitions": {
+    "agentExtension": {
+      "title": "AgentTrust AgentExtension declaration",
+      "description": "The A2A AgentExtension object declaring the AgentTrust extension on an Agent Card.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri"],
+      "properties": {
+        "uri": {
+          "const": "https://agenttrust.example/extensions/trust/v1",
+          "description": "The AgentTrust extension URI. This exact value identifies the extension in AgentCard.capabilities.extensions[], the A2A-Extensions HTTP header, Message.extensions[], and the Message.metadata namespace key."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional human-readable summary of what the extension provides."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "A2A AgentExtension.required. AgentTrust providers SHOULD declare false: the extension degrades gracefully for clients that do not opt in."
+        },
+        "params": {
+          "type": "object",
+          "description": "AgentTrust declaration parameters. Unknown keys are permitted for forward compatibility.",
+          "properties": {
+            "principal_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "principal_id (RFC-0001 Principal) under which this agent produces Evidence and accrues reputation."
+            },
+            "verification_service_url": {
+              "type": "string",
+              "pattern": "^https://",
+              "description": "HTTPS base URL of the verification service that resolves this agent's Principal, Verification Results, and Reputation Records."
+            }
+          }
+        }
+      }
+    },
+    "trustMetadata": {
+      "title": "AgentTrust message metadata payload",
+      "description": "The namespaced object carried under Message.metadata['https://agenttrust.example/extensions/trust/v1'] on task result messages.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence", "evidence_status"],
+      "properties": {
+        "evidence": {
+          "$ref": "evidence.schema.json",
+          "description": "The RFC-0001 Evidence bundle produced for the task."
+        },
+        "evidence_status": {
+          "type": "string",
+          "enum": ["pending", "verified", "rejected"],
+          "description": "Verification status of the evidence at send time. 'pending' means no independent Verification Result exists yet; 'verified'/'rejected' mirror the verifier's verdict."
+        },
+        "verification_result": {
+          "$ref": "verification-result.schema.json",
+          "description": "The RFC-0001 Verification Result backing a 'verified' or 'rejected' status. Absent while evidence_status is 'pending'."
+        }
+      }
+    }
+  }
+}

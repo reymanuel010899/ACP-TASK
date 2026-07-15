@@ -1,0 +1,47 @@
+{
+  "name": "TerraformSmith",
+  "description": "Generates and reviews Terraform infrastructure-as-code modules from natural-language requests.",
+  "url": "https://agents.example.com/terraformsmith/a2a/v1",
+  "version": "1.4.2",
+  "protocolVersion": "0.3.0",
+  "preferredTransport": "JSONRPC",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extensions": [
+      {
+        "uri": "https://agenttrust.example/extensions/trust/v1",
+        "description": "AgentTrust trust layer: signed sessions, machine-checkable Evidence on task results, independent verification, per-capability reputation.",
+        "required": false,
+        "params": {
+          "principal_id": "atp:principal:agents.example.com:terraformsmith",
+          "verification_service_url": "https://verify.agenttrust.example/v1"
+        }
+      }
+    ]
+  },
+  "securitySchemes": {
+    "bearer": {
+      "type": "http",
+      "scheme": "bearer",
+      "description": "OAuth 2.0 bearer token issued by agents.example.com."
+    }
+  },
+  "security": [{ "bearer": [] }],
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["application/json", "text/plain"],
+  "skills": [
+    {
+      "id": "terraform-generate",
+      "name": "Terraform module generation",
+      "description": "Generate a Terraform HCL module from a natural-language infrastructure request. Maps to AgentTrust capability 'terraform.generate'.",
+      "tags": ["terraform", "iac", "codegen"]
+    },
+    {
+      "id": "terraform-review",
+      "name": "Terraform plan review",
+      "description": "Review a terraform plan for risky changes. Maps to AgentTrust capability 'terraform.review'.",
+      "tags": ["terraform", "iac", "review"]
+    }
+  ]
+}

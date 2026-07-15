@@ -1,0 +1,40 @@
+{
+  "kind": "message",
+  "messageId": "msg-7f3c9a1e-2b64-4a8d-9c05-1de2f8a40b77",
+  "taskId": "task-b8d21c44-6a7f-4e39-8f10-c93a5e07d612",
+  "contextId": "ctx-4a9e0d73-15c8-4b2f-a6e1-908f4b3c25da",
+  "role": "agent",
+  "parts": [
+    {
+      "kind": "text",
+      "text": "Terraform module generated: main.tf, variables.tf and outputs.tf produced; terraform validate and the acceptance tests passed."
+    }
+  ],
+  "extensions": ["https://agenttrust.example/extensions/trust/v1"],
+  "metadata": {
+    "https://agenttrust.example/extensions/trust/v1": {
+      "evidence": {
+        "evidence_id": "ev-01a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
+        "session_id": "sess-9e8d7c6b-5a49-4382-b716-05f4e3d2c1b0",
+        "capability_id": "terraform.generate",
+        "schema_valid": true,
+        "tests_passed": true,
+        "artifact_hashes": {
+          "main.tf": "9b74c9897bac770ffc029102a200c5de1a367fd35ff223895b4a1176b866e307",
+          "variables.tf": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+          "outputs.tf": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "created_at": "2026-07-14T10:04:51Z"
+      },
+      "evidence_status": "verified",
+      "verification_result": {
+        "result_id": "vr-5566d7e8-f901-4a2b-83c4-d5e6f7a8b9c0",
+        "evidence_id": "ev-01a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
+        "principal_id": "atp:principal:verify.agenttrust.example:verifier-01",
+        "verdict": "verified",
+        "reasoning": "Recomputed sha256 of all three artifacts matched artifact_hashes; output re-validated against terraform.generate output_schema; acceptance tests re-executed and passed 12/12.",
+        "verified_at": "2026-07-14T10:05:37Z"
+      }
+    }
+  }
+}
