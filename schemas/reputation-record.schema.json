@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/reputation-record.schema.json",
+  "title": "ReputationRecord",
+  "description": "Aggregated verification history for one (Principal, Capability) pair. A principal with zero completed tasks is NEUTRAL: counts are 0 and verification_rate is null (unknown), never 0.0 (failed-by-default).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["principal_id", "capability_id", "tasks_verified", "tasks_rejected", "verification_rate", "updated_at"],
+  "properties": {
+    "principal_id": {
+      "type": "string",
+      "description": "principal_id of the Principal this record scores.",
+      "minLength": 1
+    },
+    "capability_id": {
+      "type": "string",
+      "description": "Capability.id this record scores the principal on.",
+      "minLength": 1
+    },
+    "tasks_verified": {
+      "type": "integer",
+      "description": "Count of tasks whose Evidence received a 'verified' verdict.",
+      "minimum": 0
+    },
+    "tasks_rejected": {
+      "type": "integer",
+      "description": "Count of tasks whose Evidence received a 'rejected' verdict.",
+      "minimum": 0
+    },
+    "verification_rate": {
+      "type": ["number", "null"],
+      "description": "Derived rate tasks_verified / (tasks_verified + tasks_rejected), in [0, 1]. MUST be null when both counts are 0 (neutral state).",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp of the last update to this record.",
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

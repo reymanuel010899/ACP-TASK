@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/evidence.schema.json",
+  "title": "Evidence",
+  "description": "A machine-checkable claim bundle produced when a capability is exercised inside a Session: schema validity, test outcome, and sha256 hashes of the produced artifacts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_id", "session_id", "capability_id", "schema_valid", "tests_passed", "artifact_hashes"],
+  "properties": {
+    "evidence_id": {
+      "type": "string",
+      "description": "Unique identifier for this evidence bundle.",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "description": "session_id of the Session under which the work was performed.",
+      "minLength": 1
+    },
+    "capability_id": {
+      "type": "string",
+      "description": "Capability.id of the capability that was exercised.",
+      "minLength": 1
+    },
+    "schema_valid": {
+      "type": "boolean",
+      "description": "True iff the produced output validated against the capability's output_schema."
+    },
+    "tests_passed": {
+      "type": "boolean",
+      "description": "True iff the acceptance tests for the task passed."
+    },
+    "artifact_hashes": {
+      "type": "object",
+      "description": "Map of artifact filename to lowercase hex sha256 digest of its content. May be empty if the task produced no file artifacts, but the field itself is REQUIRED.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^.+$": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp at which the evidence was produced.",
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

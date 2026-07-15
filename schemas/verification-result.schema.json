@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/verification-result.schema.json",
+  "title": "VerificationResult",
+  "description": "The outcome of an independent verifier Principal checking one Evidence bundle: a binary verdict plus human-readable reasoning.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_id", "principal_id", "verdict", "reasoning"],
+  "properties": {
+    "result_id": {
+      "type": "string",
+      "description": "Unique identifier for this verification result.",
+      "minLength": 1
+    },
+    "evidence_id": {
+      "type": "string",
+      "description": "evidence_id of the Evidence bundle that was verified.",
+      "minLength": 1
+    },
+    "principal_id": {
+      "type": "string",
+      "description": "principal_id of the verifier Principal that produced this result.",
+      "minLength": 1
+    },
+    "verdict": {
+      "type": "string",
+      "description": "'verified' if the evidence checks out, 'rejected' otherwise. There is no neutral verdict; withhold the result instead.",
+      "enum": ["verified", "rejected"]
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "Human-readable explanation of why the verdict was reached.",
+      "minLength": 1
+    },
+    "verified_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp at which verification completed.",
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

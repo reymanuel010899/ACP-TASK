@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/principal.schema.json",
+  "title": "Principal",
+  "description": "A long-lived cryptographic identity (an agent, an operator, or a verifier) identified by a stable id and an ed25519 public key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["principal_id", "public_key"],
+  "properties": {
+    "principal_id": {
+      "type": "string",
+      "description": "Stable, globally unique identifier for the principal.",
+      "minLength": 1
+    },
+    "public_key": {
+      "type": "string",
+      "description": "Raw 32-byte ed25519 public key, standard base64 with padding (exactly 44 characters).",
+      "pattern": "^[A-Za-z0-9+/]{43}=$"
+    },
+    "key_algorithm": {
+      "type": "string",
+      "description": "Signature algorithm for public_key. Only ed25519 is defined by RFC-0001.",
+      "enum": ["ed25519"]
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Optional human-readable name. Not unique, not trusted.",
+      "minLength": 1
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

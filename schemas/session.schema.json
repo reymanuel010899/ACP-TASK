@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/session.schema.json",
+  "title": "Session",
+  "description": "A short-lived working context bound to its issuing Principal by a REQUIRED ed25519 signature over the session claims. A session without the signed principal link is invalid.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "principal_id", "expires_at", "principal_signature"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Unique identifier for this session.",
+      "minLength": 1
+    },
+    "principal_id": {
+      "type": "string",
+      "description": "principal_id of the Principal that issued (and signed) this session.",
+      "minLength": 1
+    },
+    "issued_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp at which the session was issued.",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp after which the session MUST be treated as invalid.",
+      "format": "date-time"
+    },
+    "principal_signature": {
+      "type": "string",
+      "description": "64-byte ed25519 signature by the issuing Principal over the canonical session claims (session_id, principal_id, issued_at, expires_at), standard base64 with padding (exactly 88 characters).",
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

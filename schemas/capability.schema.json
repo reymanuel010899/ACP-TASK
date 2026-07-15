@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/capability.schema.json",
+  "title": "Capability",
+  "description": "A named, versioned skill an agent claims to be able to perform (e.g. 'terraform.generate'). Capabilities are the unit against which evidence is produced and reputation is accrued.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "description"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable, dot-namespaced capability identifier, e.g. 'terraform.generate'.",
+      "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9][a-z0-9_-]*)+$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version of the capability contract (semantic versioning recommended).",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of what the capability does.",
+      "minLength": 1
+    },
+    "input_schema": {
+      "type": "object",
+      "description": "Optional JSON Schema describing valid task inputs for this capability."
+    },
+    "output_schema": {
+      "type": "object",
+      "description": "Optional JSON Schema describing valid task outputs for this capability. Evidence.schema_valid refers to validation against this schema."
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}
