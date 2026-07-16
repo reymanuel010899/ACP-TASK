@@ -47,6 +47,9 @@ class ReputationStore(object):
         self._results = {}  # type: Dict[str, dict]
         # (principal_id, capability_id) -> Reputation Record
         self._reputation = {}  # type: Dict[Tuple[str, str], dict]
+        # (subject principal_id, capability_id) -> list of verified portfolio
+        # entries, in insertion order. Only 'verified' work is ever appended.
+        self._portfolio = {}  # type: Dict[Tuple[str, str], List[dict]]
         # Revoked principal_ids and/or public_keys, in one set.
         self._revoked = set()  # type: Set[str]
 
@@ -65,6 +68,10 @@ class ReputationStore(object):
         self._reputation = {
             (rec["principal_id"], rec["capability_id"]): rec
             for rec in data.get("reputation_records", [])
+        }
+        self._portfolio = {
+            (slot["principal_id"], slot["capability_id"]): list(slot["entries"])
+            for slot in data.get("portfolios", [])
         }
 
     def _load_revocations(self, path):
@@ -87,6 +94,14 @@ class ReputationStore(object):
                 self._reputation.values(),
                 key=lambda r: (r["principal_id"], r["capability_id"]),
             ),
+            "portfolios": [
+                {
+                    "principal_id": pid,
+                    "capability_id": cid,
+                    "entries": entries,
+                }
+                for (pid, cid), entries in sorted(self._portfolio.items())
+            ],
         }
         with open(self._path, "w") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
@@ -110,6 +125,47 @@ class ReputationStore(object):
         # type: (str) -> Optional[dict]
         with self._lock:
             return self._results.get(evidence_id)
+
+    # -- portfolio (verified-work history per subject principal) --------------
+
+    def add_portfolio_entry(self, principal_id, capability_id, result):
+        # type: (str, str, dict) -> None
+        """Append one VERIFIED result to a subject principal's portfolio.
+
+        Only 'verified' work forms a portfolio (rejected work never appears).
+        The entry is a compact, re-checkable pointer, not the full result.
+        """
+        if result.get("verdict") != "verified":
+            return
+        with self._lock:
+            entry = {
+                "evidence_id": result["evidence_id"],
+                "capability_id": capability_id,
+                "verdict": "verified",
+                "verified_at": result.get("verified_at"),
+            }
+            self._portfolio.setdefault((principal_id, capability_id), []).append(
+                entry
+            )
+            self._save_data()
+
+    def get_portfolio(self, principal_id, capability_id=None, limit=None):
+        # type: (str, Optional[str], Optional[int]) -> List[dict]
+        """Verified portfolio entries for a subject principal, newest first.
+
+        Empty (never an error) for a principal with no verified history.
+        """
+        with self._lock:
+            items = []  # type: List[dict]
+            for (pid, cid), entries in self._portfolio.items():
+                if pid == principal_id and (
+                    capability_id is None or cid == capability_id
+                ):
+                    items.extend(entries)
+        items.sort(key=lambda e: e.get("verified_at") or "", reverse=True)
+        if limit is not None:
+            items = items[:limit]
+        return items
 
     # -- reputation records ---------------------------------------------------
 

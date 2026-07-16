@@ -11,6 +11,9 @@ Endpoints
 - ``POST /evidence`` — body ``{"evidence": ..., "session": ..., "principal": ...}``
 - ``GET /reputation/{principal_id}[?capability_id=...]``
 - ``GET /verification-results/{evidence_id}``
+- ``GET /portfolio/{principal_id}[?capability_id=...&limit=N]`` (U3): verified
+  work history for a subject principal, newest first; empty (not 404) when
+  there is none, and rejected work never appears.
 - ``POST /revocations`` — body ``{"principal_id": ...}`` or ``{"public_key": ...}``
 - ``GET /healthz``
 
@@ -296,6 +299,11 @@ class VerificationService(object):
         record = self.store.record_verdict(
             principal["principal_id"], evidence["capability_id"], verdict
         )
+        # Verified work joins the subject principal's re-checkable portfolio
+        # (U3); rejected work never does.
+        self.store.add_portfolio_entry(
+            principal["principal_id"], evidence["capability_id"], result
+        )
         return 200, {"verification_result": result, "reputation_record": record}
 
     def _decide_verdict(self, evidence):
@@ -401,6 +409,21 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 segments[1], capability_id=capability_id
             )
             self._send_json(200, {"reputation_records": records})
+        elif len(segments) == 2 and segments[0] == "portfolio":
+            query = parse_qs(parts.query)
+            capability_id = query.get("capability_id", [None])[0]
+            raw_limit = query.get("limit", [None])[0]
+            limit = None
+            if raw_limit is not None:
+                try:
+                    limit = int(raw_limit)
+                except ValueError:
+                    self._send_json(400, {"error": "limit must be an integer"})
+                    return
+            entries = self.service.store.get_portfolio(
+                segments[1], capability_id=capability_id, limit=limit
+            )
+            self._send_json(200, {"portfolio": entries})
         elif len(segments) == 2 and segments[0] == "verification-results":
             result = self.service.store.get_result(segments[1])
             if result is None:

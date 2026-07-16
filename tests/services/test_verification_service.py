@@ -476,6 +476,23 @@ class TestHTTPEndToEnd:
         )
         assert missing.status_code == 404
 
+        # Portfolio (U3): the verified work shows for the subject principal.
+        portfolio = requests.get(
+            base_url + "/portfolio/agent:alice",
+            params={"capability_id": CAPABILITY_ID},
+            timeout=5,
+        )
+        assert portfolio.status_code == 200
+        entries = portfolio.json()["portfolio"]
+        assert len(entries) == 1
+        assert entries[0]["evidence_id"] == payload["evidence"]["evidence_id"]
+        assert entries[0]["verdict"] == "verified"
+
+        # Empty (not 404) for a principal with no history.
+        empty = requests.get(base_url + "/portfolio/agent:nobody", timeout=5)
+        assert empty.status_code == 200
+        assert empty.json()["portfolio"] == []
+
     def test_post_revocation_then_evidence_403(self, http_service):
         requests, base_url, _ = http_service
         _, payload = make_submission(principal_id="agent:dave")
@@ -554,3 +571,56 @@ def test_canonical_session_claims_is_sorted_compact_json():
         b'{"expires_at":"2099-01-01T00:00:00Z",'
         b'"principal_id":"p1","session_id":"s1"}'
     )
+
+
+# ---------------------------------------------------------------------------
+# U3: verified-work portfolio
+# ---------------------------------------------------------------------------
+
+
+class TestPortfolio:
+    def test_verified_work_enters_the_portfolio(self, service, store):
+        _, payload = make_submission(principal_id="agent:alice")
+        service.process_evidence(payload)
+        entries = store.get_portfolio("agent:alice", capability_id=CAPABILITY_ID)
+        assert len(entries) == 1
+        assert entries[0]["verdict"] == "verified"
+        assert entries[0]["evidence_id"] == payload["evidence"]["evidence_id"]
+
+    def test_rejected_work_never_enters_the_portfolio(self, service, store):
+        _, payload = make_submission(principal_id="agent:bob", hcl=INVALID_HCL)
+        status, body = service.process_evidence(payload)
+        assert body["verification_result"]["verdict"] == "rejected"
+        assert store.get_portfolio("agent:bob") == []
+
+    def test_portfolio_empty_for_principal_with_no_history(self, store):
+        # Empty, never an error/None.
+        assert store.get_portfolio("agent:nobody") == []
+        assert store.get_portfolio("agent:nobody", capability_id="x.y") == []
+
+    def test_portfolio_capability_filter_isolates(self, service, store):
+        _, p = make_submission(principal_id="agent:carol")
+        service.process_evidence(p)
+        assert len(store.get_portfolio("agent:carol", capability_id=CAPABILITY_ID)) == 1
+        assert store.get_portfolio("agent:carol", capability_id="other.cap") == []
+
+    def test_get_portfolio_orders_newest_first_and_limits(self, store):
+        # Craft entries directly so we control verified_at ordering.
+        for i, ts in enumerate(
+            ["2026-07-10T00:00:00Z", "2026-07-12T00:00:00Z", "2026-07-11T00:00:00Z"]
+        ):
+            store.add_portfolio_entry(
+                "agent:dave",
+                CAPABILITY_ID,
+                {"evidence_id": "ev-%d" % i, "verdict": "verified", "verified_at": ts},
+            )
+        newest_two = store.get_portfolio("agent:dave", limit=2)
+        assert [e["evidence_id"] for e in newest_two] == ["ev-1", "ev-2"]
+
+    def test_add_portfolio_entry_ignores_rejected(self, store):
+        store.add_portfolio_entry(
+            "agent:eve",
+            CAPABILITY_ID,
+            {"evidence_id": "ev-x", "verdict": "rejected", "verified_at": "z"},
+        )
+        assert store.get_portfolio("agent:eve") == []
