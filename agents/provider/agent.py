@@ -315,14 +315,20 @@ class ProviderAgent(object):
 
     def _handle_counter(self, payload):
         # type: (dict) -> dict
-        """One counter-offer round (RFC-0002 §6.3, KTD-N4).
+        """The single counter-offer round (RFC-0002 §6.3, KTD-N4), enforced
+        server-side.
 
-        Accept the proposal iff it meets the private reservation; otherwise
-        HOLD the current list price. Holding at the list price (not at the
-        reservation) is deliberate: re-offering exactly ``min_price`` on a
-        low-ball would hand the floor to any requester who proposes 0, which
-        is the extraction R2 exists to prevent. A below-floor counter simply
-        gets no concession — the standing price is unchanged.
+        The FIRST counter is evaluated once: accept the proposal iff it meets
+        the private reservation (as a concession that never raises the standing
+        price); otherwise HOLD the current list price. Every subsequent counter
+        for the same task is a no-op that just echoes the standing offer — no
+        re-evaluation against ``min_price``.
+
+        Enforcing "one round" here (not only in the requester) is a security
+        requirement, not politeness: an unbounded accept/hold response is a
+        one-bit oracle a client could binary-search to recover the exact
+        ``min_price`` (R2). Holding at the list price rather than the
+        reservation, and never conceding upward, keep the floor unrevealed.
         """
         task_id = payload.get("task_id")
         proposed = payload.get("proposed_price")
@@ -334,9 +340,13 @@ class ProviderAgent(object):
                 raise RpcError(
                     -32602, "unknown or already-completed task_id: %r" % (task_id,)
                 )
-            if proposed >= self.pricing.min_price:
-                task["price"] = float(proposed)  # accept the concession
-            # else: below reservation -> hold; task["price"] stays as-is
+            if not task.get("countered"):
+                task["countered"] = True
+                if proposed >= self.pricing.min_price:
+                    # Concession only: accept the lower price, never raise it.
+                    task["price"] = min(float(proposed), task["price"])
+                # else: below reservation -> hold; task["price"] unchanged.
+            # A repeat counter gets no new evaluation (kills the price oracle).
             standing = task["price"]
         return self._offer(task_id, standing)
 

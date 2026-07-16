@@ -32,9 +32,10 @@ class RequesterConfig(object):
         top_counter=2,
         counter_fraction=0.9,
         require_portfolio_for_unproven=True,
+        verification_url=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (str, str, dict, float, int, int, float, bool, float) -> None
+        # type: (str, str, dict, float, int, int, float, bool, Optional[str], float) -> None
         if not registry_url:
             raise ValueError(
                 "registry_url is required (KTD5: the registry URL is "
@@ -57,4 +58,11 @@ class RequesterConfig(object):
         # An unproven (no-history) candidate must show verified portfolio work
         # to win over a proven one; assurance by verified facts (R4 / KTD-N3).
         self.require_portfolio_for_unproven = require_portfolio_for_unproven
+        # A TRUSTED verification service URL the requester itself configures.
+        # Portfolio assurance is only honored when checked here — never against
+        # a URL a candidate declares on its own Agent Card (which an attacker
+        # controls, and could stuff with fake 'verified' entries).
+        self.verification_url = (
+            verification_url.rstrip("/") if verification_url else None
+        )
         self.http_timeout = http_timeout

@@ -50,6 +50,10 @@ class ReputationStore(object):
         # (subject principal_id, capability_id) -> list of verified portfolio
         # entries, in insertion order. Only 'verified' work is ever appended.
         self._portfolio = {}  # type: Dict[Tuple[str, str], List[dict]]
+        # Monotonic sequence for portfolio ordering. verified_at is only
+        # second-resolution, so it can tie; the sequence breaks ties so
+        # "newest first" is honored even within the same second.
+        self._portfolio_seq = 0
         # Revoked principal_ids and/or public_keys, in one set.
         self._revoked = set()  # type: Set[str]
 
@@ -73,6 +77,13 @@ class ReputationStore(object):
             (slot["principal_id"], slot["capability_id"]): list(slot["entries"])
             for slot in data.get("portfolios", [])
         }
+        seqs = [
+            e["_seq"]
+            for entries in self._portfolio.values()
+            for e in entries
+            if isinstance(e.get("_seq"), int)
+        ]
+        self._portfolio_seq = max(seqs) if seqs else 0
 
     def _load_revocations(self, path):
         # type: (str) -> None
@@ -138,11 +149,13 @@ class ReputationStore(object):
         if result.get("verdict") != "verified":
             return
         with self._lock:
+            self._portfolio_seq += 1
             entry = {
                 "evidence_id": result["evidence_id"],
                 "capability_id": capability_id,
                 "verdict": "verified",
                 "verified_at": result.get("verified_at"),
+                "_seq": self._portfolio_seq,
             }
             self._portfolio.setdefault((principal_id, capability_id), []).append(
                 entry
@@ -162,10 +175,16 @@ class ReputationStore(object):
                     capability_id is None or cid == capability_id
                 ):
                     items.extend(entries)
-        items.sort(key=lambda e: e.get("verified_at") or "", reverse=True)
+        # Newest first: by timestamp, then insertion sequence to break
+        # same-second ties (the sequence is monotonic with append order).
+        items.sort(
+            key=lambda e: (e.get("verified_at") or "", e.get("_seq", 0)),
+            reverse=True,
+        )
         if limit is not None:
             items = items[:limit]
-        return items
+        # _seq is an internal ordering aid; never leak it to API consumers.
+        return [{k: v for k, v in e.items() if k != "_seq"} for e in items]
 
     # -- reputation records ---------------------------------------------------
 

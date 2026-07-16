@@ -63,6 +63,7 @@ SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schemas"
 
 TERRAFORM_CAPABILITY_ID = "terraform.generate"
 DEFAULT_VERIFIER_PRINCIPAL_ID = "agenttrust:verifier:verification-service"
+MAX_PORTFOLIO_LIMIT = 500  # cap /portfolio response size
 
 _RESOURCE_BLOCK_RE = re.compile(
     r'(^|\n)\s*resource\s+"[^"\n]+"\s+"[^"\n]+"\s*\{'
@@ -420,6 +421,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._send_json(400, {"error": "limit must be an integer"})
                     return
+                if limit < 0:
+                    self._send_json(
+                        400, {"error": "limit must be >= 0"}
+                    )
+                    return
+                limit = min(limit, MAX_PORTFOLIO_LIMIT)
             entries = self.service.store.get_portfolio(
                 segments[1], capability_id=capability_id, limit=limit
             )

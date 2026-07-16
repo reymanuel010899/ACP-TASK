@@ -663,3 +663,154 @@ def test_competitive_no_candidates_when_none_clear_floor(competitive_stack):
     )
     outcome = agent.run_competitive()
     assert outcome["status"] == "no_candidates"
+
+
+# ---- F2: the final accept to the winner must not raise -----------------------
+
+
+class _AcceptFailsProvider(ThreadingHTTPServer):
+    """Offers and counters fine, but returns HTTP 500 on task.accept."""
+
+    daemon_threads = True
+
+    def __init__(self, principal_id):
+        self.principal_id = principal_id
+        super(_AcceptFailsProvider, self).__init__(("127.0.0.1", 0), _AFHandler)
+        self.stub = self
+
+    def card(self):
+        return {
+            "name": "flaky",
+            "url": base_url(self),
+            "version": "0.1.0",
+            "protocolVersion": "0.3.0",
+            "capabilities": {
+                "extensions": [{"uri": TRUST_EXTENSION_URI, "required": False}]
+            },
+            "skills": [{"id": CAPABILITY_ID, "name": CAPABILITY_ID}],
+        }
+
+
+class _AFHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, status, body):
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/.well-known/agent-card.json":
+            self._json(200, self.server.card())
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        req_id = body.get("id")
+        kind = body["params"]["message"]["parts"][0]["data"].get("type")
+        if kind == "task.accept":
+            self._json(500, {"error": "boom"})  # -> raise_for_status in _send
+            return
+        offer = {
+            "type": "task.offer",
+            "task_id": "task-af",
+            "capability_id": CAPABILITY_ID,
+            "price": 5.0,
+            "currency": "USD",
+        }
+        self._json(
+            200,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": _agent_message(offer),
+            },
+        )
+
+
+def test_competitive_winner_unreachable_at_accept_is_provider_error(registry_only):
+    registry_url, api_key = registry_only
+    stub = _AcceptFailsProvider(principal_id="flaky")
+    start_server(stub)
+    resp = requests.post(
+        registry_url + "/register",
+        json={
+            "agent_card": stub.card(),
+            "principal_id": stub.principal_id,
+            "api_key": api_key,
+        },
+        timeout=5,
+    )
+    assert resp.status_code == 200
+    try:
+        outcome = RequesterAgent(make_config(registry_url)).run_competitive()
+        # The 500 on accept raises inside _send; run_competitive must catch it
+        # and map it to a clean provider_error, not propagate the exception.
+        assert outcome["status"] == "provider_error", outcome
+        assert outcome["verified"] is False
+    finally:
+        stub.shutdown()
+        stub.server_close()
+
+
+# ---- F3/F4: portfolio assurance, only from a trusted verifier ----------------
+
+
+@pytest.fixture
+def unwired_stack(tmp_path):
+    """Verifier + a registry NOT wired to it (so registry reputation stays
+    neutral/None), plus real providers. This isolates the portfolio path: a
+    provider can have verified portfolio work at the verifier while the
+    registry reports no reputation rate for it."""
+    verification = make_verification_server(port=0)
+    start_server(verification)
+    verification_url = base_url(verification)
+    registry = make_registry_server(port=0)  # NOT wired to verification
+    start_server(registry)
+    registry_url = base_url(registry)
+    api_key = requests.post(
+        registry_url + "/admin/api-keys", timeout=5
+    ).json()["api_key"]
+    stack = CompetitiveStack(registry_url, verification_url, api_key, tmp_path)
+    try:
+        yield stack
+    finally:
+        for p in stack.providers:
+            p.shutdown()
+            p.server_close()
+        for server in (registry, verification):
+            server.shutdown()
+            server.server_close()
+
+
+def test_portfolio_flips_winner_only_via_trusted_verifier(unwired_stack):
+    cheap = unwired_stack.add_provider(list_price=3.0, min_price=1.0)  # no work
+    pricey = unwired_stack.add_provider(list_price=8.0, min_price=2.0)
+    # Give the pricey provider verified portfolio work at the verifier. The
+    # registry is unwired, so BOTH still report rate None to the requester.
+    unwired_stack.drive_one_verified_task(pricey)
+
+    # With a TRUSTED verifier configured, the pricey provider's verified
+    # portfolio makes it 'proven' and it wins over the cheaper, portfolio-less
+    # rival — portfolio is decisive.
+    trusting = RequesterAgent(
+        make_config(unwired_stack.registry_url, verification_url=unwired_stack.verification_url)
+    )
+    out = trusting.run_competitive()
+    assert out["status"] == "verified", out
+    assert out["provider_principal_id"] == pricey.agent.principal_id
+
+    # WITHOUT a trusted verifier, portfolio assurance is ignored (an attacker
+    # could fake it), both are unproven, and the cheapest wins instead.
+    untrusting = RequesterAgent(make_config(unwired_stack.registry_url))
+    out2 = untrusting.run_competitive()
+    assert out2["status"] == "verified", out2
+    assert out2["provider_principal_id"] == cheap.agent.principal_id

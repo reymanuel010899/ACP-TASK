@@ -163,7 +163,11 @@ task.accept                     (requester closes at the standing price)
 ```
 
 The counter round is **optional and single**. A requester MAY send exactly one
-`task.counter` per task before accepting; there is no unbounded haggling.
+`task.counter` per task before accepting; there is no unbounded haggling. A
+provider MUST enforce the single round itself: only the first `task.counter`
+for a task is evaluated, and any subsequent one re-offers the standing price
+without re-evaluation (§6.4 explains why this is a security requirement, not
+just etiquette).
 
 ### 6.2 Offer body (`schemas/offer.schema.json`)
 
@@ -175,11 +179,14 @@ home).
 
 ### 6.3 Counter body (`schemas/counter-offer.schema.json`)
 
-`task.counter` carries the `task_id` and a `proposed_price`. On receiving it a
-provider MUST respond with an updated `task.offer`: it accepts the proposal
-(offering at `proposed_price`) **iff** the proposal meets or exceeds its
-private reservation; otherwise it holds its floor (re-offering at a price no
-lower than that reservation).
+`task.counter` carries the `task_id` and a `proposed_price`. On receiving the
+first counter for a task a provider MUST respond with an updated `task.offer`:
+it accepts the proposal (re-offering at `proposed_price`, but only as a
+concession — never above the standing price) **iff** the proposal meets or
+exceeds its private reservation; otherwise it **holds its standing (list)
+price**, re-offering unchanged. It MUST NOT re-offer *at* the reservation:
+doing so would reveal the floor. The reservation is never disclosed, only
+compared against.
 
 ### 6.4 The private-reservation rule (normative)
 
@@ -189,6 +196,12 @@ It MUST NOT appear in the Agent Card, in any `task.offer`, in any
 schemas set `additionalProperties: false`, so a leaked reservation field is a
 validation error by construction. Publishing the floor would collapse
 competition — every requester would simply propose exactly the floor.
+
+The single-round rule (§6.1) is part of this protection, not a convenience. An
+unbounded accept/hold response is a one-bit oracle: a client could binary-search
+its `proposed_price` and recover the exact reservation in a few dozen counters,
+even though no message ever names it. Evaluating only the first counter closes
+that oracle.
 
 ### 6.5 Reputation-gated selection
 

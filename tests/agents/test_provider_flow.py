@@ -598,6 +598,28 @@ def test_counter_on_unknown_task_is_invalid(priced_provider):
     assert body["error"]["code"] == -32602
 
 
+def test_second_counter_is_a_no_op_no_floor_oracle(priced_provider):
+    # Security (R2): only the FIRST counter is evaluated. Further counters
+    # must not reveal accept/hold per proposed_price, or a client could
+    # binary-search the private min_price (3.0 here).
+    url = base_url(priced_provider)
+    offer = request_offer(url)  # list 5.0
+    first = data_part(counter(url, offer["task_id"], 2.0)["result"])  # below floor
+    assert first["price"] == 5.0  # held at list
+    # A second counter at 4.0 (>= floor) MUST NOT now be accepted — the round
+    # is spent. It just echoes the standing price.
+    second = data_part(counter(url, offer["task_id"], 4.0)["result"])
+    assert second["price"] == 5.0  # unchanged; no oracle bit leaked
+
+
+def test_counter_never_raises_the_price(priced_provider):
+    # A counter above the list price is not a concession; the price never rises.
+    url = base_url(priced_provider)
+    offer = request_offer(url)  # list 5.0
+    held = data_part(counter(url, offer["task_id"], 99.0)["result"])
+    assert held["price"] == 5.0
+
+
 def test_pricing_config_rejects_list_below_min():
     with pytest.raises(ValueError):
         PricingConfig(list_price=2.0, min_price=5.0)

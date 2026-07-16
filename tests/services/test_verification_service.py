@@ -493,6 +493,15 @@ class TestHTTPEndToEnd:
         assert empty.status_code == 200
         assert empty.json()["portfolio"] == []
 
+        # A negative limit is a 400, never a silent items[:-1] that drops the
+        # newest entries.
+        bad = requests.get(
+            base_url + "/portfolio/agent:alice",
+            params={"capability_id": CAPABILITY_ID, "limit": "-1"},
+            timeout=5,
+        )
+        assert bad.status_code == 400
+
     def test_post_revocation_then_evidence_403(self, http_service):
         requests, base_url, _ = http_service
         _, payload = make_submission(principal_id="agent:dave")
@@ -624,3 +633,24 @@ class TestPortfolio:
             {"evidence_id": "ev-x", "verdict": "rejected", "verified_at": "z"},
         )
         assert store.get_portfolio("agent:eve") == []
+
+    def test_portfolio_newest_first_within_the_same_second(self, store):
+        # verified_at is second-resolution; ties must still order newest-first
+        # by insertion sequence.
+        ts = "2026-07-15T12:00:00Z"
+        for i in range(3):
+            store.add_portfolio_entry(
+                "agent:frank",
+                CAPABILITY_ID,
+                {"evidence_id": "ev-%d" % i, "verdict": "verified", "verified_at": ts},
+            )
+        got = store.get_portfolio("agent:frank", limit=1)
+        assert [e["evidence_id"] for e in got] == ["ev-2"]  # last inserted
+
+    def test_portfolio_entries_do_not_leak_internal_seq(self, store):
+        store.add_portfolio_entry(
+            "agent:gina",
+            CAPABILITY_ID,
+            {"evidence_id": "ev-1", "verdict": "verified", "verified_at": "t"},
+        )
+        assert "_seq" not in store.get_portfolio("agent:gina")[0]

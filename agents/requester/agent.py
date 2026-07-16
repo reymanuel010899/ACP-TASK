@@ -381,11 +381,24 @@ class RequesterAgent(object):
 
         winner = self._select_winner(offers)
 
-        # Close with the winner and read the trust gate.
-        result_env = self._send(
-            winner["provider_url"],
-            {"type": "task.accept", "task_id": winner["task_id"]},
-        )
+        # Close with the winner and read the trust gate. Guard the accept the
+        # same way as request/counter: a winner that dies in the gap between
+        # the counter round and the accept must map to provider_error, not
+        # raise out of this method (its docstring promises it never does).
+        try:
+            result_env = self._send(
+                winner["provider_url"],
+                {"type": "task.accept", "task_id": winner["task_id"]},
+            )
+        except requests.RequestException as exc:
+            return _outcome(
+                "provider_error",
+                capability=capability,
+                provider_principal_id=winner["principal_id"],
+                task_id=winner["task_id"],
+                offers_considered=len(offers),
+                reason="winner unreachable during task.accept: %s" % exc,
+            )
         if "error" in result_env:
             return _outcome(
                 "provider_error",
@@ -417,21 +430,29 @@ class RequesterAgent(object):
         return {
             "principal_id": candidate.get("principal_id"),
             "provider_url": card.get("url"),
-            "verification_url": _verification_url_of(card),
             "verification_rate": _rate_of(candidate),
             "index": index,
         }
 
     def _is_proven(self, meta, capability):
         # type: (dict, str) -> bool
-        """Proven = has a per-capability reputation rate, or verified portfolio
-        work the requester can re-check. Judged only from verified facts (R4)."""
+        """Proven = has a per-capability reputation rate (registry-attested),
+        or verified portfolio work checked against the requester's OWN trusted
+        verifier. Judged only from verified facts (R4).
+
+        The portfolio is deliberately NOT fetched from a candidate-declared
+        URL: an attacker controls that field and could return fake 'verified'
+        entries to jump the trust gate. With no trusted verifier configured, an
+        unproven candidate stays unproven.
+        """
         if meta.get("verification_rate") is not None:
             return True
         if not self.config.require_portfolio_for_unproven:
             return True
+        if not self.config.verification_url:
+            return False
         portfolio = self._fetch_portfolio(
-            meta.get("verification_url"), meta.get("principal_id"), capability
+            self.config.verification_url, meta.get("principal_id"), capability
         )
         return len(portfolio) > 0
 
@@ -511,17 +532,6 @@ def _rate_of(candidate):
     return summary.get("verification_rate")
 
 
-def _verification_url_of(agent_card):
-    # type: (dict) -> Optional[str]
-    """The provider's verification service URL, declared in the trust
-    extension params on its Agent Card (RFC-0002 §2)."""
-    caps = agent_card.get("capabilities") or {}
-    for ext in caps.get("extensions") or []:
-        if isinstance(ext, dict) and ext.get("uri") == TRUST_EXTENSION_URI:
-            return (ext.get("params") or {}).get("verification_service_url")
-    return None
-
-
 _REASONS = {
     "verified": "task completed and independently verified",
     "rejected": "artifact delivered but independent verification rejected it",
@@ -598,6 +608,12 @@ def main(argv=None):
         help="Use the legacy single-offer path instead of competitive "
         "negotiation (graceful-degradation / compatibility).",
     )
+    parser.add_argument(
+        "--verification-url",
+        default=None,
+        help="A TRUSTED verification service to check candidate portfolios "
+        "against. Portfolio assurance is ignored unless this is set.",
+    )
     args = parser.parse_args(argv)
 
     task_input = None
@@ -618,6 +634,7 @@ def main(argv=None):
         capability=args.capability or "terraform.generate",
         task_input=task_input,
         min_reputation=args.min_reputation,
+        verification_url=args.verification_url,
         **kwargs
     )
     agent = RequesterAgent(config)

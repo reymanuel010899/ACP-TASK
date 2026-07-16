@@ -6,3 +6,6 @@ __pycache__/
 # Claves privadas ed25519 de Principals — nunca versionadas (KTD8)
 agents/**/keys/
 *.key
+
+# Settings locales de Claude Code (por usuario)
+.claude/settings.local.json
