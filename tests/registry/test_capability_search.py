@@ -465,3 +465,62 @@ class TestHTTPEndToEnd:
             timeout=5,
         )
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# U4 (auth): optional admin token on /admin/api-keys
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def http_registry_secured():
+    server = make_server(port=0, admin_token="adm1n")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = "http://%s:%d" % server.server_address[:2]
+    try:
+        yield base_url
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+class TestAdminAuth:
+    def test_open_admin_mints_without_token(self, http_registry):
+        # Default (no admin_token): the admin surface is open (compat).
+        base_url, _ = http_registry
+        resp = requests.post(base_url + "/admin/api-keys", timeout=5)
+        assert resp.status_code == 200
+        assert resp.json()["api_key"]
+
+    def test_secured_admin_rejects_without_token(self, http_registry_secured):
+        resp = requests.post(http_registry_secured + "/admin/api-keys", timeout=5)
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate") == "Bearer"
+
+    def test_secured_admin_rejects_wrong_token(self, http_registry_secured):
+        resp = requests.post(
+            http_registry_secured + "/admin/api-keys",
+            headers={"Authorization": "Bearer nope"},
+            timeout=5,
+        )
+        assert resp.status_code == 401
+
+    def test_secured_admin_accepts_right_token(self, http_registry_secured):
+        resp = requests.post(
+            http_registry_secured + "/admin/api-keys",
+            headers={"Authorization": "Bearer adm1n"},
+            timeout=5,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["api_key"]
+
+    def test_secured_admin_does_not_affect_search(self, http_registry_secured):
+        # /search is unaffected by the admin token.
+        resp = requests.get(
+            http_registry_secured + "/search",
+            params={"capability": TERRAFORM_CAP},
+            timeout=5,
+        )
+        assert resp.status_code == 200

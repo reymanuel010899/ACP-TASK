@@ -102,15 +102,25 @@ class RegistryService(object):
         index,
         reputation_store=None,
         verification_url=None,
+        admin_token=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], float) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
             verification_url.rstrip("/") if verification_url else None
         )
+        # Optional admin bearer token gating POST /admin/api-keys (KTD-A5).
+        # None = open (demo default). Never serialized.
+        self.admin_token = admin_token
         self.http_timeout = http_timeout
+
+    def admin_ok(self, token):
+        # type: (Optional[str]) -> bool
+        """True when admin access is allowed: no token configured (open), or
+        the presented token matches the configured one."""
+        return self.admin_token is None or token == self.admin_token
 
     # -- API keys ----------------------------------------------------------------
 
@@ -267,6 +277,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _bearer_token(self):
+        # type: () -> Optional[str]
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if header.startswith(prefix):
+            return header[len(prefix):].strip()
+        return None
+
     def _read_json_body(self):
         # type: () -> Tuple[Optional[dict], Optional[str]]
         try:
@@ -330,8 +348,19 @@ class _RequestHandler(BaseHTTPRequestHandler):
             status, response = self.service.register(body)
             self._send_json(status, response)
         elif segments == ["admin", "api-keys"]:
-            # v1: unauthenticated admin surface -- demo scale only. This is
-            # the bootstrap path for the first invite key.
+            # Gated by an admin bearer token when one is configured (KTD-A5);
+            # open (demo default) when none is set.
+            if not self.service.admin_ok(self._bearer_token()):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                self.send_header("Content-Type", "application/json")
+                data = json.dumps(
+                    {"error": "admin authentication required"}
+                ).encode("utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             self._send_json(200, {"api_key": self.service.create_api_key()})
         else:
             self._send_json(404, {"error": "not found"})
@@ -344,14 +373,16 @@ def make_server(
     service=None,
     reputation_store=None,
     verification_url=None,
+    admin_token=None,
 ):
-    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str]) -> RegistryHTTPServer
+    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str]) -> RegistryHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     if service is None:
         service = RegistryService(
             index if index is not None else IndexStore(),
             reputation_store=reputation_store,
             verification_url=verification_url,
+            admin_token=admin_token,
         )
     return RegistryHTTPServer((host, port), service)
 
@@ -378,11 +409,19 @@ def main(argv=None):
         default=None,
         help="Optional JSON file for persisting registrations.",
     )
+    parser.add_argument(
+        "--admin-token",
+        default=None,
+        help="If set, POST /admin/api-keys requires this bearer token. "
+        "Omit to leave the admin surface open (demo default).",
+    )
     args = parser.parse_args(argv)
 
     index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
     service = RegistryService(
-        index, verification_url=args.verification_url
+        index,
+        verification_url=args.verification_url,
+        admin_token=args.admin_token,
     )
     server = make_server(port=args.port, host=args.host, service=service)
     print(
