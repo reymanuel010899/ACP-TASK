@@ -459,9 +459,11 @@ class ProviderHTTPServer(ThreadingHTTPServer):
         keys_dir=None,
         pricing=None,
         auth_tokens=None,
+        rate_limiter=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (tuple, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], float) -> None
+        # type: (tuple, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], object, float) -> None
+        self.rate_limiter = rate_limiter
         ThreadingHTTPServer.__init__(self, address, _RequestHandler)
         self.agent = ProviderAgent(
             base_url="http://%s:%d" % self.server_address[:2],
@@ -505,7 +507,17 @@ class _RequestHandler(BaseHTTPRequestHandler):
             uri.strip() for uri in header.split(",")
         ]
 
+    def _rate_ok(self):
+        # type: () -> bool
+        limiter = getattr(self.server, "rate_limiter", None)
+        if limiter is None or limiter.allow(self.client_address[0]):
+            return True
+        self._send_json(429, {"error": "rate limit exceeded"})
+        return False
+
     def do_GET(self):
+        if not self._rate_ok():
+            return
         if self.path == "/.well-known/agent-card.json":
             self._send_json(200, self.agent.agent_card())
         elif self.path == "/healthz":
@@ -522,6 +534,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
         return None
 
     def do_POST(self):
+        if not self._rate_ok():
+            return
         # Access control (RFC-0002 §7): if this provider requires auth, the
         # caller MUST present a valid bearer token before any task is processed.
         # Discovery (GET /.well-known/...) stays public — only POST is gated.
@@ -634,9 +648,10 @@ def make_server(
     keys_dir=None,
     pricing=None,
     auth_tokens=None,
+    rate_limiter=None,
     http_timeout=DEFAULT_HTTP_TIMEOUT,
 ):
-    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], float) -> ProviderHTTPServer
+    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], object, float) -> ProviderHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     return ProviderHTTPServer(
         (host, port),
@@ -646,6 +661,7 @@ def make_server(
         keys_dir=keys_dir,
         pricing=pricing,
         auth_tokens=auth_tokens,
+        rate_limiter=rate_limiter,
         http_timeout=http_timeout,
     )
 

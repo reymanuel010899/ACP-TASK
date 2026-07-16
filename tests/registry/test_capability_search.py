@@ -524,3 +524,24 @@ class TestAdminAuth:
             timeout=5,
         )
         assert resp.status_code == 200
+
+
+class TestRateLimiting:
+    def test_exceeding_the_limit_returns_429(self):
+        from common.ratelimit import RateLimiter
+
+        server = make_server(
+            port=0, rate_limiter=RateLimiter(max_requests=2, window_seconds=60)
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = "http://%s:%d" % server.server_address[:2]
+        try:
+            url = base_url + "/search?capability=" + TERRAFORM_CAP
+            assert requests.get(url, timeout=5).status_code == 200
+            assert requests.get(url, timeout=5).status_code == 200
+            assert requests.get(url, timeout=5).status_code == 429  # over cap
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)

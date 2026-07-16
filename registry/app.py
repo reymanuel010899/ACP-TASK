@@ -250,9 +250,10 @@ class RegistryService(object):
 class RegistryHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, service):
-        # type: (tuple, RegistryService) -> None
+    def __init__(self, address, service, rate_limiter=None):
+        # type: (tuple, RegistryService, object) -> None
         self.service = service
+        self.rate_limiter = rate_limiter
         ThreadingHTTPServer.__init__(self, address, _RequestHandler)
 
 
@@ -285,6 +286,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return header[len(prefix):].strip()
         return None
 
+    def _rate_ok(self):
+        # type: () -> bool
+        limiter = getattr(self.server, "rate_limiter", None)
+        if limiter is None or limiter.allow(self.client_address[0]):
+            return True
+        self._send_json(429, {"error": "rate limit exceeded"})
+        return False
+
     def _read_json_body(self):
         # type: () -> Tuple[Optional[dict], Optional[str]]
         try:
@@ -303,6 +312,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
         return body, None
 
     def do_GET(self):
+        if not self._rate_ok():
+            return
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
 
@@ -337,6 +348,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._rate_ok():
+            return
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         body, error = self._read_json_body()
@@ -374,8 +387,9 @@ def make_server(
     reputation_store=None,
     verification_url=None,
     admin_token=None,
+    rate_limiter=None,
 ):
-    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str]) -> RegistryHTTPServer
+    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str], object) -> RegistryHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     if service is None:
         service = RegistryService(
@@ -384,7 +398,7 @@ def make_server(
             verification_url=verification_url,
             admin_token=admin_token,
         )
-    return RegistryHTTPServer((host, port), service)
+    return RegistryHTTPServer((host, port), service, rate_limiter=rate_limiter)
 
 
 def main(argv=None):

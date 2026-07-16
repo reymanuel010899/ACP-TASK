@@ -355,9 +355,10 @@ class VerificationService(object):
 class VerificationHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, service):
-        # type: (tuple, VerificationService) -> None
+    def __init__(self, address, service, rate_limiter=None):
+        # type: (tuple, VerificationService, object) -> None
         self.service = service
+        self.rate_limiter = rate_limiter
         ThreadingHTTPServer.__init__(self, address, _RequestHandler)
 
 
@@ -397,7 +398,17 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return None, "request body must be a JSON object"
         return body, None
 
+    def _rate_ok(self):
+        # type: () -> bool
+        limiter = getattr(self.server, "rate_limiter", None)
+        if limiter is None or limiter.allow(self.client_address[0]):
+            return True
+        self._send_json(429, {"error": "rate limit exceeded"})
+        return False
+
     def do_GET(self):
+        if not self._rate_ok():
+            return
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
 
@@ -443,6 +454,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._rate_ok():
+            return
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         body, error = self._read_json_body()
@@ -468,12 +481,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
 
-def make_server(port=0, host="127.0.0.1", store=None, service=None):
-    # type: (int, str, Optional[ReputationStore], Optional[VerificationService]) -> VerificationHTTPServer
+def make_server(port=0, host="127.0.0.1", store=None, service=None, rate_limiter=None):
+    # type: (int, str, Optional[ReputationStore], Optional[VerificationService], object) -> VerificationHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     if service is None:
         service = VerificationService(store if store is not None else ReputationStore())
-    return VerificationHTTPServer((host, port), service)
+    return VerificationHTTPServer((host, port), service, rate_limiter=rate_limiter)
 
 
 def main(argv=None):
