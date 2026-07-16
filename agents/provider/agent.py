@@ -37,6 +37,7 @@ from typing import Optional, Tuple
 import nacl.signing
 import requests
 
+from agents.provider.config import PricingConfig
 from agents.provider.terraform_generate import (
     SUPPORTED_LOAD_BALANCERS,
     generate_terraform,
@@ -145,13 +146,15 @@ class ProviderAgent(object):
         registry_url=None,
         api_key=None,
         keys_dir=None,
+        pricing=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (str, str, Optional[str], Optional[str], Optional[str], float) -> None
+        # type: (str, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> None
         self.base_url = base_url
         self.verification_url = verification_url
         self.registry_url = registry_url
         self.api_key = api_key
+        self.pricing = pricing if pricing is not None else PricingConfig()
         self.http_timeout = http_timeout
 
         if keys_dir is None:
@@ -271,6 +274,8 @@ class ProviderAgent(object):
         payload_type = payload.get("type")
         if payload_type == "task.request":
             return self._handle_request(payload)
+        if payload_type == "task.counter":
+            return self._handle_counter(payload)
         if payload_type == "task.accept":
             return self._handle_accept(payload)
         raise RpcError(
@@ -284,29 +289,67 @@ class ProviderAgent(object):
             raise RpcError(-32602, "invalid task.request: %s" % reason)
         task_id = "task-%s" % uuid.uuid4().hex
         with self._lock:
-            self._pending_tasks[task_id] = dict(payload["input"])
+            self._pending_tasks[task_id] = {
+                "input": dict(payload["input"]),
+                "price": self.pricing.list_price,
+            }
+        return self._offer(task_id, self.pricing.list_price)
+
+    def _offer(self, task_id, price):
+        # type: (str, float) -> dict
+        """Build a public task.offer. Only the public price crosses the wire;
+        ``self.pricing.min_price`` is never referenced in the returned object
+        (R2 / KTD-N2)."""
         return {
             "type": "task.offer",
             "task_id": task_id,
             "capability_id": CAPABILITY_ID,
+            "price": price,
+            "currency": self.pricing.currency,
+            "delivery": "immediate",
             "terms": {
-                "price": "0",
-                "currency": "USD",
-                "delivery": "immediate",
                 "verification": "evidence submitted to an independent "
                 "verification service before completion",
             },
         }
 
+    def _handle_counter(self, payload):
+        # type: (dict) -> dict
+        """One counter-offer round (RFC-0002 §6.3, KTD-N4).
+
+        Accept the proposal iff it meets the private reservation; otherwise
+        HOLD the current list price. Holding at the list price (not at the
+        reservation) is deliberate: re-offering exactly ``min_price`` on a
+        low-ball would hand the floor to any requester who proposes 0, which
+        is the extraction R2 exists to prevent. A below-floor counter simply
+        gets no concession — the standing price is unchanged.
+        """
+        task_id = payload.get("task_id")
+        proposed = payload.get("proposed_price")
+        if not isinstance(proposed, (int, float)) or isinstance(proposed, bool):
+            raise RpcError(-32602, "task.counter needs a numeric proposed_price")
+        with self._lock:
+            task = self._pending_tasks.get(task_id)
+            if task is None:
+                raise RpcError(
+                    -32602, "unknown or already-completed task_id: %r" % (task_id,)
+                )
+            if proposed >= self.pricing.min_price:
+                task["price"] = float(proposed)  # accept the concession
+            # else: below reservation -> hold; task["price"] stays as-is
+            standing = task["price"]
+        return self._offer(task_id, standing)
+
     def _handle_accept(self, payload):
         # type: (dict) -> dict
         task_id = payload.get("task_id")
         with self._lock:
-            task_input = self._pending_tasks.pop(task_id, None)
-        if task_input is None:
+            task = self._pending_tasks.pop(task_id, None)
+        if task is None:
             raise RpcError(
                 -32602, "unknown or already-completed task_id: %r" % (task_id,)
             )
+        task_input = task["input"]
         hcl = generate_terraform(
             task_input["containers"], task_input["load_balancer"]
         )
@@ -315,6 +358,8 @@ class ProviderAgent(object):
             "type": "task.result",
             "task_id": task_id,
             "task_state": "completed",
+            "price": task["price"],
+            "currency": self.pricing.currency,
             "artifacts": {"main.tf": hcl},
         }
         return {"result": result, "trust": self._submit_evidence(evidence)}
@@ -381,9 +426,10 @@ class ProviderHTTPServer(ThreadingHTTPServer):
         registry_url=None,
         api_key=None,
         keys_dir=None,
+        pricing=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (tuple, str, Optional[str], Optional[str], Optional[str], float) -> None
+        # type: (tuple, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> None
         ThreadingHTTPServer.__init__(self, address, _RequestHandler)
         self.agent = ProviderAgent(
             base_url="http://%s:%d" % self.server_address[:2],
@@ -391,6 +437,7 @@ class ProviderHTTPServer(ThreadingHTTPServer):
             registry_url=registry_url,
             api_key=api_key,
             keys_dir=keys_dir,
+            pricing=pricing,
             http_timeout=http_timeout,
         )
 
@@ -520,9 +567,10 @@ def make_server(
     registry_url=None,
     api_key=None,
     keys_dir=None,
+    pricing=None,
     http_timeout=DEFAULT_HTTP_TIMEOUT,
 ):
-    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], float) -> ProviderHTTPServer
+    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> ProviderHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     return ProviderHTTPServer(
         (host, port),
@@ -530,6 +578,7 @@ def make_server(
         registry_url=registry_url,
         api_key=api_key,
         keys_dir=keys_dir,
+        pricing=pricing,
         http_timeout=http_timeout,
     )
 
@@ -561,7 +610,34 @@ def main(argv=None):
         help="Directory holding the Principal's local ed25519 key "
         "(default: agents/provider/keys, git-ignored).",
     )
+    parser.add_argument(
+        "--list-price",
+        type=float,
+        default=None,
+        help="Public asking price quoted in task.offer.",
+    )
+    parser.add_argument(
+        "--min-price",
+        type=float,
+        default=None,
+        help="PRIVATE reservation floor; never serialized. Counters below "
+        "it are declined.",
+    )
+    parser.add_argument("--currency", default=None)
     args = parser.parse_args(argv)
+
+    pricing = None
+    if any(
+        v is not None for v in (args.list_price, args.min_price, args.currency)
+    ):
+        kwargs = {}
+        if args.list_price is not None:
+            kwargs["list_price"] = args.list_price
+        if args.min_price is not None:
+            kwargs["min_price"] = args.min_price
+        if args.currency is not None:
+            kwargs["currency"] = args.currency
+        pricing = PricingConfig(**kwargs)
 
     server = make_server(
         port=args.port,
@@ -570,6 +646,7 @@ def main(argv=None):
         registry_url=args.registry_url,
         api_key=args.api_key,
         keys_dir=args.keys_dir,
+        pricing=pricing,
     )
     if args.registry_url:
         registered = server.agent.register_with_registry()

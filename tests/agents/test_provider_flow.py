@@ -48,9 +48,12 @@ from agents.provider.terraform_generate import (
     validate_own_output,
 )
 
+from agents.provider.config import PricingConfig
+
 CAPABILITY_ID = "terraform.generate"
 
 AGENTS_DIR = Path(provider_agent.__file__).resolve().parent
+ROOT = AGENTS_DIR.parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -473,3 +476,128 @@ def test_session_signature_is_canonical_and_valid(tmp_path):
         VerifyKey(public_key).verify(claims, signature)  # raises if invalid
     finally:
         provider.server_close()
+
+
+# ---------------------------------------------------------------------------
+# U2: pricing, private reservation, and the single counter-offer round
+# ---------------------------------------------------------------------------
+
+from jsonschema import Draft7Validator  # noqa: E402
+
+OFFER_SCHEMA = json.loads(
+    (ROOT / "schemas" / "offer.schema.json").read_text()
+)
+
+
+@pytest.fixture
+def priced_provider(tmp_path):
+    """A standalone provider with a known list/reservation and a dead verifier
+    (offer/counter need no verification; accept degrades to pending)."""
+    provider = provider_agent.make_server(
+        port=0,
+        verification_url="http://127.0.0.1:%d" % free_port(),
+        keys_dir=str(tmp_path / "keys"),
+        pricing=PricingConfig(list_price=5.0, min_price=3.0, currency="USD"),
+    )
+    start_server(provider)
+    try:
+        yield provider
+    finally:
+        provider.shutdown()
+        provider.server_close()
+
+
+def request_offer(url):
+    resp = send_rpc(
+        url,
+        {
+            "type": "task.request",
+            "input": {"containers": 2, "load_balancer": "alb"},
+        },
+    )
+    return data_part(resp.json()["result"])
+
+
+def counter(url, task_id, price):
+    resp = send_rpc(
+        url,
+        {"type": "task.counter", "task_id": task_id, "proposed_price": price},
+    )
+    return resp.json()
+
+
+def test_offer_carries_price_and_currency_and_validates(priced_provider):
+    offer = request_offer(base_url(priced_provider))
+    assert offer["price"] == 5.0  # list price
+    assert offer["currency"] == "USD"
+    Draft7Validator(OFFER_SCHEMA).validate(offer)  # matches U1 schema
+
+
+def test_counter_at_or_above_reservation_is_accepted(priced_provider):
+    url = base_url(priced_provider)
+    offer = request_offer(url)
+    body = counter(url, offer["task_id"], 4.0)  # 4 >= min 3 -> accept
+    new_offer = data_part(body["result"])
+    assert new_offer["type"] == "task.offer"
+    assert new_offer["price"] == 4.0
+    Draft7Validator(OFFER_SCHEMA).validate(new_offer)
+
+
+def test_counter_below_reservation_holds_and_never_reveals_floor(priced_provider):
+    url = base_url(priced_provider)
+    offer = request_offer(url)
+    body = counter(url, offer["task_id"], 0.5)  # 0.5 < min 3 -> hold
+    held = data_part(body["result"])
+    # Holds the LIST price (5), never concedes down to the reservation (3):
+    # a low-ball extracts nothing, and the floor is never revealed.
+    assert held["price"] == 5.0
+    assert held["price"] >= 3.0
+
+
+def test_min_price_is_never_serialized(priced_provider):
+    url = base_url(priced_provider)
+    card = requests.get(
+        url + "/.well-known/agent-card.json", timeout=5
+    ).json()
+    offer = request_offer(url)
+    counter_reply = counter(url, offer["task_id"], 0.5)
+    for blob in (card, offer, counter_reply):
+        text = json.dumps(blob).lower()
+        for forbidden in ("min_price", "reservation", "floor", "minimum_price"):
+            assert forbidden not in text, "%r leaked in %s" % (forbidden, text)
+
+
+def test_accepted_counter_price_rides_the_result(priced_provider):
+    url = base_url(priced_provider)
+    offer = request_offer(url)
+    counter(url, offer["task_id"], 4.0)
+    accept = send_rpc(
+        url, {"type": "task.accept", "task_id": offer["task_id"]}
+    ).json()
+    result = data_part(accept["result"])
+    assert result["task_state"] == "completed"
+    assert result["price"] == 4.0  # the negotiated price, not the list price
+    assert result["currency"] == "USD"
+
+
+def test_single_offer_path_still_closes_without_a_counter(priced_provider):
+    # Graceful degradation (R7): request -> accept, no counter, still completes
+    # at the list price.
+    url = base_url(priced_provider)
+    offer = request_offer(url)
+    accept = send_rpc(
+        url, {"type": "task.accept", "task_id": offer["task_id"]}
+    ).json()
+    result = data_part(accept["result"])
+    assert result["task_state"] == "completed"
+    assert result["price"] == 5.0
+
+
+def test_counter_on_unknown_task_is_invalid(priced_provider):
+    body = counter(base_url(priced_provider), "task-never-offered", 4.0)
+    assert body["error"]["code"] == -32602
+
+
+def test_pricing_config_rejects_list_below_min():
+    with pytest.raises(ValueError):
+        PricingConfig(list_price=2.0, min_price=5.0)
