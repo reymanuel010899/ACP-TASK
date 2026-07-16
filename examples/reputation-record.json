@@ -1,0 +1,8 @@
+{
+  "principal_id": "atp:principal:agents.example.com:terraformsmith",
+  "capability_id": "terraform.generate",
+  "tasks_verified": 12,
+  "tasks_rejected": 1,
+  "verification_rate": 0.9230769230769231,
+  "updated_at": "2026-07-14T10:05:37Z"
+}
