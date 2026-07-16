@@ -39,7 +39,8 @@ def test_serves_the_page(console):
     assert resp.status_code == 200
     assert "text/html" in resp.headers["Content-Type"]
     assert "AgentTrust" in resp.text
-    assert "Buscar proveedor y ejecutar" in resp.text
+    assert "Pedirlo a mi agente" in resp.text
+    assert "¿Qué necesitás?" in resp.text
 
 
 def test_healthz(console):
@@ -78,6 +79,31 @@ def test_cheaper_provider_wins_the_competition(console):
     # round it should win.
     assert outcome["provider_name"] == "BudgetInfra"
     assert outcome["price_paid"] < 4.0  # counter pushed it below list
+
+
+def test_task_via_natural_language(console):
+    # The consumer path: free text -> the agent interprets and runs it.
+    resp = requests.post(
+        base_url(console) + "/api/task",
+        json={"text": "necesito infra para una app web con 3 contenedores"},
+        timeout=30,
+    )
+    assert resp.status_code == 200
+    outcome = resp.json()
+    assert outcome["status"] == "verified", outcome
+    # The agent echoes what it understood, and it built the 3-container task.
+    assert "3" in outcome["interpretation"]
+    assert outcome["artifacts"]["main.tf"].count('resource "aws_ecs_service"') == 3
+
+
+def test_non_infra_text_is_declined(console):
+    resp = requests.post(
+        base_url(console) + "/api/task",
+        json={"text": "editame este video para instagram"},
+        timeout=10,
+    )
+    assert resp.status_code == 400
+    assert "terraform" in resp.json()["error"].lower() or "infra" in resp.json()["error"].lower()
 
 
 def test_invalid_task_is_rejected(console):

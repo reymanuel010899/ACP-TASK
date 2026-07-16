@@ -56,11 +56,11 @@ PAGE_HTML = """<!doctype html>
   precio y trae el trabajo — verificado por un tercero independiente.</p>
 
   <div class="card">
-    <label for="containers">¿Cuántos contenedores querés desplegar?</label>
-    <input id="containers" type="number" min="1" value="2">
-    <label for="lb">¿Detrás de qué balanceador?</label>
-    <select id="lb"><option value="alb">AWS Application Load Balancer</option></select>
-    <button id="go" onclick="run()">Buscar proveedor y ejecutar</button>
+    <label for="text">¿Qué necesitás?</label>
+    <input id="text" type="text" autocomplete="off"
+      placeholder="Ej: necesito infra para una app web con 3 contenedores"
+      onkeydown="if(event.key==='Enter')run()">
+    <button id="go" onclick="run()">Pedirlo a mi agente</button>
   </div>
 
   <div id="result" class="card hidden"></div>
@@ -81,10 +81,7 @@ async function run() {
   try {
     var r = await fetch('/api/task', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        containers: parseInt(document.getElementById('containers').value, 10),
-        load_balancer: document.getElementById('lb').value
-      })
+      body: JSON.stringify({ text: document.getElementById('text').value })
     });
     var o = await r.json();
     if (!r.ok) { res.innerHTML = '<p class="err">Error: ' + (o.error||'') + '</p>'; return; }
@@ -92,7 +89,7 @@ async function run() {
   } catch (e) {
     res.innerHTML = '<p class="err">No se pudo completar: ' + e + '</p>';
   } finally {
-    btn.disabled = false; btn.textContent = 'Buscar proveedor y ejecutar';
+    btn.disabled = false; btn.textContent = 'Pedirlo a mi agente';
   }
 }
 
@@ -100,7 +97,10 @@ function render(o) {
   var res = document.getElementById('result');
   if (o.status === 'verified') {
     var tf = (o.artifacts && o.artifacts['main.tf']) || '';
-    res.innerHTML =
+    var understood = o.interpretation
+      ? '<p class="meta">Tu agente entendió: <b>' + esc(o.interpretation) + '</b></p>'
+      : '';
+    res.innerHTML = understood +
       '<span class="badge ok">✓ Verificado independientemente</span>' +
       '<p class="meta">Contratado: <b>' + esc(o.provider_name) + '</b><br>' +
       'Pagaste <b>' + o.price_paid + ' ' + (o.currency||'') + '</b> · ' +

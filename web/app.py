@@ -33,6 +33,7 @@ from agents.requester.agent import RequesterAgent
 from agents.requester.config import RequesterConfig
 from registry.app import make_server as make_registry_server
 from services.verification.app import make_server as make_verification_server
+from web.nl import parse_request
 from web.page import PAGE_HTML
 
 CAPABILITY_ID = "terraform.generate"
@@ -181,26 +182,38 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "invalid JSON"})
             return
 
-        reason = _validate_task(payload)
-        if reason:
-            self._send(400, {"error": reason})
-            return
+        # Two ways in: free text ("necesito infra...") parsed by the NL
+        # translator, or a structured {containers, load_balancer} body.
+        interpretation = None
+        if isinstance(payload, dict) and "text" in payload:
+            task_input, message = parse_request(payload.get("text") or "")
+            if task_input is None:
+                self._send(400, {"error": message})
+                return
+            interpretation = message
+        else:
+            reason = _validate_task(payload)
+            if reason:
+                self._send(400, {"error": reason})
+                return
+            task_input = {
+                "containers": payload["containers"],
+                "load_balancer": payload["load_balancer"],
+            }
 
         config = RequesterConfig(
             registry_url=self.stack.registry_url,
             capability=CAPABILITY_ID,
-            task_input={
-                "containers": payload["containers"],
-                "load_balancer": payload["load_balancer"],
-            },
+            task_input=task_input,
             # The requester trusts THIS verifier for portfolio checks (F3).
             verification_url=self.stack.verification_url,
         )
         outcome = RequesterAgent(config).run_competitive()
-        # Enrich with the friendly provider name for the UI.
+        # Enrich for the UI: friendly provider name + what the agent understood.
         outcome["provider_name"] = self.stack.name_for(
             outcome.get("provider_principal_id")
         )
+        outcome["interpretation"] = interpretation
         self._send(200, outcome)
 
 
