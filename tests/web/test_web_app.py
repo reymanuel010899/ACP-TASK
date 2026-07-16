@@ -7,17 +7,30 @@ negotiation -> independent verification -> result rendered.
 """
 
 import json
+import socket
 import threading
 
 import pytest
 import requests
 
-from web.app import DEMO_PROVIDERS, make_server
+from agents.provider import agent as provider_agent
+from agents.provider.config import PricingConfig
+from web.app import DEMO_PROVIDERS, _inspect_card, make_server
+
+TRUST_URI = provider_agent.TRUST_EXTENSION_URI
 
 
 def base_url(server):
     host, port = server.server_address[:2]
     return "http://%s:%d" % (host, port)
+
+
+def free_port():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 @pytest.fixture
@@ -124,3 +137,96 @@ def test_invalid_task_is_rejected(console):
 
 def test_unknown_path_is_404(console):
     assert requests.get(base_url(console) + "/nope", timeout=5).status_code == 404
+
+
+# ---- self-registration by Agent Card URL (no CLI) ---------------------------
+
+
+def test_register_provider_by_url_and_it_competes(console, tmp_path):
+    stack = console.stack
+    # A real provider on the same embedded stack (so it can submit evidence),
+    # NOT pre-registered — the web form does the registration.
+    prov = provider_agent.make_server(
+        port=0,
+        verification_url=stack.verification_url,
+        keys_dir=str(tmp_path / "extkeys"),
+        pricing=PricingConfig(list_price=2.0, min_price=1.0),  # cheapest
+    )
+    threading.Thread(target=prov.serve_forever, daemon=True).start()
+    try:
+        resp = requests.post(
+            base_url(console) + "/api/register-provider",
+            json={"url": base_url(prov)},
+            timeout=10,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["registered"] is True
+        assert "terraform.generate" in body["capabilities"]
+
+        # It now appears in the running registry's capability search.
+        search = requests.get(
+            stack.registry_url + "/search",
+            params={"capability": "terraform.generate"},
+            timeout=5,
+        ).json()
+        assert prov.agent.principal_id in [
+            c["principal_id"] for c in search["candidates"]
+        ]
+
+        # And it competes in the next task: 3 providers now, and the newcomer
+        # (cheapest) wins verified.
+        outcome = requests.post(
+            base_url(console) + "/api/task",
+            json={"text": "infra con 2 contenedores"},
+            timeout=30,
+        ).json()
+        assert outcome["status"] == "verified"
+        assert outcome["offers_considered"] == 3
+        assert outcome["provider_principal_id"] == prov.agent.principal_id
+    finally:
+        prov.shutdown()
+        prov.server_close()
+
+
+def test_register_provider_unreachable_url_is_400(console):
+    resp = requests.post(
+        base_url(console) + "/api/register-provider",
+        json={"url": "http://127.0.0.1:%d" % free_port()},
+        timeout=5,
+    )
+    assert resp.status_code == 400
+    assert "alcanzar" in resp.json()["error"].lower()
+
+
+def test_inspect_card_rejects_missing_trust_extension():
+    pid, caps, err = _inspect_card(
+        {"skills": [{"id": "x"}], "capabilities": {"extensions": []}}
+    )
+    assert pid is None
+    assert "confianza" in err.lower()
+
+
+def test_inspect_card_rejects_no_skills():
+    card = {
+        "capabilities": {
+            "extensions": [{"uri": TRUST_URI, "params": {"principal_id": "p1"}}]
+        },
+        "skills": [],
+    }
+    pid, caps, err = _inspect_card(card)
+    assert pid is None
+    assert "capacidad" in err.lower() or "skill" in err.lower()
+
+
+def test_inspect_card_accepts_valid_card():
+    card = {
+        "capabilities": {
+            "extensions": [{"uri": TRUST_URI, "params": {"principal_id": "p1"}}]
+        },
+        "skills": [{"id": "terraform.generate"}],
+    }
+    pid, caps, err = _inspect_card(card)
+    assert err is None
+    assert pid == "p1"
+    assert caps == ["terraform.generate"]

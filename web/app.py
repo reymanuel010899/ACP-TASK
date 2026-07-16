@@ -23,7 +23,7 @@ import os
 import threading
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -64,8 +64,9 @@ class DemoStack(object):
     not just an opaque id.
     """
 
-    def __init__(self, keys_root, provider_specs=DEMO_PROVIDERS):
-        # type: (str, List[dict]) -> None
+    def __init__(self, keys_root, provider_specs=DEMO_PROVIDERS, http_timeout=3.0):
+        # type: (str, List[dict], float) -> None
+        self.http_timeout = http_timeout
         self.verification = make_verification_server(port=0)
         _start(self.verification)
         self.verification_url = _base_url(self.verification)
@@ -104,6 +105,60 @@ class DemoStack(object):
         # type: (Optional[str]) -> Optional[str]
         return self.names.get(principal_id, principal_id)
 
+    def register_external(self, url):
+        # type: (str) -> Tuple[int, dict]
+        """Self-service registration by Agent Card URL — no CLI.
+
+        Fetches the provider's published Agent Card, validates it declares the
+        trust extension and a capability, mints an invite key, and registers it
+        with the running registry. Returns ``(http_status, body)``.
+        """
+        if not isinstance(url, str) or not url.strip():
+            return 400, {"error": "Pegá la URL de tu agente."}
+        card_url = url.rstrip("/") + "/.well-known/agent-card.json"
+        try:
+            resp = requests.get(card_url, timeout=self.http_timeout)
+            resp.raise_for_status()
+            card = resp.json()
+        except (requests.RequestException, ValueError):
+            return 400, {
+                "error": "No pude alcanzar tu agente en esa URL. ¿Está "
+                "corriendo y sirve /.well-known/agent-card.json?"
+            }
+
+        principal_id, capabilities, reason = _inspect_card(card)
+        if reason:
+            return 400, {"error": reason}
+
+        try:
+            api_key = requests.post(
+                self.registry_url + "/admin/api-keys", timeout=self.http_timeout
+            ).json()["api_key"]
+            registered = requests.post(
+                self.registry_url + "/register",
+                json={
+                    "agent_card": card,
+                    "principal_id": principal_id,
+                    "api_key": api_key,
+                },
+                timeout=self.http_timeout,
+            )
+        except requests.RequestException as exc:
+            return 502, {"error": "El registro no respondió: %s" % exc}
+        if registered.status_code != 200:
+            return 400, {
+                "error": "El registro rechazó el agente: %s"
+                % registered.json().get("error", registered.status_code)
+            }
+
+        self.names[principal_id] = card.get("name") or principal_id
+        return 200, {
+            "registered": True,
+            "name": card.get("name"),
+            "principal_id": principal_id,
+            "capabilities": capabilities,
+        }
+
     def shutdown(self):
         # type: () -> None
         for server in reversed(self._servers):
@@ -118,6 +173,45 @@ class WebServer(ThreadingHTTPServer):
         # type: (tuple, DemoStack) -> None
         self.stack = stack
         ThreadingHTTPServer.__init__(self, address, _Handler)
+
+
+def _inspect_card(card):
+    # type: (object) -> Tuple[Optional[str], list, Optional[str]]
+    """Validate a fetched Agent Card for self-registration.
+
+    Returns ``(principal_id, capability_ids, error)``. On any problem the
+    principal_id is None and error carries a user-facing reason.
+    """
+    trust_uri = provider_agent.TRUST_EXTENSION_URI
+    if not isinstance(card, dict):
+        return None, [], "El Agent Card no es un objeto JSON válido."
+    extensions = (card.get("capabilities") or {}).get("extensions") or []
+    trust = next(
+        (
+            e
+            for e in extensions
+            if isinstance(e, dict) and e.get("uri") == trust_uri
+        ),
+        None,
+    )
+    if trust is None:
+        return None, [], (
+            "Tu Agent Card no declara la extensión de confianza de AgentTrust "
+            "en capabilities.extensions[]."
+        )
+    principal_id = (trust.get("params") or {}).get("principal_id")
+    if not principal_id:
+        return None, [], (
+            "Tu extensión de confianza no declara un principal_id en params."
+        )
+    capabilities = [
+        s.get("id")
+        for s in (card.get("skills") or [])
+        if isinstance(s, dict) and s.get("id")
+    ]
+    if not capabilities:
+        return None, [], "Tu Agent Card no declara ninguna skill/capacidad."
+    return principal_id, capabilities, None
 
 
 def _validate_task(payload):
@@ -167,6 +261,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/api/register-provider":
+            self._handle_register_provider()
+            return
         if self.path != "/api/task":
             self._send(404, {"error": "not found"})
             return
@@ -215,6 +312,24 @@ class _Handler(BaseHTTPRequestHandler):
         )
         outcome["interpretation"] = interpretation
         self._send(200, outcome)
+
+    def _handle_register_provider(self):
+        # type: () -> None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+        status, body = self.stack.register_external(
+            payload.get("url") if isinstance(payload, dict) else None
+        )
+        self._send(status, body)
 
 
 def make_server(port=8000, host="127.0.0.1", keys_root=None):

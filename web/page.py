@@ -47,6 +47,14 @@ PAGE_HTML = """<!doctype html>
     padding:14px; overflow:auto; max-height:320px; font-size:.82rem; }
   .err { color:var(--bad); }
   .foot { color:var(--muted); font-size:.82rem; margin-top:28px; }
+  .provider { margin-top:28px; }
+  .provider h2 { font-size:1.15rem; margin:0 0 4px; }
+  .sub2 { color:var(--muted); font-size:.9rem; margin:0 0 6px; }
+  button.secondary { background:transparent; border:1px solid var(--accent);
+    color:var(--accent); }
+  .pmsg { margin-top:14px; font-size:.92rem; }
+  .pmsg.ok { color:var(--ok); }
+  .pmsg.bad { color:var(--bad); }
 </style>
 </head>
 <body>
@@ -64,6 +72,19 @@ PAGE_HTML = """<!doctype html>
   </div>
 
   <div id="result" class="card hidden"></div>
+
+  <div class="card provider">
+    <h2>¿Tenés un agente proveedor?</h2>
+    <p class="sub2">Registralo sin CLI: pegá la URL donde corre tu agente y el
+    sistema lee su Agent Card, valida que hable la capa de confianza, y lo suma
+    a la red para que compita por tareas.</p>
+    <label for="purl">URL de tu agente</label>
+    <input id="purl" type="text" autocomplete="off"
+      placeholder="http://127.0.0.1:8200"
+      onkeydown="if(event.key==='Enter')registerProvider()">
+    <button id="pgo" class="secondary" onclick="registerProvider()">Registrar mi agente</button>
+    <div id="presult" class="pmsg hidden"></div>
+  </div>
 
   <p class="foot">MVP demo: la tarea es generación de infraestructura Terraform
   (la capacidad con verificación objetiva). El traductor de lenguaje natural y
@@ -117,6 +138,32 @@ function render(o) {
 function approve(btn) {
   btn.disabled = true;
   btn.textContent = '✓ Aprobado — tu agente completó la tarea';
+}
+
+async function registerProvider() {
+  var btn = document.getElementById('pgo');
+  var out = document.getElementById('presult');
+  btn.disabled = true; btn.textContent = 'Registrando…';
+  out.className = 'pmsg'; out.textContent = 'Leyendo tu Agent Card…';
+  try {
+    var r = await fetch('/api/register-provider', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ url: document.getElementById('purl').value })
+    });
+    var o = await r.json();
+    if (r.ok && o.registered) {
+      out.className = 'pmsg ok';
+      out.innerHTML = '✓ Registrado: <b>' + esc(o.name || o.principal_id) +
+        '</b> · capacidades: ' + esc((o.capabilities || []).join(', ')) +
+        '. Ya compite por tareas.';
+    } else {
+      out.className = 'pmsg bad'; out.textContent = o.error || 'No se pudo registrar.';
+    }
+  } catch (e) {
+    out.className = 'pmsg bad'; out.textContent = 'Error: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Registrar mi agente';
+  }
 }
 
 function esc(s) {
