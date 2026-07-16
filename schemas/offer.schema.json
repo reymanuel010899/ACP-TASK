@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/offer.schema.json",
+  "title": "Offer",
+  "description": "A provider's public offer to perform a task at a stated price (the 'task.offer' message body, RFC-0002). The provider's private minimum/reservation price is NEVER part of this object: 'additionalProperties' is false, so only the public 'price' can cross the wire. A leaked reservation field is a schema-validation error by construction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "task_id", "capability_id", "price", "currency"],
+  "properties": {
+    "type": {
+      "const": "task.offer",
+      "description": "Message discriminator; always 'task.offer'."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task this offer is for.",
+      "minLength": 1
+    },
+    "capability_id": {
+      "type": "string",
+      "description": "Capability.id being offered, e.g. 'terraform.generate'.",
+      "minLength": 1
+    },
+    "price": {
+      "type": "number",
+      "description": "Public offered price. Always >= the provider's private reservation, which is not represented here (RFC-0002 §negotiation).",
+      "minimum": 0
+    },
+    "currency": {
+      "type": "string",
+      "description": "Currency code for 'price', e.g. 'USD'. Demo-scale value; no real funds move.",
+      "minLength": 1
+    },
+    "delivery": {
+      "type": "string",
+      "description": "Human-readable delivery term, e.g. 'immediate'."
+    },
+    "terms": {
+      "type": "object",
+      "description": "Optional non-price terms (e.g. verification commitment). MUST NOT carry any reservation/minimum-price field."
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/counter-offer.schema.json",
+  "title": "CounterOffer",
+  "description": "A requester's single-round counter-offer proposing a lower price for an existing task (the 'task.counter' message body, RFC-0002). The provider accepts if 'proposed_price' meets or exceeds its private reservation, otherwise it holds its floor. There is no unbounded haggling: one counter per task.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "task_id", "proposed_price"],
+  "properties": {
+    "type": {
+      "const": "task.counter",
+      "description": "Message discriminator; always 'task.counter'."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "Identifier of the task being re-negotiated (from the prior task.offer).",
+      "minLength": 1
+    },
+    "proposed_price": {
+      "type": "number",
+      "description": "The price the requester proposes. The provider's reservation is unknown to the requester by design.",
+      "minimum": 0
+    },
+    "currency": {
+      "type": "string",
+      "description": "Optional currency code for 'proposed_price'; defaults to the offer's currency.",
+      "minLength": 1
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}

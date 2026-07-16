@@ -18,6 +18,8 @@ EXAMPLES = [
     ("examples/evidence.json", "schemas/evidence.schema.json"),
     ("examples/verification-result.json", "schemas/verification-result.schema.json"),
     ("examples/reputation-record.json", "schemas/reputation-record.schema.json"),
+    ("examples/offer.json", "schemas/offer.schema.json"),
+    ("examples/counter-offer.json", "schemas/counter-offer.schema.json"),
 ]
 
 

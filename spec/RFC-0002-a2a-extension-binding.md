@@ -146,7 +146,67 @@ trust level; the two layers never contradict each other because they answer
 different questions ("did the agent finish?" vs. "does the work check out?").
 `evidence_status` MUST NOT influence A2A state-machine handling.
 
-## 6. Descriptor schema
+## 6. Competitive negotiation
+
+The base binding closes a task in a single offer round
+(`task.request` → `task.offer` → `task.accept`). This section extends that to
+a **competitive** negotiation so price can settle by competition rather than
+by taking the first offer. It adds one optional message (`task.counter`) and a
+priced Offer body; it adds no new A2A task state.
+
+### 6.1 Message cycle
+
+```
+task.request  → task.offer      (provider quotes a public price)
+[task.counter → task.offer]     (optional: one round, requester proposes a lower price)
+task.accept                     (requester closes at the standing price)
+```
+
+The counter round is **optional and single**. A requester MAY send exactly one
+`task.counter` per task before accepting; there is no unbounded haggling.
+
+### 6.2 Offer body (`schemas/offer.schema.json`)
+
+`task.offer` carries a public `price` and `currency`
+(`$id: https://agenttrust.example/schemas/offer.schema.json`). The price is a
+demo-scale number; **no real funds move** — escrow/payment is out of scope for
+this binding (a payment extension such as `a2a-x402` is the natural future
+home).
+
+### 6.3 Counter body (`schemas/counter-offer.schema.json`)
+
+`task.counter` carries the `task_id` and a `proposed_price`. On receiving it a
+provider MUST respond with an updated `task.offer`: it accepts the proposal
+(offering at `proposed_price`) **iff** the proposal meets or exceeds its
+private reservation; otherwise it holds its floor (re-offering at a price no
+lower than that reservation).
+
+### 6.4 The private-reservation rule (normative)
+
+A provider's minimum acceptable price (its reservation/floor) is **private**.
+It MUST NOT appear in the Agent Card, in any `task.offer`, in any
+`task.counter` response, or in any other serialized message. Both negotiation
+schemas set `additionalProperties: false`, so a leaked reservation field is a
+validation error by construction. Publishing the floor would collapse
+competition — every requester would simply propose exactly the floor.
+
+### 6.5 Reputation-gated selection
+
+Which provider wins is a **requester-side** decision, not a wire concern. A
+trust-aware requester SHOULD gate candidates by a per-capability reputation
+floor (§Reputation) before letting price compete, and MAY re-check a
+candidate's verified-evidence portfolio. Fitness is judged only from verified
+facts (reputation, portfolio) — never from a provider's self-reported
+internals.
+
+### 6.6 Graceful degradation
+
+`task.counter` is optional. A provider that does not implement it still closes
+via `task.request` → `task.offer` → `task.accept`, and a requester that does
+not negotiate competitively still uses the single-offer path. Negotiation
+never breaks the extension's opt-in, degrade-gracefully contract (§3).
+
+## 7. Descriptor schema
 
 `schemas/a2a-extension-descriptor.schema.json`
 (`$id: https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json`)
@@ -162,7 +222,7 @@ the `$id` base `https://agenttrust.example/schemas/`; offline validators
 SHOULD preload the sibling schema files into their resolver rather than
 fetching them.
 
-## 7. Compliance
+## 8. Compliance
 
 An implementation is RFC-0002 compliant if: (a) its Agent Card declaration
 entry validates against `#/definitions/agentExtension`; (b) it activates the

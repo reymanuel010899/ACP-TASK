@@ -1,0 +1,11 @@
+{
+  "type": "task.offer",
+  "task_id": "task-b8d21c44-6a7f-4e39-8f10-c93a5e07d612",
+  "capability_id": "terraform.generate",
+  "price": 5,
+  "currency": "USD",
+  "delivery": "immediate",
+  "terms": {
+    "verification": "evidence submitted to an independent verification service before completion"
+  }
+}
