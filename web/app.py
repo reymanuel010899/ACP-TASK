@@ -107,57 +107,9 @@ class DemoStack(object):
 
     def register_external(self, url):
         # type: (str) -> Tuple[int, dict]
-        """Self-service registration by Agent Card URL — no CLI.
-
-        Fetches the provider's published Agent Card, validates it declares the
-        trust extension and a capability, mints an invite key, and registers it
-        with the running registry. Returns ``(http_status, body)``.
-        """
-        if not isinstance(url, str) or not url.strip():
-            return 400, {"error": "Pegá la URL de tu agente."}
-        card_url = url.rstrip("/") + "/.well-known/agent-card.json"
-        try:
-            resp = requests.get(card_url, timeout=self.http_timeout)
-            resp.raise_for_status()
-            card = resp.json()
-        except (requests.RequestException, ValueError):
-            return 400, {
-                "error": "No pude alcanzar tu agente en esa URL. ¿Está "
-                "corriendo y sirve /.well-known/agent-card.json?"
-            }
-
-        principal_id, capabilities, reason = _inspect_card(card)
-        if reason:
-            return 400, {"error": reason}
-
-        try:
-            api_key = requests.post(
-                self.registry_url + "/admin/api-keys", timeout=self.http_timeout
-            ).json()["api_key"]
-            registered = requests.post(
-                self.registry_url + "/register",
-                json={
-                    "agent_card": card,
-                    "principal_id": principal_id,
-                    "api_key": api_key,
-                },
-                timeout=self.http_timeout,
-            )
-        except requests.RequestException as exc:
-            return 502, {"error": "El registro no respondió: %s" % exc}
-        if registered.status_code != 200:
-            return 400, {
-                "error": "El registro rechazó el agente: %s"
-                % registered.json().get("error", registered.status_code)
-            }
-
-        self.names[principal_id] = card.get("name") or principal_id
-        return 200, {
-            "registered": True,
-            "name": card.get("name"),
-            "principal_id": principal_id,
-            "capabilities": capabilities,
-        }
+        return _register_external(
+            self.registry_url, self.http_timeout, url, self.names
+        )
 
     def shutdown(self):
         # type: () -> None
@@ -169,9 +121,10 @@ class DemoStack(object):
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, stack):
-        # type: (tuple, DemoStack) -> None
-        self.stack = stack
+    def __init__(self, address, stack, provider_tokens=None):
+        # type: (tuple, object, Optional[dict]) -> None
+        self.stack = stack  # DemoStack (embedded) or ConnectedBackend
+        self.provider_tokens = dict(provider_tokens or {})
         ThreadingHTTPServer.__init__(self, address, _Handler)
 
 
@@ -212,6 +165,97 @@ def _inspect_card(card):
     if not capabilities:
         return None, [], "Tu Agent Card no declara ninguna skill/capacidad."
     return principal_id, capabilities, None
+
+
+def _register_external(registry_url, http_timeout, url, names, admin_token=None):
+    # type: (str, float, str, dict, Optional[str]) -> Tuple[int, dict]
+    """Self-service registration by Agent Card URL — no CLI. Fetches the
+    provider's published Agent Card, validates it, mints an invite key, and
+    registers it with ``registry_url``. Shared by the embedded and connected
+    backends. Returns ``(http_status, body)``."""
+    if not isinstance(url, str) or not url.strip():
+        return 400, {"error": "Pegá la URL de tu agente."}
+    card_url = url.rstrip("/") + "/.well-known/agent-card.json"
+    try:
+        resp = requests.get(card_url, timeout=http_timeout)
+        resp.raise_for_status()
+        card = resp.json()
+    except (requests.RequestException, ValueError):
+        return 400, {
+            "error": "No pude alcanzar tu agente en esa URL. ¿Está corriendo "
+            "y sirve /.well-known/agent-card.json?"
+        }
+
+    principal_id, capabilities, reason = _inspect_card(card)
+    if reason:
+        return 400, {"error": reason}
+
+    admin_headers = (
+        {"Authorization": "Bearer %s" % admin_token} if admin_token else {}
+    )
+    try:
+        api_key = requests.post(
+            registry_url + "/admin/api-keys",
+            headers=admin_headers,
+            timeout=http_timeout,
+        ).json()["api_key"]
+        registered = requests.post(
+            registry_url + "/register",
+            json={
+                "agent_card": card,
+                "principal_id": principal_id,
+                "api_key": api_key,
+            },
+            timeout=http_timeout,
+        )
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        return 502, {"error": "El registro no respondió bien: %s" % exc}
+    if registered.status_code != 200:
+        return 400, {
+            "error": "El registro rechazó el agente: %s"
+            % registered.json().get("error", registered.status_code)
+        }
+
+    names[principal_id] = card.get("name") or principal_id
+    return 200, {
+        "registered": True,
+        "name": card.get("name"),
+        "principal_id": principal_id,
+        "capabilities": capabilities,
+    }
+
+
+class ConnectedBackend(object):
+    """A backend that points at an EXTERNAL registry + verification service
+    (real providers live there), instead of booting an embedded demo stack.
+
+    Same surface the request handler uses: ``registry_url``,
+    ``verification_url``, ``name_for``, ``register_external``, ``shutdown``.
+    """
+
+    def __init__(self, registry_url, verification_url, admin_token=None,
+                 http_timeout=3.0):
+        # type: (str, str, Optional[str], float) -> None
+        self.registry_url = registry_url.rstrip("/")
+        self.verification_url = verification_url.rstrip("/")
+        self.admin_token = admin_token
+        self.http_timeout = http_timeout
+        self.names = {}
+
+    def name_for(self, principal_id):
+        # type: (Optional[str]) -> Optional[str]
+        return self.names.get(principal_id, principal_id)
+
+    def register_external(self, url):
+        # type: (str) -> Tuple[int, dict]
+        return _register_external(
+            self.registry_url, self.http_timeout, url, self.names,
+            admin_token=self.admin_token,
+        )
+
+    def shutdown(self):
+        # type: () -> None
+        pass  # nothing to tear down; the external stack is not ours
 
 
 def _validate_task(payload):
@@ -304,6 +348,8 @@ class _Handler(BaseHTTPRequestHandler):
             task_input=task_input,
             # The requester trusts THIS verifier for portfolio checks (F3).
             verification_url=self.stack.verification_url,
+            # Tokens to present to providers that require auth (U3).
+            provider_tokens=self.server.provider_tokens,
         )
         outcome = RequesterAgent(config).run_competitive()
         # Enrich for the UI: friendly provider name + what the agent understood.
@@ -332,24 +378,79 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(status, body)
 
 
-def make_server(port=8000, host="127.0.0.1", keys_root=None):
-    # type: (int, str, Optional[str]) -> WebServer
-    if keys_root is None:
-        keys_root = os.path.join(os.path.dirname(__file__), "keys")
-    stack = DemoStack(keys_root=keys_root)
-    return WebServer((host, port), stack)
+def make_server(
+    port=8000,
+    host="127.0.0.1",
+    keys_root=None,
+    registry_url=None,
+    verification_url=None,
+    admin_token=None,
+    provider_tokens=None,
+):
+    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[dict]) -> WebServer
+    """Connected mode when both registry_url and verification_url are given
+    (uses an external stack with real providers); embedded demo stack
+    otherwise (default)."""
+    if registry_url and verification_url:
+        stack = ConnectedBackend(
+            registry_url, verification_url, admin_token=admin_token
+        )
+    else:
+        if keys_root is None:
+            keys_root = os.path.join(os.path.dirname(__file__), "keys")
+        stack = DemoStack(keys_root=keys_root)
+    return WebServer((host, port), stack, provider_tokens=provider_tokens)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="AgentTrust MVP web console")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--registry-url",
+        default=None,
+        help="Connect to an external registry (with --verification-url) "
+        "instead of booting the embedded demo stack.",
+    )
+    parser.add_argument("--verification-url", default=None)
+    parser.add_argument(
+        "--admin-token",
+        default=None,
+        help="Admin token to mint invite keys when the external registry is "
+        "secured.",
+    )
+    parser.add_argument(
+        "--provider-token",
+        action="append",
+        default=None,
+        dest="provider_tokens",
+        metavar="PRINCIPAL_ID=TOKEN",
+        help="Bearer token to present to a provider that requires auth "
+        "(repeatable).",
+    )
     args = parser.parse_args(argv)
 
-    server = make_server(port=args.port, host=args.host)
+    provider_tokens = {}
+    for entry in args.provider_tokens or []:
+        principal, _, token = entry.partition("=")
+        if principal and token:
+            provider_tokens[principal] = token
+
+    connected = bool(args.registry_url and args.verification_url)
+    server = make_server(
+        port=args.port,
+        host=args.host,
+        registry_url=args.registry_url,
+        verification_url=args.verification_url,
+        admin_token=args.admin_token,
+        provider_tokens=provider_tokens,
+    )
     host, port = server.server_address[:2]
     print("AgentTrust MVP console: open http://%s:%d" % (host, port))
-    print("(embedded demo stack: verification + registry + 2 providers)")
+    if connected:
+        print("(connected to external stack: %s)" % args.registry_url)
+    else:
+        print("(embedded demo stack: verification + registry + 2 providers)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

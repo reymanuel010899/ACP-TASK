@@ -15,6 +15,8 @@ import requests
 
 from agents.provider import agent as provider_agent
 from agents.provider.config import PricingConfig
+from registry.app import make_server as make_registry_server
+from services.verification.app import make_server as make_verification_server
 from web.app import DEMO_PROVIDERS, _inspect_card, make_server
 
 TRUST_URI = provider_agent.TRUST_EXTENSION_URI
@@ -230,3 +232,110 @@ def test_inspect_card_accepts_valid_card():
     assert err is None
     assert pid == "p1"
     assert caps == ["terraform.generate"]
+
+
+# ---- U6: connected mode (external stack) + provider tokens ------------------
+
+
+class ExternalStack(object):
+    """A verification + registry + providers stack living OUTSIDE the console,
+    to exercise the console's connected mode."""
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self._n = 0
+        self.verification = make_verification_server(port=0)
+        threading.Thread(target=self.verification.serve_forever, daemon=True).start()
+        self.verification_url = base_url(self.verification)
+        self.registry = make_registry_server(
+            port=0, verification_url=self.verification_url
+        )
+        threading.Thread(target=self.registry.serve_forever, daemon=True).start()
+        self.registry_url = base_url(self.registry)
+        self.api_key = requests.post(
+            self.registry_url + "/admin/api-keys", timeout=5
+        ).json()["api_key"]
+        self.providers = []
+
+    def add_provider(self, list_price, min_price, auth_tokens=None):
+        self._n += 1
+        p = provider_agent.make_server(
+            port=0,
+            verification_url=self.verification_url,
+            registry_url=self.registry_url,
+            api_key=self.api_key,
+            keys_dir=str(self.tmp_path / ("ext-keys-%d" % self._n)),
+            pricing=PricingConfig(list_price=list_price, min_price=min_price),
+            auth_tokens=auth_tokens,
+        )
+        assert p.agent.register_with_registry()
+        threading.Thread(target=p.serve_forever, daemon=True).start()
+        self.providers.append(p)
+        return p
+
+    def shutdown(self):
+        for s in self.providers + [self.registry, self.verification]:
+            s.shutdown()
+            s.server_close()
+
+
+@pytest.fixture
+def external_stack(tmp_path):
+    stack = ExternalStack(tmp_path)
+    try:
+        yield stack
+    finally:
+        stack.shutdown()
+
+
+def _run_console(server):
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def test_connected_mode_runs_task_against_external_providers(external_stack):
+    external_stack.add_provider(list_price=4.0, min_price=2.0)
+    console = make_server(
+        port=0,
+        registry_url=external_stack.registry_url,
+        verification_url=external_stack.verification_url,
+    )
+    _run_console(console)
+    try:
+        outcome = requests.post(
+            base_url(console) + "/api/task",
+            json={"text": "infra con 2 contenedores"},
+            timeout=30,
+        ).json()
+        assert outcome["status"] == "verified", outcome
+        assert outcome["provider_principal_id"] == (
+            external_stack.providers[0].agent.principal_id
+        )
+    finally:
+        console.stack.shutdown()
+        console.shutdown()
+        console.server_close()
+
+
+def test_connected_mode_with_auth_provider_and_token(external_stack):
+    prov = external_stack.add_provider(
+        list_price=4.0, min_price=2.0, auth_tokens=["tok-xyz"]
+    )
+    console = make_server(
+        port=0,
+        registry_url=external_stack.registry_url,
+        verification_url=external_stack.verification_url,
+        provider_tokens={prov.agent.principal_id: "tok-xyz"},
+    )
+    _run_console(console)
+    try:
+        outcome = requests.post(
+            base_url(console) + "/api/task",
+            json={"text": "infra con 2 contenedores"},
+            timeout=30,
+        ).json()
+        assert outcome["status"] == "verified", outcome
+        assert outcome["provider_principal_id"] == prov.agent.principal_id
+    finally:
+        console.stack.shutdown()
+        console.shutdown()
+        console.server_close()
