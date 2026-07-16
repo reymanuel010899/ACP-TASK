@@ -219,7 +219,63 @@ via `task.request` → `task.offer` → `task.accept`, and a requester that does
 not negotiate competitively still uses the single-offer path. Negotiation
 never breaks the extension's opt-in, degrade-gracefully contract (§3).
 
-## 7. Descriptor schema
+## 7. Provider authentication (optional)
+
+A provider MAY require callers to authenticate before it accepts tasks. This
+uses A2A's **standard** Agent Card auth fields — no new mechanism — and is
+**orthogonal** to the trust extension: authentication answers *"may you call
+me?"* (access control), while the Principal/Session signatures of RFC-0001
+answer *"who did the work?"* (identity for reputation). The two never
+substitute for each other.
+
+### 7.1 Declaration
+
+A provider that requires authentication declares a security scheme and its
+requirement on its Agent Card, per A2A:
+
+```json
+{
+  "securitySchemes": {
+    "bearer": { "type": "http", "scheme": "bearer" }
+  },
+  "security": [ { "bearer": [] } ]
+}
+```
+
+Only the HTTP **bearer** scheme is specified here; other schemes (OAuth2,
+OpenID Connect, API-key) are out of scope for this binding.
+
+### 7.2 Presenting the credential
+
+A caller that wants to hire an authenticating provider MUST include the token
+in the standard HTTP header on every `message/send` request:
+
+```
+Authorization: Bearer <token>
+```
+
+The token travels at the transport layer, **not** inside the A2A message body
+or the trust metadata. The provider MUST validate it **before** processing the
+task and, on a missing or invalid token, respond `401` with a JSON-RPC error
+and perform no work (produce no artifact, submit no Evidence).
+
+### 7.3 Discovery stays public
+
+The Agent Card itself (`/.well-known/agent-card.json`) MUST remain readable
+**without** authentication, even when the provider requires a token for tasks —
+otherwise no one could discover the provider or learn *which* scheme it wants.
+Auth gates the task endpoints, not the public card.
+
+### 7.4 Opt-in and graceful degradation
+
+Authentication is entirely optional. A provider with no `securitySchemes`
+is **open** and accepts tasks from anyone, exactly as before. A caller that
+holds no token for an authenticating provider treats that provider as **not
+eligible** and skips it — it does not fail the whole request. Open and
+authenticating providers coexist in one network; a caller presents a token
+only to those that ask for one.
+
+## 8. Descriptor schema
 
 `schemas/a2a-extension-descriptor.schema.json`
 (`$id: https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json`)
@@ -235,7 +291,7 @@ the `$id` base `https://agenttrust.example/schemas/`; offline validators
 SHOULD preload the sibling schema files into their resolver rather than
 fetching them.
 
-## 8. Compliance
+## 9. Compliance
 
 An implementation is RFC-0002 compliant if: (a) its Agent Card declaration
 entry validates against `#/definitions/agentExtension`; (b) it activates the

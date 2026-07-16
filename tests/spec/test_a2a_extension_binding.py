@@ -285,6 +285,31 @@ class TestTrustMetadataPayload:
 # ---------------------------------------------------------------------------
 
 
+class TestProviderAuthBinding:
+    """RFC-0002 §7: optional provider auth via standard A2A security fields."""
+
+    def test_example_card_declares_bearer_scheme(self, agent_card):
+        # The example provider card advertises HTTP bearer auth (§7.1).
+        schemes = agent_card.get("securitySchemes", {})
+        assert "bearer" in schemes
+        assert schemes["bearer"]["type"] == "http"
+        assert schemes["bearer"]["scheme"] == "bearer"
+
+    def test_example_card_requires_that_scheme(self, agent_card):
+        # `security` lists the requirement, so this card requires auth.
+        assert {"bearer": []} in agent_card.get("security", [])
+
+    def test_card_without_security_is_open(self, agent_card):
+        # A provider that drops securitySchemes/security is "open": no auth
+        # requirement (§7.4 graceful degradation).
+        open_card = copy.deepcopy(agent_card)
+        open_card.pop("securitySchemes", None)
+        open_card.pop("security", None)
+        assert not open_card.get("security")
+        # It is still a valid A2A card that declares the trust extension.
+        assert find_trust_extension(open_card) is not None
+
+
 class TestGracefulDegradation:
     def make_plain_message(self, task_message):
         """The same task result as the server sends it when the client did
