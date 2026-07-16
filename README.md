@@ -34,6 +34,24 @@ credential extension) already do.
    independent Verification Result validates the submitted Evidence. A
    provider saying "done" is not enough.
 
+## Competitive pricing
+
+Providers compete on price. A requester asks several qualified providers for
+offers, runs a single counter-offer round with the cheapest, and closes with
+the fair-price winner. Two rules keep it honest:
+
+- **Trust gates price.** A provider must clear a per-capability reputation
+  floor to be eligible; only then does price compete. Fitness is judged from
+  verified facts (reputation, a re-checkable portfolio of verified work),
+  never from a provider's self-reported internals.
+- **The floor is private.** Each provider has a minimum (reservation) price it
+  never publishes — it is not in the Agent Card, the offer, or any counter
+  response. A counter below it is declined. Publishing the floor would collapse
+  competition, so the schemas forbid it from crossing the wire.
+
+No real money moves — price is a negotiated number (escrow/payment is a
+separate, deferred concern). See RFC-0002 §6.
+
 ## Layout
 
 ```

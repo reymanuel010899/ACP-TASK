@@ -70,12 +70,23 @@ python -m agents.provider.agent \
   --port 8100 \
   --verification-url http://127.0.0.1:8080 \
   --registry-url http://127.0.0.1:8090 \
-  --api-key <KEY>
+  --api-key <KEY> \
+  --list-price 5 --min-price 3
 ```
 
 Genera su par ed25519 localmente (git-ignorado, KTD8), publica su Agent Card
 en `/.well-known/agent-card.json` declarando la skill `terraform.generate` y
 la extensión de confianza, y se registra al arrancar.
+
+**Precios:** `--list-price` es el precio público que oferta; `--min-price` es
+su **reserva privada** (el piso que acepta), que **nunca** se serializa — no
+aparece en el Agent Card, ni en la oferta, ni en la respuesta a una
+contraoferta (R2/KTD-N2). Una contraoferta por debajo de la reserva se declina
+sosteniendo el precio de lista.
+
+Para una demo **competitiva**, levantá **varios** proveedores en puertos
+distintos con precios distintos (cada uno con su `--keys-dir` propio), p. ej.
+uno con `--list-price 9 --min-price 8` y otro con `--list-price 4 --min-price 2`.
 
 ### 5. Agente solicitante (proceso de una sola pasada)
 
@@ -83,8 +94,11 @@ la extensión de confianza, y se registra al arrancar.
 python -m agents.requester.agent --registry-url http://127.0.0.1:8090
 ```
 
-Busca en el registro, elige candidato por reputación, negocia la tarea en una
-sola ronda (`task.request` → `task.offer` → `task.accept`, KTD6) y trata la
+Por defecto **negocia de forma competitiva**: pide ofertas a varios
+proveedores calificados, corre una ronda de contraoferta con los más baratos
+(`task.request` → `task.offer` → `task.counter` → `task.offer` → `task.accept`),
+y elige al ganador de precio justo que pasa el **piso de reputación por
+capacidad** (con re-chequeo del portfolio de evidencia verificada). Trata la
 tarea como **genuinamente completa solo si la verificación independiente dice
 `verified`** (R4). Imprime el resultado como JSON y sale con código `0` solo
 si el resultado fue verificado.
@@ -96,13 +110,17 @@ Salida esperada (recortada):
   "status": "verified",
   "verified": true,
   "evidence_status": "verified",
+  "price_paid": 3.6,
+  "offers_considered": 2,
   "verification_result": { "verdict": "verified", ... },
   "artifacts": { "main.tf": "..." }
 }
 ```
 
 Opciones útiles: `--min-reputation 0.9` (solo proveedores probados),
-`--containers N`, `--load-balancer alb`.
+`--fan-out N` (a cuántos pedir oferta), `--top-counter N` (a cuántos
+contraofertar), `--single-offer` (camino heredado de una sola oferta,
+compatibilidad R7), `--containers N`, `--load-balancer alb`.
 
 ## Verificar la reputación actualizada
 
