@@ -1,0 +1,233 @@
+"""AgentTrust MVP web console (unit W1).
+
+The consumer-facing front end for the "Agent 1" (requester) idea: instead of a
+CLI, a person opens a web page, says what they need, and their requester agent
+discovers providers, negotiates competitively, gets the work done, and shows
+the result with its independent verification verdict — ready to approve.
+
+This module is the **operator's product surface**, not an independently-built
+agent, so (unlike ``agents/requester``) it may wire the demo stack together: on
+startup it boots the verification service, the registry, and a couple of demo
+providers in-process, then serves the UI and drives ``RequesterAgent`` behind a
+single HTTP endpoint. One command, open the browser, it works.
+
+The requester is configured with the trusted verification URL (so the F3
+portfolio check has a verifier it trusts), exactly as a real deployment would.
+
+Run: ``python -m web.app [--port 8000]`` then open http://127.0.0.1:8000
+"""
+
+import argparse
+import json
+import os
+import threading
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import List, Optional
+
+import requests
+
+from agents.provider import agent as provider_agent
+from agents.provider.config import PricingConfig
+from agents.requester.agent import RequesterAgent
+from agents.requester.config import RequesterConfig
+from registry.app import make_server as make_registry_server
+from services.verification.app import make_server as make_verification_server
+from web.page import PAGE_HTML
+
+CAPABILITY_ID = "terraform.generate"
+
+# Two demo providers with different prices, so the competitive negotiation has
+# something to compete over. (name shown in the UI, list/reservation prices.)
+DEMO_PROVIDERS = [
+    {"name": "FastInfra", "list_price": 9.0, "min_price": 7.0},
+    {"name": "BudgetInfra", "list_price": 4.0, "min_price": 2.0},
+]
+
+
+def _start(server):
+    # type: (ThreadingHTTPServer) -> None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def _base_url(server):
+    # type: (ThreadingHTTPServer) -> str
+    host, port = server.server_address[:2]
+    return "http://%s:%d" % (host, port)
+
+
+class DemoStack(object):
+    """Boots verification + registry + demo providers in-process.
+
+    Keeps a display name per provider principal so the UI can show *who* won,
+    not just an opaque id.
+    """
+
+    def __init__(self, keys_root, provider_specs=DEMO_PROVIDERS):
+        # type: (str, List[dict]) -> None
+        self.verification = make_verification_server(port=0)
+        _start(self.verification)
+        self.verification_url = _base_url(self.verification)
+
+        self.registry = make_registry_server(
+            port=0, verification_url=self.verification_url
+        )
+        _start(self.registry)
+        self.registry_url = _base_url(self.registry)
+
+        self.api_key = requests.post(
+            self.registry_url + "/admin/api-keys", timeout=5
+        ).json()["api_key"]
+
+        self.providers = []
+        self.names = {}  # principal_id -> display name
+        for index, spec in enumerate(provider_specs):
+            server = provider_agent.make_server(
+                port=0,
+                verification_url=self.verification_url,
+                registry_url=self.registry_url,
+                api_key=self.api_key,
+                keys_dir=os.path.join(keys_root, "provider-%d" % index),
+                pricing=PricingConfig(
+                    list_price=spec["list_price"], min_price=spec["min_price"]
+                ),
+            )
+            server.agent.register_with_registry()
+            _start(server)
+            self.providers.append(server)
+            self.names[server.agent.principal_id] = spec["name"]
+
+        self._servers = [self.verification, self.registry] + self.providers
+
+    def name_for(self, principal_id):
+        # type: (Optional[str]) -> Optional[str]
+        return self.names.get(principal_id, principal_id)
+
+    def shutdown(self):
+        # type: () -> None
+        for server in reversed(self._servers):
+            server.shutdown()
+            server.server_close()
+
+
+class WebServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, stack):
+        # type: (tuple, DemoStack) -> None
+        self.stack = stack
+        ThreadingHTTPServer.__init__(self, address, _Handler)
+
+
+def _validate_task(payload):
+    # type: (dict) -> Optional[str]
+    if not isinstance(payload, dict):
+        return "body must be a JSON object"
+    containers = payload.get("containers")
+    if isinstance(containers, bool) or not isinstance(containers, int):
+        return "containers must be an integer"
+    if containers < 1:
+        return "containers must be >= 1"
+    if payload.get("load_balancer") != "alb":
+        return "load_balancer must be 'alb'"
+    return None
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "AgentTrustWeb/0.1"
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def stack(self):
+        # type: () -> DemoStack
+        return self.server.stack
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        pass
+
+    def _send(self, status, body, content_type="application/json"):
+        # type: (int, object, str) -> None
+        if content_type == "application/json":
+            data = json.dumps(body).encode("utf-8")
+        else:
+            data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, PAGE_HTML, content_type="text/html; charset=utf-8")
+        elif self.path == "/healthz":
+            self._send(200, {"status": "ok"})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/task":
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+
+        reason = _validate_task(payload)
+        if reason:
+            self._send(400, {"error": reason})
+            return
+
+        config = RequesterConfig(
+            registry_url=self.stack.registry_url,
+            capability=CAPABILITY_ID,
+            task_input={
+                "containers": payload["containers"],
+                "load_balancer": payload["load_balancer"],
+            },
+            # The requester trusts THIS verifier for portfolio checks (F3).
+            verification_url=self.stack.verification_url,
+        )
+        outcome = RequesterAgent(config).run_competitive()
+        # Enrich with the friendly provider name for the UI.
+        outcome["provider_name"] = self.stack.name_for(
+            outcome.get("provider_principal_id")
+        )
+        self._send(200, outcome)
+
+
+def make_server(port=8000, host="127.0.0.1", keys_root=None):
+    # type: (int, str, Optional[str]) -> WebServer
+    if keys_root is None:
+        keys_root = os.path.join(os.path.dirname(__file__), "keys")
+    stack = DemoStack(keys_root=keys_root)
+    return WebServer((host, port), stack)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="AgentTrust MVP web console")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args(argv)
+
+    server = make_server(port=args.port, host=args.host)
+    host, port = server.server_address[:2]
+    print("AgentTrust MVP console: open http://%s:%d" % (host, port))
+    print("(embedded demo stack: verification + registry + 2 providers)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.stack.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
