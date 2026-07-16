@@ -81,11 +81,14 @@ def free_port():
     return port
 
 
-def send_rpc(url, payload, opt_in=True, method="message/send", req_id=None):
+def send_rpc(url, payload, opt_in=True, method="message/send", req_id=None,
+             token=None):
     """Drive the provider as an A2A JSON-RPC client."""
     headers = {}
     if opt_in:
         headers["A2A-Extensions"] = TRUST_EXTENSION_URI
+    if token is not None:
+        headers["Authorization"] = "Bearer %s" % token
     body = {
         "jsonrpc": "2.0",
         "id": req_id if req_id is not None else "req-%s" % uuid.uuid4().hex,
@@ -623,3 +626,82 @@ def test_counter_never_raises_the_price(priced_provider):
 def test_pricing_config_rejects_list_below_min():
     with pytest.raises(ValueError):
         PricingConfig(list_price=2.0, min_price=5.0)
+
+
+# ---------------------------------------------------------------------------
+# U2 (auth): provider declares and enforces bearer, opt-in
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def auth_provider(tmp_path):
+    provider = provider_agent.make_server(
+        port=0,
+        verification_url="http://127.0.0.1:%d" % free_port(),
+        keys_dir=str(tmp_path / "keys"),
+        auth_tokens=["s3cr3t"],
+    )
+    start_server(provider)
+    try:
+        yield provider
+    finally:
+        provider.shutdown()
+        provider.server_close()
+
+
+def test_open_provider_card_has_no_security(stack):
+    card = requests.get(
+        stack.provider_url + "/.well-known/agent-card.json", timeout=5
+    ).json()
+    assert "securitySchemes" not in card  # open provider, no auth (compat)
+    assert "security" not in card
+
+
+def test_auth_provider_card_declares_bearer(auth_provider):
+    card = requests.get(
+        base_url(auth_provider) + "/.well-known/agent-card.json", timeout=5
+    ).json()
+    assert card["securitySchemes"]["bearer"] == {
+        "type": "http",
+        "scheme": "bearer",
+    }
+    assert {"bearer": []} in card["security"]
+    # The token itself never appears in the card.
+    assert "s3cr3t" not in json.dumps(card)
+
+
+def test_well_known_is_public_even_with_auth(auth_provider):
+    # Discovery must work without a token (§7.3).
+    resp = requests.get(
+        base_url(auth_provider) + "/.well-known/agent-card.json", timeout=5
+    )
+    assert resp.status_code == 200
+
+
+def test_auth_provider_accepts_with_valid_token(auth_provider):
+    resp = send_rpc(
+        base_url(auth_provider),
+        {"type": "task.request", "input": {"containers": 2, "load_balancer": "alb"}},
+        token="s3cr3t",
+    )
+    assert resp.status_code == 200
+    offer = data_part(resp.json()["result"])
+    assert offer["type"] == "task.offer"
+
+
+def test_auth_provider_rejects_without_token(auth_provider):
+    resp = send_rpc(
+        base_url(auth_provider),
+        {"type": "task.request", "input": {"containers": 2, "load_balancer": "alb"}},
+    )
+    assert resp.status_code == 401
+    assert resp.headers.get("WWW-Authenticate") == "Bearer"
+
+
+def test_auth_provider_rejects_wrong_token(auth_provider):
+    resp = send_rpc(
+        base_url(auth_provider),
+        {"type": "task.request", "input": {"containers": 2, "load_balancer": "alb"}},
+        token="wrong",
+    )
+    assert resp.status_code == 401

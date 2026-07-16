@@ -147,14 +147,18 @@ class ProviderAgent(object):
         api_key=None,
         keys_dir=None,
         pricing=None,
+        auth_tokens=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (str, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> None
+        # type: (str, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], float) -> None
         self.base_url = base_url
         self.verification_url = verification_url
         self.registry_url = registry_url
         self.api_key = api_key
         self.pricing = pricing if pricing is not None else PricingConfig()
+        # Accepted bearer tokens (empty set = open, no auth required). Never
+        # serialized — only compared against the Authorization header (KTD-A3).
+        self.auth_tokens = set(auth_tokens or [])
         self.http_timeout = http_timeout
 
         if keys_dir is None:
@@ -178,6 +182,15 @@ class ProviderAgent(object):
     def principal_id(self):
         # type: () -> str
         return self.principal["principal_id"]
+
+    @property
+    def requires_auth(self):
+        # type: () -> bool
+        return bool(self.auth_tokens)
+
+    def token_ok(self, token):
+        # type: (Optional[str]) -> bool
+        return token is not None and token in self.auth_tokens
 
     # -- identity ---------------------------------------------------------------
 
@@ -205,7 +218,7 @@ class ProviderAgent(object):
 
     def agent_card(self):
         # type: () -> dict
-        return {
+        card = {
             "name": "AgentTrust demo provider",
             "description": "Generates Terraform HCL modules: N container "
             "services behind an AWS Application Load Balancer.",
@@ -244,6 +257,14 @@ class ProviderAgent(object):
                 }
             ],
         }
+        # Declare bearer auth via A2A's standard fields when this provider
+        # requires a token (RFC-0002 §7). The token itself is never in the card.
+        if self.requires_auth:
+            card["securitySchemes"] = {
+                "bearer": {"type": "http", "scheme": "bearer"}
+            }
+            card["security"] = [{"bearer": []}]
+        return card
 
     def register_with_registry(self):
         # type: () -> bool
@@ -437,9 +458,10 @@ class ProviderHTTPServer(ThreadingHTTPServer):
         api_key=None,
         keys_dir=None,
         pricing=None,
+        auth_tokens=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (tuple, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> None
+        # type: (tuple, str, Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], float) -> None
         ThreadingHTTPServer.__init__(self, address, _RequestHandler)
         self.agent = ProviderAgent(
             base_url="http://%s:%d" % self.server_address[:2],
@@ -448,6 +470,7 @@ class ProviderHTTPServer(ThreadingHTTPServer):
             api_key=api_key,
             keys_dir=keys_dir,
             pricing=pricing,
+            auth_tokens=auth_tokens,
             http_timeout=http_timeout,
         )
 
@@ -490,7 +513,39 @@ class _RequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
+    def _bearer_token(self):
+        # type: () -> Optional[str]
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if header.startswith(prefix):
+            return header[len(prefix):].strip()
+        return None
+
     def do_POST(self):
+        # Access control (RFC-0002 §7): if this provider requires auth, the
+        # caller MUST present a valid bearer token before any task is processed.
+        # Discovery (GET /.well-known/...) stays public — only POST is gated.
+        if self.agent.requires_auth and not self.agent.token_ok(
+            self._bearer_token()
+        ):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", "Bearer")
+            body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32001,
+                        "message": "authentication required: valid bearer "
+                        "token missing or invalid",
+                    },
+                }
+            ).encode("utf-8")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -578,9 +633,10 @@ def make_server(
     api_key=None,
     keys_dir=None,
     pricing=None,
+    auth_tokens=None,
     http_timeout=DEFAULT_HTTP_TIMEOUT,
 ):
-    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[PricingConfig], float) -> ProviderHTTPServer
+    # type: (int, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[PricingConfig], Optional[list], float) -> ProviderHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     return ProviderHTTPServer(
         (host, port),
@@ -589,6 +645,7 @@ def make_server(
         api_key=api_key,
         keys_dir=keys_dir,
         pricing=pricing,
+        auth_tokens=auth_tokens,
         http_timeout=http_timeout,
     )
 
@@ -634,6 +691,14 @@ def main(argv=None):
         "it are declined.",
     )
     parser.add_argument("--currency", default=None)
+    parser.add_argument(
+        "--auth-token",
+        action="append",
+        default=None,
+        dest="auth_tokens",
+        help="Accepted bearer token required to send tasks (repeatable). "
+        "Omit to run open (no auth).",
+    )
     args = parser.parse_args(argv)
 
     pricing = None
@@ -657,6 +722,7 @@ def main(argv=None):
         api_key=args.api_key,
         keys_dir=args.keys_dir,
         pricing=pricing,
+        auth_tokens=args.auth_tokens,
     )
     if args.registry_url:
         registered = server.agent.register_with_registry()
