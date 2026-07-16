@@ -33,9 +33,10 @@ class RequesterConfig(object):
         counter_fraction=0.9,
         require_portfolio_for_unproven=True,
         verification_url=None,
+        provider_tokens=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (str, str, dict, float, int, int, float, bool, Optional[str], float) -> None
+        # type: (str, str, dict, float, int, int, float, bool, Optional[str], dict, float) -> None
         if not registry_url:
             raise ValueError(
                 "registry_url is required (KTD5: the registry URL is "
@@ -65,4 +66,8 @@ class RequesterConfig(object):
         self.verification_url = (
             verification_url.rstrip("/") if verification_url else None
         )
+        # Bearer tokens to present to providers that require auth, keyed by
+        # principal_id. A provider that requires auth but has no token here is
+        # simply not eligible (RFC-0002 §7.4 / R3) — never a hard failure.
+        self.provider_tokens = dict(provider_tokens or {})
         self.http_timeout = http_timeout

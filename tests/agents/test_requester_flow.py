@@ -556,7 +556,7 @@ class CompetitiveStack(object):
         self.providers = []
         self._n = 0
 
-    def add_provider(self, list_price, min_price):
+    def add_provider(self, list_price, min_price, auth_tokens=None):
         self._n += 1
         p = provider_agent.make_server(
             port=0,
@@ -565,6 +565,7 @@ class CompetitiveStack(object):
             api_key=self.api_key,
             keys_dir=str(self.tmp_path / ("keys-%d" % self._n)),
             pricing=ProviderPricing(list_price=list_price, min_price=min_price),
+            auth_tokens=auth_tokens,
         )
         assert p.agent.register_with_registry()
         start_server(p)
@@ -663,6 +664,77 @@ def test_competitive_no_candidates_when_none_clear_floor(competitive_stack):
     )
     outcome = agent.run_competitive()
     assert outcome["status"] == "no_candidates"
+
+
+# ---- U3 (auth): requester presents token / skips without it -----------------
+
+
+def test_card_requires_auth_detection():
+    from agents.requester.agent import _card_requires_auth
+
+    assert _card_requires_auth({"security": [{"bearer": []}]}) is True
+    assert _card_requires_auth({"security": []}) is False
+    assert _card_requires_auth({}) is False
+
+
+def test_requester_with_token_hires_auth_provider(competitive_stack):
+    prov = competitive_stack.add_provider(
+        list_price=4.0, min_price=2.0, auth_tokens=["tok-123"]
+    )
+    agent = RequesterAgent(
+        make_config(
+            competitive_stack.registry_url,
+            provider_tokens={prov.agent.principal_id: "tok-123"},
+        )
+    )
+    outcome = agent.run_competitive()
+    assert outcome["status"] == "verified", outcome
+    assert outcome["provider_principal_id"] == prov.agent.principal_id
+
+
+def test_auth_provider_without_token_is_not_eligible(competitive_stack):
+    # Only an auth provider exists; the requester holds no token for it -> it is
+    # skipped, and the outcome is a clean no_candidates (never a crash).
+    competitive_stack.add_provider(
+        list_price=3.0, min_price=1.0, auth_tokens=["tok-123"]
+    )
+    outcome = RequesterAgent(
+        make_config(competitive_stack.registry_url)
+    ).run_competitive()
+    assert outcome["status"] == "no_candidates"
+
+
+def test_wrong_token_provider_is_dropped(competitive_stack):
+    competitive_stack.add_provider(
+        list_price=3.0, min_price=1.0, auth_tokens=["right"]
+    )
+    prov = competitive_stack.providers[-1]
+    outcome = RequesterAgent(
+        make_config(
+            competitive_stack.registry_url,
+            provider_tokens={prov.agent.principal_id: "WRONG"},
+        )
+    ).run_competitive()
+    # 401 drops it from the fan-out; it was the only one -> no_candidates.
+    assert outcome["status"] == "no_candidates"
+
+
+def test_open_and_auth_providers_coexist(competitive_stack):
+    # An open provider and an auth provider both registered; the requester has
+    # the token only for the auth one. Both are eligible; cheapest wins.
+    competitive_stack.add_provider(list_price=8.0, min_price=6.0)  # open
+    auth = competitive_stack.add_provider(
+        list_price=3.0, min_price=1.0, auth_tokens=["tok"]
+    )  # auth, cheaper
+    outcome = RequesterAgent(
+        make_config(
+            competitive_stack.registry_url,
+            provider_tokens={auth.agent.principal_id: "tok"},
+        )
+    ).run_competitive()
+    assert outcome["status"] == "verified"
+    assert outcome["offers_considered"] == 2  # both were eligible
+    assert outcome["provider_principal_id"] == auth.agent.principal_id
 
 
 # ---- F2: the final accept to the winner must not raise -----------------------

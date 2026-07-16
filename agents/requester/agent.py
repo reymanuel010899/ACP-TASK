@@ -97,11 +97,13 @@ class RequesterAgent(object):
 
     # -- A2A client -------------------------------------------------------------
 
-    def _send(self, provider_url, payload):
-        # type: (str, dict) -> dict
+    def _send(self, provider_url, payload, token=None):
+        # type: (str, dict, Optional[str]) -> dict
         """One A2A ``message/send`` JSON-RPC call, opting in to the trust layer.
 
-        Returns the JSON-RPC envelope (with ``result`` or ``error``).
+        When ``token`` is set it is presented as ``Authorization: Bearer`` for
+        providers that require auth (RFC-0002 §7.2). Returns the JSON-RPC
+        envelope (with ``result`` or ``error``).
         """
         body = {
             "jsonrpc": "2.0",
@@ -116,10 +118,13 @@ class RequesterAgent(object):
                 }
             },
         }
+        headers = {"A2A-Extensions": TRUST_EXTENSION_URI}
+        if token is not None:
+            headers["Authorization"] = "Bearer %s" % token
         resp = requests.post(
             provider_url,
             json=body,
-            headers={"A2A-Extensions": TRUST_EXTENSION_URI},
+            headers=headers,
             timeout=self.config.http_timeout,
         )
         resp.raise_for_status()
@@ -349,9 +354,15 @@ class RequesterAgent(object):
             meta = self._candidate_meta(candidate, index)
             if not meta["provider_url"]:
                 continue
-            offer = self._request_offer(meta["provider_url"], task_input)
+            # Not eligible: this provider requires auth and we hold no token
+            # for it (R3). Skip it — never fail the whole request.
+            if meta["requires_auth"] and not meta["token"]:
+                continue
+            offer = self._request_offer(
+                meta["provider_url"], task_input, meta["token"]
+            )
             if offer is None:
-                continue  # unreachable / refused -> drop this candidate
+                continue  # unreachable / refused / 401 -> drop this candidate
             meta["offer"] = offer
             meta["price"] = offer.get("price")
             meta["task_id"] = offer.get("task_id")
@@ -372,7 +383,7 @@ class RequesterAgent(object):
         ]:
             proposed = round(meta["price"] * self.config.counter_fraction, 4)
             updated = self._counter(
-                meta["provider_url"], meta["task_id"], proposed
+                meta["provider_url"], meta["task_id"], proposed, meta["token"]
             )
             if updated is not None and isinstance(
                 updated.get("price"), (int, float)
@@ -389,6 +400,7 @@ class RequesterAgent(object):
             result_env = self._send(
                 winner["provider_url"],
                 {"type": "task.accept", "task_id": winner["task_id"]},
+                token=winner["token"],
             )
         except requests.RequestException as exc:
             return _outcome(
@@ -427,10 +439,13 @@ class RequesterAgent(object):
     def _candidate_meta(self, candidate, index):
         # type: (dict, int) -> dict
         card = candidate.get("agent_card") or {}
+        principal_id = candidate.get("principal_id")
         return {
-            "principal_id": candidate.get("principal_id"),
+            "principal_id": principal_id,
             "provider_url": card.get("url"),
             "verification_rate": _rate_of(candidate),
+            "requires_auth": _card_requires_auth(card),
+            "token": self.config.provider_tokens.get(principal_id),
             "index": index,
         }
 
@@ -475,11 +490,13 @@ class RequesterAgent(object):
             return []
         return entries if isinstance(entries, list) else []
 
-    def _request_offer(self, provider_url, task_input):
-        # type: (str, dict) -> Optional[dict]
+    def _request_offer(self, provider_url, task_input, token=None):
+        # type: (str, dict, Optional[str]) -> Optional[dict]
         try:
             env = self._send(
-                provider_url, {"type": "task.request", "input": task_input}
+                provider_url,
+                {"type": "task.request", "input": task_input},
+                token=token,
             )
         except requests.RequestException:
             return None
@@ -490,8 +507,8 @@ class RequesterAgent(object):
             return None
         return offer
 
-    def _counter(self, provider_url, task_id, proposed_price):
-        # type: (str, str, float) -> Optional[dict]
+    def _counter(self, provider_url, task_id, proposed_price, token=None):
+        # type: (str, str, float, Optional[str]) -> Optional[dict]
         try:
             env = self._send(
                 provider_url,
@@ -500,6 +517,7 @@ class RequesterAgent(object):
                     "task_id": task_id,
                     "proposed_price": proposed_price,
                 },
+                token=token,
             )
         except requests.RequestException:
             return None
@@ -530,6 +548,14 @@ def _rate_of(candidate):
     # type: (dict) -> Optional[float]
     summary = candidate.get("reputation_summary") or {}
     return summary.get("verification_rate")
+
+
+def _card_requires_auth(agent_card):
+    # type: (dict) -> bool
+    """True if the provider's Agent Card declares an auth requirement (A2A
+    ``security``), meaning a caller must present a credential (RFC-0002 §7)."""
+    security = agent_card.get("security")
+    return isinstance(security, list) and len(security) > 0
 
 
 _REASONS = {
@@ -614,7 +640,22 @@ def main(argv=None):
         help="A TRUSTED verification service to check candidate portfolios "
         "against. Portfolio assurance is ignored unless this is set.",
     )
+    parser.add_argument(
+        "--provider-token",
+        action="append",
+        default=None,
+        dest="provider_tokens",
+        metavar="PRINCIPAL_ID=TOKEN",
+        help="Bearer token to present to a provider that requires auth "
+        "(repeatable).",
+    )
     args = parser.parse_args(argv)
+
+    provider_tokens = {}
+    for entry in args.provider_tokens or []:
+        principal, _, token = entry.partition("=")
+        if principal and token:
+            provider_tokens[principal] = token
 
     task_input = None
     if args.containers is not None or args.load_balancer is not None:
@@ -635,6 +676,7 @@ def main(argv=None):
         task_input=task_input,
         min_reputation=args.min_reputation,
         verification_url=args.verification_url,
+        provider_tokens=provider_tokens,
         **kwargs
     )
     agent = RequesterAgent(config)
