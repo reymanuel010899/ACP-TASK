@@ -461,3 +461,205 @@ def test_requester_opts_into_trust_extension(registry_only):
     register_stub(registry_url, api_key, stub)
     RequesterAgent(make_config(registry_url)).run()
     assert stub.seen_extensions_header == TRUST_EXTENSION_URI
+
+
+# ===========================================================================
+# U4: competitive negotiation
+# ===========================================================================
+
+from agents.provider import agent as provider_agent  # noqa: E402
+from agents.provider.config import PricingConfig as ProviderPricing  # noqa: E402
+
+
+def _rpc(url, payload):
+    """Drive a provider as a raw A2A client (trust extension opted in)."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": "t-%s" % uuid.uuid4().hex,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "messageId": "m",
+                "role": "user",
+                "parts": [{"kind": "data", "data": payload}],
+            }
+        },
+    }
+    return requests.post(
+        url, json=body, headers={"A2A-Extensions": TRUST_EXTENSION_URI}, timeout=10
+    ).json()
+
+
+def _data(env):
+    for part in env["result"]["parts"]:
+        if part.get("kind") == "data":
+            return part["data"]
+    raise AssertionError("no data part: %r" % (env,))
+
+
+# ---- winner-selection unit tests (no HTTP) --------------------------------
+
+
+def _offer(price, proven=True, rate=1.0, index=0, principal="p"):
+    return {
+        "price": price,
+        "proven": proven,
+        "verification_rate": rate,
+        "index": index,
+        "principal_id": principal,
+        "task_id": "t-%s" % principal,
+        "provider_url": "http://x",
+    }
+
+
+def test_select_winner_picks_cheapest():
+    offers = [_offer(9, index=0, principal="a"), _offer(4, index=1, principal="b")]
+    assert RequesterAgent._select_winner(offers)["principal_id"] == "b"
+
+
+def test_select_winner_prefers_proven_over_cheaper_unproven():
+    offers = [
+        _offer(3, proven=False, rate=None, index=0, principal="cheap-unproven"),
+        _offer(6, proven=True, rate=1.0, index=1, principal="proven"),
+    ]
+    # The cheaper one is unproven; a proven provider wins despite costing more.
+    assert RequesterAgent._select_winner(offers)["principal_id"] == "proven"
+
+
+def test_select_winner_tiebreak_by_reputation_then_order():
+    offers = [
+        _offer(5, rate=0.8, index=0, principal="lo-rep"),
+        _offer(5, rate=0.99, index=1, principal="hi-rep"),
+        _offer(5, rate=0.99, index=2, principal="hi-rep-later"),
+    ]
+    # Same price -> higher verification_rate wins; then earliest discovery.
+    assert RequesterAgent._select_winner(offers)["principal_id"] == "hi-rep"
+
+
+def test_competition_config_validation():
+    with pytest.raises(ValueError):
+        RequesterConfig(registry_url="http://x", fan_out=0)
+    with pytest.raises(ValueError):
+        RequesterConfig(registry_url="http://x", counter_fraction=1.5)
+
+
+# ---- integration: a real multi-provider competitive stack -----------------
+
+
+class CompetitiveStack(object):
+    def __init__(self, registry_url, verification_url, api_key, tmp_path):
+        self.registry_url = registry_url
+        self.verification_url = verification_url
+        self.api_key = api_key
+        self.tmp_path = tmp_path
+        self.providers = []
+        self._n = 0
+
+    def add_provider(self, list_price, min_price):
+        self._n += 1
+        p = provider_agent.make_server(
+            port=0,
+            verification_url=self.verification_url,
+            registry_url=self.registry_url,
+            api_key=self.api_key,
+            keys_dir=str(self.tmp_path / ("keys-%d" % self._n)),
+            pricing=ProviderPricing(list_price=list_price, min_price=min_price),
+        )
+        assert p.agent.register_with_registry()
+        start_server(p)
+        self.providers.append(p)
+        return p
+
+    def drive_one_verified_task(self, provider):
+        """Run request->accept against a provider so it earns reputation."""
+        url = base_url(provider)
+        offer = _data(
+            _rpc(
+                url,
+                {
+                    "type": "task.request",
+                    "input": {"containers": 2, "load_balancer": "alb"},
+                },
+            )
+        )
+        _rpc(url, {"type": "task.accept", "task_id": offer["task_id"]})
+
+
+@pytest.fixture
+def competitive_stack(tmp_path):
+    verification = make_verification_server(port=0)
+    start_server(verification)
+    verification_url = base_url(verification)
+    registry = make_registry_server(port=0, verification_url=verification_url)
+    start_server(registry)
+    registry_url = base_url(registry)
+    api_key = requests.post(
+        registry_url + "/admin/api-keys", timeout=5
+    ).json()["api_key"]
+    stack = CompetitiveStack(registry_url, verification_url, api_key, tmp_path)
+    try:
+        yield stack
+    finally:
+        for p in stack.providers:
+            p.shutdown()
+            p.server_close()
+        for server in (registry, verification):
+            server.shutdown()
+            server.server_close()
+
+
+def test_competitive_picks_cheapest_and_verifies(competitive_stack):
+    competitive_stack.add_provider(list_price=9.0, min_price=8.0)  # pricey
+    cheap = competitive_stack.add_provider(list_price=4.0, min_price=2.0)
+
+    agent = RequesterAgent(make_config(competitive_stack.registry_url))
+    outcome = agent.run_competitive()
+
+    assert outcome["status"] == "verified", outcome
+    assert outcome["offers_considered"] == 2
+    assert outcome["provider_principal_id"] == cheap.agent.principal_id
+    # Counter round pushed the cheap provider below its 4.0 list price
+    # (0.9 * 4.0 = 3.6, still >= its 2.0 floor, so it accepts).
+    assert outcome["price_paid"] == 3.6
+    assert 'resource "aws_lb"' in outcome["artifacts"]["main.tf"]
+
+
+def test_counter_below_floor_is_held_expensive_rival_can_win(competitive_stack):
+    # Cheap provider has a HIGH floor: 0.9*5=4.5 < 4.9 floor -> it holds at 5.
+    # The rival's counter 0.9*6=5.4 >= 5.0 floor -> it drops to 5.4... still
+    # pricier. Cheapest standing price wins.
+    competitive_stack.add_provider(list_price=5.0, min_price=4.9)  # holds at 5.0
+    competitive_stack.add_provider(list_price=6.0, min_price=5.0)  # drops to 5.4
+    agent = RequesterAgent(make_config(competitive_stack.registry_url))
+    outcome = agent.run_competitive()
+    assert outcome["status"] == "verified"
+    assert outcome["price_paid"] == 5.0  # the held price beat the 5.4 concession
+
+
+def test_reputation_floor_excludes_cheaper_unproven(competitive_stack):
+    cheap = competitive_stack.add_provider(list_price=3.0, min_price=1.0)
+    proven = competitive_stack.add_provider(list_price=9.0, min_price=5.0)
+    # Give only the pricey provider a verified history.
+    competitive_stack.drive_one_verified_task(proven)
+
+    agent = RequesterAgent(
+        make_config(competitive_stack.registry_url, min_reputation=0.9)
+    )
+    outcome = agent.run_competitive()
+
+    # The cheaper provider has no reputation, so the floor excludes it: only
+    # the proven (pricier) one is even considered.
+    assert outcome["status"] == "verified"
+    assert outcome["offers_considered"] == 1
+    assert outcome["provider_principal_id"] == proven.agent.principal_id
+    assert outcome["provider_principal_id"] != cheap.agent.principal_id
+
+
+def test_competitive_no_candidates_when_none_clear_floor(competitive_stack):
+    competitive_stack.add_provider(list_price=3.0, min_price=1.0)  # no history
+    agent = RequesterAgent(
+        make_config(competitive_stack.registry_url, min_reputation=0.9)
+    )
+    outcome = agent.run_competitive()
+    assert outcome["status"] == "no_candidates"

@@ -209,6 +209,11 @@ def test_requester_does_not_hang_when_provider_is_gone(demo):
     outcome, returncode = demo.run_requester(timeout=30)
     elapsed = time.time() - start
 
-    assert outcome["status"] == "provider_error", outcome
+    # The CLI now defaults to competitive negotiation: a gone provider is
+    # dropped as an unreachable candidate, so the clean non-verified outcome
+    # is 'no_candidates' (no usable offer) rather than 'provider_error'. Either
+    # way the point stands — a clean, bounded failure instead of a hang.
+    assert outcome["status"] in ("provider_error", "no_candidates"), outcome
+    assert outcome["verified"] is False
     assert returncode == 1
     assert elapsed < 25, "requester should fail fast, not hang (%.1fs)" % elapsed

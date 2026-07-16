@@ -28,18 +28,33 @@ class RequesterConfig(object):
         capability=DEFAULT_CAPABILITY,
         task_input=None,
         min_reputation=None,
+        fan_out=3,
+        top_counter=2,
+        counter_fraction=0.9,
+        require_portfolio_for_unproven=True,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
     ):
-        # type: (str, str, dict, float, float) -> None
+        # type: (str, str, dict, float, int, int, float, bool, float) -> None
         if not registry_url:
             raise ValueError(
                 "registry_url is required (KTD5: the registry URL is "
                 "configurable and never hardcoded)"
             )
+        if fan_out < 1:
+            raise ValueError("fan_out must be >= 1")
+        if not 0 < counter_fraction <= 1:
+            raise ValueError("counter_fraction must be in (0, 1]")
         self.registry_url = registry_url.rstrip("/")
         self.capability = capability
         self.task_input = (
             dict(task_input) if task_input is not None else dict(DEFAULT_TASK_INPUT)
         )
         self.min_reputation = min_reputation
+        # Competitive-negotiation knobs (U4):
+        self.fan_out = fan_out  # how many candidates to request offers from
+        self.top_counter = top_counter  # how many cheapest offers to counter
+        self.counter_fraction = counter_fraction  # counter at this * their price
+        # An unproven (no-history) candidate must show verified portfolio work
+        # to win over a proven one; assurance by verified facts (R4 / KTD-N3).
+        self.require_portfolio_for_unproven = require_portfolio_for_unproven
         self.http_timeout = http_timeout

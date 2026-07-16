@@ -260,8 +260,11 @@ class RequesterAgent(object):
         task_state,
         artifacts,
         trust,
+        price_paid=None,
+        currency=None,
+        offers_considered=0,
     ):
-        # type: (str, str, str, Optional[str], dict, Optional[dict]) -> dict
+        # type: (str, str, str, Optional[str], dict, Optional[dict], Optional[float], Optional[str], int) -> dict
         """Map A2A state + trust metadata onto a single outcome status.
 
         Independent verification is the gate for "done" (R4): a provider
@@ -295,8 +298,228 @@ class RequesterAgent(object):
             evidence_status=evidence_status,
             artifacts=artifacts,
             verification_result=verification_result,
+            price_paid=price_paid,
+            currency=currency,
+            offers_considered=offers_considered,
             reason=_REASONS[status],
         )
+
+    # -- competitive negotiation (U4) -------------------------------------------
+
+    def run_competitive(self, capability=None, task_input=None, min_reputation=None):
+        # type: (Optional[str], Optional[dict], Optional[float]) -> dict
+        """Discover many providers, collect offers, run one counter round, and
+        pick the fair-price winner that clears the trust gate (R1/R3/R4).
+
+        Reputation-per-capability is a hard eligibility floor (applied at
+        discovery); among the eligible, price competes, with verified-portfolio
+        assurance deciding ties in favor of proven providers over unproven ones
+        (KTD-N3). Never raises for an expected failure — each maps to a status.
+        """
+        capability = capability or self.config.capability
+        task_input = task_input if task_input is not None else self.config.task_input
+
+        try:
+            candidates = self.discover(capability, min_reputation)
+        except requests.RequestException as exc:
+            return _outcome(
+                "registry_unreachable",
+                capability=capability,
+                reason="registry at %s could not be reached: %s"
+                % (self.config.registry_url, exc),
+            )
+        if not candidates:
+            return _outcome(
+                "no_candidates",
+                capability=capability,
+                reason="no provider clears the reputation floor for %r"
+                % capability,
+            )
+
+        # Fan out to the top-N candidates by known reputation (KTD-N4).
+        # None (no history) sorts below any real rate.
+        candidates = sorted(
+            candidates,
+            key=lambda c: _rate_of(c) if _rate_of(c) is not None else -1.0,
+            reverse=True,
+        )[: self.config.fan_out]
+
+        offers = []  # each: dict(meta + offer + price + proven)
+        for index, candidate in enumerate(candidates):
+            meta = self._candidate_meta(candidate, index)
+            if not meta["provider_url"]:
+                continue
+            offer = self._request_offer(meta["provider_url"], task_input)
+            if offer is None:
+                continue  # unreachable / refused -> drop this candidate
+            meta["offer"] = offer
+            meta["price"] = offer.get("price")
+            meta["task_id"] = offer.get("task_id")
+            meta["proven"] = self._is_proven(meta, capability)
+            offers.append(meta)
+
+        offers = [o for o in offers if isinstance(o.get("price"), (int, float))]
+        if not offers:
+            return _outcome(
+                "no_candidates",
+                capability=capability,
+                reason="no candidate returned a usable priced offer",
+            )
+
+        # One counter round to the cheapest `top_counter` offers (KTD-N4).
+        for meta in sorted(offers, key=lambda o: o["price"])[
+            : self.config.top_counter
+        ]:
+            proposed = round(meta["price"] * self.config.counter_fraction, 4)
+            updated = self._counter(
+                meta["provider_url"], meta["task_id"], proposed
+            )
+            if updated is not None and isinstance(
+                updated.get("price"), (int, float)
+            ):
+                meta["price"] = updated["price"]  # accept-or-hold outcome
+
+        winner = self._select_winner(offers)
+
+        # Close with the winner and read the trust gate.
+        result_env = self._send(
+            winner["provider_url"],
+            {"type": "task.accept", "task_id": winner["task_id"]},
+        )
+        if "error" in result_env:
+            return _outcome(
+                "provider_error",
+                capability=capability,
+                provider_principal_id=winner["principal_id"],
+                task_id=winner["task_id"],
+                offers_considered=len(offers),
+                reason="winner refused task.accept: %s"
+                % result_env["error"].get("message"),
+            )
+        message = result_env.get("result") or {}
+        result = self._data_part(message) or {}
+        trust = self._trust_metadata(message)
+        return self._classify(
+            capability=capability,
+            principal_id=winner["principal_id"],
+            task_id=winner["task_id"],
+            task_state=result.get("task_state"),
+            artifacts=result.get("artifacts") or {},
+            trust=trust,
+            price_paid=winner["price"],
+            currency=(winner.get("offer") or {}).get("currency"),
+            offers_considered=len(offers),
+        )
+
+    def _candidate_meta(self, candidate, index):
+        # type: (dict, int) -> dict
+        card = candidate.get("agent_card") or {}
+        return {
+            "principal_id": candidate.get("principal_id"),
+            "provider_url": card.get("url"),
+            "verification_url": _verification_url_of(card),
+            "verification_rate": _rate_of(candidate),
+            "index": index,
+        }
+
+    def _is_proven(self, meta, capability):
+        # type: (dict, str) -> bool
+        """Proven = has a per-capability reputation rate, or verified portfolio
+        work the requester can re-check. Judged only from verified facts (R4)."""
+        if meta.get("verification_rate") is not None:
+            return True
+        if not self.config.require_portfolio_for_unproven:
+            return True
+        portfolio = self._fetch_portfolio(
+            meta.get("verification_url"), meta.get("principal_id"), capability
+        )
+        return len(portfolio) > 0
+
+    def _fetch_portfolio(self, verification_url, principal_id, capability):
+        # type: (Optional[str], Optional[str], str) -> List[dict]
+        """Best-effort verified-work lookup; any failure means 'no portfolio'."""
+        if not verification_url or not principal_id:
+            return []
+        try:
+            resp = requests.get(
+                verification_url.rstrip("/")
+                + "/portfolio/"
+                + quote(principal_id, safe=""),
+                params={"capability_id": capability},
+                timeout=self.config.http_timeout,
+            )
+            resp.raise_for_status()
+            entries = resp.json().get("portfolio", [])
+        except (requests.RequestException, ValueError):
+            return []
+        return entries if isinstance(entries, list) else []
+
+    def _request_offer(self, provider_url, task_input):
+        # type: (str, dict) -> Optional[dict]
+        try:
+            env = self._send(
+                provider_url, {"type": "task.request", "input": task_input}
+            )
+        except requests.RequestException:
+            return None
+        if "error" in env:
+            return None
+        offer = self._data_part(env.get("result") or {}) or {}
+        if offer.get("type") != "task.offer" or not offer.get("task_id"):
+            return None
+        return offer
+
+    def _counter(self, provider_url, task_id, proposed_price):
+        # type: (str, str, float) -> Optional[dict]
+        try:
+            env = self._send(
+                provider_url,
+                {
+                    "type": "task.counter",
+                    "task_id": task_id,
+                    "proposed_price": proposed_price,
+                },
+            )
+        except requests.RequestException:
+            return None
+        if "error" in env:
+            return None
+        return self._data_part(env.get("result") or {})
+
+    @staticmethod
+    def _select_winner(offers):
+        # type: (List[dict]) -> dict
+        """Cheapest offer wins; proven providers are preferred over unproven,
+        then higher reputation, then discovery order (KTD-N3)."""
+        proven = [o for o in offers if o.get("proven")]
+        pool = proven if proven else offers
+
+        def key(o):
+            rate = o.get("verification_rate")
+            return (
+                o["price"],
+                -(rate if rate is not None else -1.0),
+                o["index"],
+            )
+
+        return min(pool, key=key)
+
+
+def _rate_of(candidate):
+    # type: (dict) -> Optional[float]
+    summary = candidate.get("reputation_summary") or {}
+    return summary.get("verification_rate")
+
+
+def _verification_url_of(agent_card):
+    # type: (dict) -> Optional[str]
+    """The provider's verification service URL, declared in the trust
+    extension params on its Agent Card (RFC-0002 §2)."""
+    caps = agent_card.get("capabilities") or {}
+    for ext in caps.get("extensions") or []:
+        if isinstance(ext, dict) and ext.get("uri") == TRUST_EXTENSION_URI:
+            return (ext.get("params") or {}).get("verification_service_url")
+    return None
 
 
 _REASONS = {
@@ -320,6 +543,9 @@ def _outcome(status, **fields):
         "evidence_status": fields.get("evidence_status"),
         "artifacts": fields.get("artifacts") or {},
         "verification_result": fields.get("verification_result"),
+        "price_paid": fields.get("price_paid"),
+        "currency": fields.get("currency"),
+        "offers_considered": fields.get("offers_considered", 0),
         "reason": fields.get("reason", ""),
     }
     return outcome
@@ -354,6 +580,24 @@ def main(argv=None):
         default=None,
         help="Only consider providers whose verification_rate is >= this.",
     )
+    parser.add_argument(
+        "--fan-out",
+        type=int,
+        default=None,
+        help="How many candidates to request competing offers from.",
+    )
+    parser.add_argument(
+        "--top-counter",
+        type=int,
+        default=None,
+        help="How many of the cheapest offers to send a counter-offer to.",
+    )
+    parser.add_argument(
+        "--single-offer",
+        action="store_true",
+        help="Use the legacy single-offer path instead of competitive "
+        "negotiation (graceful-degradation / compatibility).",
+    )
     args = parser.parse_args(argv)
 
     task_input = None
@@ -364,13 +608,20 @@ def main(argv=None):
         if args.load_balancer is not None:
             task_input["load_balancer"] = args.load_balancer
 
+    kwargs = {}
+    if args.fan_out is not None:
+        kwargs["fan_out"] = args.fan_out
+    if args.top_counter is not None:
+        kwargs["top_counter"] = args.top_counter
     config = RequesterConfig(
         registry_url=args.registry_url,
         capability=args.capability or "terraform.generate",
         task_input=task_input,
         min_reputation=args.min_reputation,
+        **kwargs
     )
-    outcome = RequesterAgent(config).run()
+    agent = RequesterAgent(config)
+    outcome = agent.run() if args.single_offer else agent.run_competitive()
     json.dump(outcome, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     # Exit non-zero unless the task was genuinely, independently verified.
