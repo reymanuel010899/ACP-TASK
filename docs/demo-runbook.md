@@ -149,3 +149,63 @@ El `reputation_summary` del candidato muestra `tasks_verified >= 1` y
 Si el proveedor muere a mitad de flujo, el solicitante devuelve
 `provider_error` en tiempo acotado en vez de colgarse (recoge el hueco de
 liveness del estado RUNNING; el diseño completo de heartbeat queda diferido).
+
+## Autenticación y seguridad (opcional)
+
+Todo lo de abajo es **opt-in**: sin estas flags, la red funciona abierta como
+en la demo básica. La autenticación es del estándar A2A (`securitySchemes`), no
+un mecanismo nuevo (ver RFC-0002 §7).
+
+**Proveedor que exige un token.** Arrancalo con `--auth-token`:
+
+```bash
+python -m agents.provider.agent --port 8100 \
+  --verification-url http://127.0.0.1:8080 \
+  --registry-url http://127.0.0.1:8090 --api-key <KEY> \
+  --auth-token mi-token-secreto
+```
+
+Su Agent Card declara `securitySchemes: bearer`; valida el header
+`Authorization: Bearer` **antes** de procesar (401 sin token). El
+`/.well-known/agent-card.json` sigue público.
+
+**Solicitante que presenta el token.** Le pasás `principal_id=token` (el
+`principal_id` sale de la Agent Card del proveedor):
+
+```bash
+python -m agents.requester.agent --registry-url http://127.0.0.1:8090 \
+  --provider-token atp:principal:demo-provider:XXXX=mi-token-secreto
+```
+
+Sin el token, un proveedor que exige auth **no es elegible** (se saltea); los
+proveedores abiertos siguen compitiendo sin token.
+
+**Registro con admin protegido.** `--admin-token` hace que emitir invite-keys
+requiera ese token:
+
+```bash
+python -m registry.app --port 8090 --verification-url http://127.0.0.1:8080 \
+  --admin-token adm-secreto
+curl -s -X POST http://127.0.0.1:8090/admin/api-keys \
+  -H "Authorization: Bearer adm-secreto"
+```
+
+**Rate-limiting.** `--rate-limit N` limita a N solicitudes por IP por ventana
+de 60s (429 al exceder):
+
+```bash
+python -m registry.app --port 8090 --rate-limit 100
+```
+
+**Consola web conectada a un stack externo** (con proveedores reales, con o sin
+auth):
+
+```bash
+python -m web.app --port 8000 \
+  --registry-url http://127.0.0.1:8090 \
+  --verification-url http://127.0.0.1:8080 \
+  --provider-token atp:principal:demo-provider:XXXX=mi-token-secreto
+```
+
+**Diferido a producción:** TLS/HTTPS, rotación de tokens/claves, OAuth2/OIDC,
+un emisor de tokens, y resistencia Sybil con staking.

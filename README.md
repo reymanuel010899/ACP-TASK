@@ -52,6 +52,25 @@ the fair-price winner. Two rules keep it honest:
 No real money moves — price is a negotiated number (escrow/payment is a
 separate, deferred concern). See RFC-0002 §6.
 
+## Authentication & security (optional)
+
+Everything here is **opt-in** — the network runs open by default, and open and
+authenticating providers coexist in one network.
+
+- **Provider auth.** A provider may require a bearer token, declared via A2A's
+  standard `securitySchemes`/`security` on its Agent Card (no new mechanism).
+  It validates the `Authorization: Bearer` header before doing any work; the
+  requester reads the scheme, presents its configured token, and simply skips
+  any authenticating provider it has no token for. Auth (access) is orthogonal
+  to the trust layer (identity). See RFC-0002 §7.
+- **Admin gating.** The registry's key-minting endpoint can require an admin
+  token (`--admin-token`).
+- **Rate limiting.** Basic per-IP fixed-window limiting on the public
+  endpoints (`--rate-limit N`), returning 429 past the cap.
+
+Deferred to production: TLS/HTTPS, token/key rotation, OAuth2/OIDC, a token
+issuer, and staking-based Sybil resistance.
+
 ## Layout
 
 ```

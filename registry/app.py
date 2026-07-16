@@ -429,6 +429,12 @@ def main(argv=None):
         help="If set, POST /admin/api-keys requires this bearer token. "
         "Omit to leave the admin surface open (demo default).",
     )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Max requests per IP per 60s window (0 = off).",
+    )
     args = parser.parse_args(argv)
 
     index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
@@ -437,7 +443,17 @@ def main(argv=None):
         verification_url=args.verification_url,
         admin_token=args.admin_token,
     )
-    server = make_server(port=args.port, host=args.host, service=service)
+    rate_limiter = None
+    if args.rate_limit > 0:
+        from common.ratelimit import RateLimiter
+
+        rate_limiter = RateLimiter(
+            max_requests=args.rate_limit, window_seconds=60
+        )
+    server = make_server(
+        port=args.port, host=args.host, service=service,
+        rate_limiter=rate_limiter,
+    )
     print(
         "AgentTrust registry listening on http://%s:%d"
         % server.server_address[:2]
