@@ -191,10 +191,12 @@ curl -s -X POST http://127.0.0.1:8090/admin/api-keys \
 ```
 
 **Rate-limiting.** `--rate-limit N` limita a N solicitudes por IP por ventana
-de 60s (429 al exceder):
+de 60s (429 al exceder). Disponible en los tres servicios:
 
 ```bash
 python -m registry.app --port 8090 --rate-limit 100
+python -m services.verification.app --port 8080 --rate-limit 100
+python -m agents.provider.agent --port 8100 --rate-limit 100 ...
 ```
 
 **Consola web conectada a un stack externo** (con proveedores reales, con o sin

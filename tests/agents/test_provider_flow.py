@@ -601,6 +601,26 @@ def test_counter_on_unknown_task_is_invalid(priced_provider):
     assert body["error"]["code"] == -32602
 
 
+def test_provider_rate_limit_returns_429(tmp_path):
+    from common.ratelimit import RateLimiter
+
+    provider = provider_agent.make_server(
+        port=0,
+        verification_url="http://127.0.0.1:%d" % free_port(),
+        keys_dir=str(tmp_path / "keys"),
+        rate_limiter=RateLimiter(max_requests=2, window_seconds=60),
+    )
+    start_server(provider)
+    try:
+        url = base_url(provider) + "/healthz"
+        codes = [requests.get(url, timeout=5).status_code for _ in range(3)]
+        assert codes[:2] == [200, 200]
+        assert codes[2] == 429
+    finally:
+        provider.shutdown()
+        provider.server_close()
+
+
 def test_second_counter_is_a_no_op_no_floor_oracle(priced_provider):
     # Security (R2): only the FIRST counter is evaluated. Further counters
     # must not reveal accept/hold per proposed_price, or a client could
@@ -705,3 +725,43 @@ def test_auth_provider_rejects_wrong_token(auth_provider):
         token="wrong",
     )
     assert resp.status_code == 401
+
+
+def test_bearer_scheme_is_case_insensitive(auth_provider):
+    # 'bearer' (lowercase) is a valid scheme per RFC 9110.
+    resp = requests.post(
+        base_url(auth_provider),
+        json={
+            "jsonrpc": "2.0", "id": "x", "method": "message/send",
+            "params": {"message": {"kind": "message", "messageId": "m",
+                       "role": "user", "parts": [{"kind": "data", "data": {
+                           "type": "task.request",
+                           "input": {"containers": 1, "load_balancer": "alb"}}}]}},
+        },
+        headers={"Authorization": "bearer s3cr3t"},
+        timeout=5,
+    )
+    assert resp.status_code == 200
+
+
+def test_401_does_not_desync_keepalive(auth_provider):
+    # P1 regression: after a 401, a reused keep-alive connection must not
+    # desync. A pooled Session sends an unauthenticated POST (401), then an
+    # authenticated one — the second must succeed, not get a 400 from leftover
+    # body bytes.
+    url = base_url(auth_provider)
+    payload = {
+        "jsonrpc": "2.0", "id": "1", "method": "message/send",
+        "params": {"message": {"kind": "message", "messageId": "m",
+                   "role": "user", "parts": [{"kind": "data", "data": {
+                       "type": "task.request",
+                       "input": {"containers": 1, "load_balancer": "alb"}}}]}},
+    }
+    with requests.Session() as s:
+        first = s.post(url, json=payload, timeout=5)  # no token
+        assert first.status_code == 401
+        second = s.post(  # same session/pool, valid token
+            url, json=payload, headers={"Authorization": "Bearer s3cr3t"},
+            timeout=5,
+        )
+        assert second.status_code == 200, second.text

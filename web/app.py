@@ -194,11 +194,23 @@ def _register_external(registry_url, http_timeout, url, names, admin_token=None)
         {"Authorization": "Bearer %s" % admin_token} if admin_token else {}
     )
     try:
-        api_key = requests.post(
+        mint = requests.post(
             registry_url + "/admin/api-keys",
             headers=admin_headers,
             timeout=http_timeout,
-        ).json()["api_key"]
+        )
+    except requests.RequestException as exc:
+        return 502, {"error": "El registro no respondió: %s" % exc}
+    if mint.status_code == 401:
+        return 502, {
+            "error": "El registro requiere un token de admin para emitir la "
+            "invitación (configurá el admin token en la consola)."
+        }
+    try:
+        api_key = mint.json()["api_key"]
+    except (ValueError, KeyError):
+        return 502, {"error": "El registro devolvió una respuesta inesperada."}
+    try:
         registered = requests.post(
             registry_url + "/register",
             json={
@@ -208,8 +220,8 @@ def _register_external(registry_url, http_timeout, url, names, admin_token=None)
             },
             timeout=http_timeout,
         )
-    except (requests.RequestException, ValueError, KeyError) as exc:
-        return 502, {"error": "El registro no respondió bien: %s" % exc}
+    except requests.RequestException as exc:
+        return 502, {"error": "El registro no respondió al registrar: %s" % exc}
     if registered.status_code != 200:
         return 400, {
             "error": "El registro rechazó el agente: %s"
@@ -392,6 +404,19 @@ def make_server(
     (uses an external stack with real providers); embedded demo stack
     otherwise (default)."""
     if registry_url and verification_url:
+        # Fail fast with a clear message when the external stack is unreachable,
+        # instead of degrading silently or crashing per-task later.
+        for name, url in (
+            ("registro", registry_url),
+            ("verificación", verification_url),
+        ):
+            try:
+                requests.get(url.rstrip("/") + "/healthz", timeout=3).raise_for_status()
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    "No pude alcanzar el %s en %s (¿está corriendo?): %s"
+                    % (name, url, exc)
+                )
         stack = ConnectedBackend(
             registry_url, verification_url, admin_token=admin_token
         )
@@ -432,19 +457,31 @@ def main(argv=None):
 
     provider_tokens = {}
     for entry in args.provider_tokens or []:
-        principal, _, token = entry.partition("=")
-        if principal and token:
-            provider_tokens[principal] = token
+        principal, sep, token = entry.partition("=")
+        if not sep or not principal or not token:
+            parser.error(
+                "--provider-token expects PRINCIPAL_ID=TOKEN, got %r" % entry
+            )
+        provider_tokens[principal] = token
+
+    if bool(args.registry_url) != bool(args.verification_url):
+        parser.error(
+            "--registry-url and --verification-url must be given together "
+            "(connected mode needs both)."
+        )
 
     connected = bool(args.registry_url and args.verification_url)
-    server = make_server(
-        port=args.port,
-        host=args.host,
-        registry_url=args.registry_url,
-        verification_url=args.verification_url,
-        admin_token=args.admin_token,
-        provider_tokens=provider_tokens,
-    )
+    try:
+        server = make_server(
+            port=args.port,
+            host=args.host,
+            registry_url=args.registry_url,
+            verification_url=args.verification_url,
+            admin_token=args.admin_token,
+            provider_tokens=provider_tokens,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
     host, port = server.server_address[:2]
     print("AgentTrust MVP console: open http://%s:%d" % (host, port))
     if connected:

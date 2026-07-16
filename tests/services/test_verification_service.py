@@ -502,6 +502,32 @@ class TestHTTPEndToEnd:
         )
         assert bad.status_code == 400
 
+    def test_rate_limit_returns_429(self):
+        import threading
+
+        import requests
+
+        from common.ratelimit import RateLimiter
+        from services.verification.app import make_server
+
+        server = make_server(
+            port=0, rate_limiter=RateLimiter(max_requests=2, window_seconds=60)
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = "http://%s:%d" % server.server_address[:2]
+        try:
+            codes = [
+                requests.get(base_url + "/healthz", timeout=5).status_code
+                for _ in range(3)
+            ]
+            assert codes[:2] == [200, 200]
+            assert codes[2] == 429
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_post_revocation_then_evidence_403(self, http_service):
         requests, base_url, _ = http_service
         _, payload = make_submission(principal_id="agent:dave")

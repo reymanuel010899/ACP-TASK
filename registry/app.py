@@ -56,6 +56,7 @@ Run: ``python -m registry.app --port 8090 [--verification-url URL]
 """
 
 import argparse
+import hmac
 import json
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -119,8 +120,10 @@ class RegistryService(object):
     def admin_ok(self, token):
         # type: (Optional[str]) -> bool
         """True when admin access is allowed: no token configured (open), or
-        the presented token matches the configured one."""
-        return self.admin_token is None or token == self.admin_token
+        the presented token matches (constant-time) the configured one."""
+        if self.admin_token is None:
+            return True
+        return token is not None and hmac.compare_digest(token, self.admin_token)
 
     # -- API keys ----------------------------------------------------------------
 
@@ -280,10 +283,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _bearer_token(self):
         # type: () -> Optional[str]
-        header = self.headers.get("Authorization", "")
-        prefix = "Bearer "
-        if header.startswith(prefix):
-            return header[len(prefix):].strip()
+        # Auth-scheme is case-insensitive per RFC 9110 §11.1.
+        parts = self.headers.get("Authorization", "").split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
         return None
 
     def _rate_ok(self):
@@ -291,6 +294,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         limiter = getattr(self.server, "rate_limiter", None)
         if limiter is None or limiter.allow(self.client_address[0]):
             return True
+        # Close: this early reply hasn't read the request body, so reusing the
+        # keep-alive connection would desync it.
+        self.close_connection = True
         self._send_json(429, {"error": "rate limit exceeded"})
         return False
 

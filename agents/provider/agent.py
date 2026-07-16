@@ -26,6 +26,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import hmac
 import json
 import os
 import threading
@@ -190,7 +191,10 @@ class ProviderAgent(object):
 
     def token_ok(self, token):
         # type: (Optional[str]) -> bool
-        return token is not None and token in self.auth_tokens
+        if token is None:
+            return False
+        # Constant-time compare against each accepted token (no timing leak).
+        return any(hmac.compare_digest(token, t) for t in self.auth_tokens)
 
     # -- identity ---------------------------------------------------------------
 
@@ -512,6 +516,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         limiter = getattr(self.server, "rate_limiter", None)
         if limiter is None or limiter.allow(self.client_address[0]):
             return True
+        # Close the connection: this early reply hasn't read the request body,
+        # so reusing the keep-alive connection would desync it.
+        self.close_connection = True
         self._send_json(429, {"error": "rate limit exceeded"})
         return False
 
@@ -527,10 +534,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _bearer_token(self):
         # type: () -> Optional[str]
-        header = self.headers.get("Authorization", "")
-        prefix = "Bearer "
-        if header.startswith(prefix):
-            return header[len(prefix):].strip()
+        # Auth-scheme is case-insensitive per RFC 9110 §11.1.
+        parts = self.headers.get("Authorization", "").split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
         return None
 
     def do_POST(self):
@@ -542,6 +549,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if self.agent.requires_auth and not self.agent.token_ok(
             self._bearer_token()
         ):
+            # Close: the request body is unread, so the keep-alive connection
+            # would desync if reused (mirror the same guard on 429).
+            self.close_connection = True
             self.send_response(401)
             self.send_header("WWW-Authenticate", "Bearer")
             body = json.dumps(
@@ -715,7 +725,21 @@ def main(argv=None):
         help="Accepted bearer token required to send tasks (repeatable). "
         "Omit to run open (no auth).",
     )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Max requests per IP per 60s window (0 = off).",
+    )
     args = parser.parse_args(argv)
+
+    rate_limiter = None
+    if args.rate_limit > 0:
+        from common.ratelimit import RateLimiter
+
+        rate_limiter = RateLimiter(
+            max_requests=args.rate_limit, window_seconds=60
+        )
 
     pricing = None
     if any(
@@ -739,6 +763,7 @@ def main(argv=None):
         keys_dir=args.keys_dir,
         pricing=pricing,
         auth_tokens=args.auth_tokens,
+        rate_limiter=rate_limiter,
     )
     if args.registry_url:
         registered = server.agent.register_with_registry()

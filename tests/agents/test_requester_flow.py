@@ -737,6 +737,22 @@ def test_open_and_auth_providers_coexist(competitive_stack):
     assert outcome["provider_principal_id"] == auth.agent.principal_id
 
 
+def test_token_less_requester_still_works_in_a_mixed_network(competitive_stack):
+    # The strongest backward-compat guarantee: a requester with NO tokens keeps
+    # working in a network that gained auth providers — the auth one is skipped,
+    # the OPEN one wins.
+    open_p = competitive_stack.add_provider(list_price=5.0, min_price=2.0)
+    competitive_stack.add_provider(
+        list_price=1.0, min_price=1.0, auth_tokens=["tok"]  # cheaper, but auth
+    )
+    outcome = RequesterAgent(
+        make_config(competitive_stack.registry_url)  # no tokens at all
+    ).run_competitive()
+    assert outcome["status"] == "verified", outcome
+    assert outcome["offers_considered"] == 1  # only the open one was eligible
+    assert outcome["provider_principal_id"] == open_p.agent.principal_id
+
+
 # ---- F2: the final accept to the winner must not raise -----------------------
 
 

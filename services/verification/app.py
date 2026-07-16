@@ -403,6 +403,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         limiter = getattr(self.server, "rate_limiter", None)
         if limiter is None or limiter.allow(self.client_address[0]):
             return True
+        # Close: this early reply hasn't read the request body, so reusing the
+        # keep-alive connection would desync it.
+        self.close_connection = True
         self._send_json(429, {"error": "rate limit exceeded"})
         return False
 
@@ -510,13 +513,29 @@ def main(argv=None):
         default=DEFAULT_VERIFIER_PRINCIPAL_ID,
         help="principal_id this verifier stamps on Verification Results.",
     )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Max requests per IP per 60s window (0 = off).",
+    )
     args = parser.parse_args(argv)
 
     store = ReputationStore(
         path=args.store_path, revocation_path=args.revocations_path
     )
     service = VerificationService(store, verifier_principal_id=args.verifier_id)
-    server = make_server(port=args.port, host=args.host, service=service)
+    rate_limiter = None
+    if args.rate_limit > 0:
+        from common.ratelimit import RateLimiter
+
+        rate_limiter = RateLimiter(
+            max_requests=args.rate_limit, window_seconds=60
+        )
+    server = make_server(
+        port=args.port, host=args.host, service=service,
+        rate_limiter=rate_limiter,
+    )
     print(
         "AgentTrust verification service listening on http://%s:%d"
         % server.server_address[:2]

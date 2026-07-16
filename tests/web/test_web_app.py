@@ -316,6 +316,18 @@ def test_connected_mode_runs_task_against_external_providers(external_stack):
         console.server_close()
 
 
+def test_connected_mode_unreachable_registry_fails_clearly():
+    # Plan U6: connected mode with an unreachable registry must fail with a
+    # clear error at startup, not degrade silently or crash per-task.
+    with pytest.raises(RuntimeError) as exc:
+        make_server(
+            port=0,
+            registry_url="http://127.0.0.1:%d" % free_port(),
+            verification_url="http://127.0.0.1:%d" % free_port(),
+        )
+    assert "alcanzar" in str(exc.value).lower()
+
+
 def test_connected_mode_with_auth_provider_and_token(external_stack):
     prov = external_stack.add_provider(
         list_price=4.0, min_price=2.0, auth_tokens=["tok-xyz"]

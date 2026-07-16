@@ -653,9 +653,12 @@ def main(argv=None):
 
     provider_tokens = {}
     for entry in args.provider_tokens or []:
-        principal, _, token = entry.partition("=")
-        if principal and token:
-            provider_tokens[principal] = token
+        principal, sep, token = entry.partition("=")
+        if not sep or not principal or not token:
+            parser.error(
+                "--provider-token expects PRINCIPAL_ID=TOKEN, got %r" % entry
+            )
+        provider_tokens[principal] = token
 
     task_input = None
     if args.containers is not None or args.load_balancer is not None:
