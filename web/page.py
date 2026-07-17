@@ -19,6 +19,23 @@ PAGE_HTML = """<!doctype html>
     :root { --bg:#f4f6fb; --card:#fff; --fg:#161a2b; --muted:#5b6178;
             --accent:#2f6fed; --ok:#12925f; --bad:#c0334b; --line:#e2e6f0; }
   }
+  /* Manual override via the floating switch (wins over the OS preference). */
+  :root[data-theme="dark"] {
+    --bg:#0f1220; --card:#1a1e33; --fg:#e8eaf2; --muted:#9aa0bd;
+    --accent:#6ea8fe; --ok:#57d9a3; --bad:#ff7a90; --line:#2a2f4a;
+  }
+  :root[data-theme="light"] {
+    --bg:#f4f6fb; --card:#fff; --fg:#161a2b; --muted:#5b6178;
+    --accent:#2f6fed; --ok:#12925f; --bad:#c0334b; --line:#e2e6f0;
+  }
+  .theme-toggle {
+    position: fixed; top: 16px; right: 16px; z-index: 50;
+    width: 46px; height: 46px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg);
+    font-size: 1.25rem; line-height: 1; cursor: pointer;
+    box-shadow: 0 6px 18px rgba(0,0,0,.18); transition: transform .15s;
+  }
+  .theme-toggle:hover { transform: scale(1.08); }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
     font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
@@ -58,6 +75,8 @@ PAGE_HTML = """<!doctype html>
 </style>
 </head>
 <body>
+<button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()"
+  aria-label="Cambiar tema" title="Cambiar entre claro y oscuro">🌙</button>
 <div class="wrap">
   <h1>AgentTrust</h1>
   <p class="sub">Decí qué necesitás. Tu agente busca un proveedor, negocia el
@@ -170,6 +189,31 @@ function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+function currentTheme() {
+  var explicit = document.documentElement.getAttribute('data-theme');
+  if (explicit) return explicit;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+    ? 'dark' : 'light';
+}
+
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  // Show the icon of what a click will switch TO: moon = go dark, sun = go light.
+  document.getElementById('theme-toggle').textContent = t === 'dark' ? '☀️' : '🌙';
+}
+
+function toggleTheme() {
+  var next = currentTheme() === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  try { localStorage.setItem('theme', next); } catch (e) {}
+}
+
+(function () {
+  var saved = null;
+  try { saved = localStorage.getItem('theme'); } catch (e) {}
+  applyTheme(saved === 'dark' || saved === 'light' ? saved : currentTheme());
+})();
 </script>
 </body>
 </html>
