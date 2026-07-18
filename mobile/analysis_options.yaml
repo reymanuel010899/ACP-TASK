@@ -1,0 +1,11 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # Fixtures and demo data intentionally include long literals.
+    lines_longer_than_80_chars: ignore
+    # Hand-written without a compiler; treat style lints as non-fatal so the
+    # first `flutter analyze` surfaces real errors, not const-preference noise.
+    prefer_const_constructors: ignore
+    prefer_const_constructors_in_immutables: ignore
+    prefer_const_literals_to_create_immutables: ignore

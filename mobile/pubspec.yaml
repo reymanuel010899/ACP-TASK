@@ -1,0 +1,29 @@
+name: agenttrust_mobile
+description: "AgentTrust mobile client — Flutter (mock-first). Native client for the AgentTrust A2A trust/verification/reputation layer."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+  flutter: '>=3.22.0'
+
+# NOTE ON VERSIONS
+# These are intentionally pinned to well-known stable APIs so the hand-written
+# code is correct without a local Flutter SDK to compile against. Newer stacks
+# (flutter_riverpod 3.x with codegen, go_router 17.x, lucide_icons) can be
+# adopted later — see README "Upgrade path".
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.6.1   # manual providers, no build_runner/codegen
+  go_router: ^14.6.0         # StatefulShellRoute.indexedStack for the tab shell
+  google_fonts: ^6.2.1       # Inter + Geist Mono without bundling binaries
+  intl: ^0.19.0              # relative-time formatting ("hace 3 min")
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,23 @@
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+.pub-cache/
+.pub/
+pubspec.lock
+
+# Generated platform folders (recreate with `flutter create .`)
+# Keep these ignored until you decide to commit platform config.
+# ios/
+# android/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.log
+
+# macOS
+.DS_Store
