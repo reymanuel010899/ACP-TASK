@@ -1,0 +1,46 @@
+name: Spec Validation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  spec-validation:
+    runs-on: ubuntu-latest
+    name: Validate JSON schemas and examples
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate RFC-0001 spec
+        run: pytest tests/spec/test_rfc0001_spec.py -v
+
+      - name: Validate RFC-0002 binding
+        run: pytest tests/spec/test_rfc0002_binding.py -v
+
+      - name: Validate JSON schemas
+        run: pytest tests/schemas/test_*.py -v
+
+      - name: Validate example artifacts
+        run: pytest tests/schemas/test_example_artifacts.py -v
