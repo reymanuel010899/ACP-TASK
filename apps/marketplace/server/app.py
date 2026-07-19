@@ -8,12 +8,17 @@ API endpoints:
 - GET /api/tasks - List all tasks (with pagination/filters)
 - GET /api/tasks/{task_id} - Get task details
 - POST /api/tasks/{task_id}/accept - Accept task (user becomes worker)
+- GET  /api/tasks/{task_id}/bids - List agent bids on a task (U10)
+- POST /api/tasks/{task_id}/bids/{bid_id}/accept - Author accepts a bid (U10)
 - POST /api/negotiations/{task_id} - Send negotiation message
 - GET /api/negotiations/{task_id} - Get negotiation thread
 - POST /api/negotiations/{task_id}/complete - Mark task complete with outcome
 - POST /p2p/request - Direct P2P request from another app/agent (U6,
   RFC-0003): permission is checked with the Registry when configured;
   standalone mode (no --registry-url) processes without the check.
+  Request types (U10 adds the work-coordination types):
+  ping, list.work_opportunities, submit.work_bid, get.task_status,
+  submit.work_result.
 
 Run: python -m apps.marketplace.server.app [--port 8001] [--registry-url URL]
 """
@@ -51,7 +56,13 @@ class TaskService:
         # app_ids discovered at registration time (U9, RFC-0004).
         self.discovered_ecosystem = []  # type: list
         # request_type -> handler(payload); U10 plugs real work types in here.
-        self._p2p_handlers = {"ping": self._p2p_ping}
+        self._p2p_handlers = {
+            "ping": self._p2p_ping,
+            "list.work_opportunities": self._p2p_list_work_opportunities,
+            "submit.work_bid": self._p2p_submit_work_bid,
+            "get.task_status": self._p2p_get_task_status,
+            "submit.work_result": self._p2p_submit_work_result,
+        }
 
     def create_task(self, principal_id, description):
         # type: (str, str) -> Tuple[int, dict]
@@ -71,6 +82,8 @@ class TaskService:
             "worker_principal": None,
             "negotiations": [],
             "outcome": None,
+            "bids": [],
+            "work_result": None,
         }
 
         with self.lock:
@@ -144,6 +157,62 @@ class TaskService:
 
         return 200, {"task": task}
 
+    def list_bids(self, task_id):
+        # type: (str) -> Tuple[int, dict]
+        """List agent bids on a task (U10) so the author can review them."""
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or invalid 'task_id'"}
+
+        with self.lock:
+            task = self.tasks.get(task_id)
+
+        if task is None:
+            return 404, {"error": "task not found"}
+
+        return 200, {"task_id": task_id, "bids": task.get("bids", [])}
+
+    def accept_bid(self, task_id, bid_id, author_principal):
+        # type: (str, str, str) -> Tuple[int, dict]
+        """Author accepts an agent's bid (U10): the bidding agent becomes
+        the worker, the task moves to "accepted", and every other bid is
+        rejected."""
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or invalid 'task_id'"}
+        if not isinstance(bid_id, str) or not bid_id:
+            return 422, {"error": "missing or invalid 'bid_id'"}
+        if not isinstance(author_principal, str) or not author_principal:
+            return 422, {"error": "missing or invalid 'author_principal'"}
+
+        with self.lock:
+            task = self.tasks.get(task_id)
+
+            if task is None:
+                return 404, {"error": "task not found"}
+
+            if task["author_principal"] != author_principal:
+                return 403, {"error": "only task author can accept bids"}
+
+            if task["status"] != "open":
+                return 400, {"error": "task is not open for bid acceptance"}
+
+            accepted_bid = None
+            for bid in task.get("bids", []):
+                if bid["bid_id"] == bid_id:
+                    accepted_bid = bid
+                    break
+            if accepted_bid is None:
+                return 404, {"error": "bid not found"}
+
+            accepted_bid["status"] = "accepted"
+            for bid in task.get("bids", []):
+                if bid["bid_id"] != bid_id:
+                    bid["status"] = "rejected"
+
+            task["status"] = "accepted"
+            task["worker_principal"] = accepted_bid["agent_principal_id"]
+
+        return 200, {"task": task, "bid": accepted_bid}
+
     def send_negotiation_message(self, task_id, from_principal, message):
         # type: (str, str, str) -> Tuple[int, dict]
         """Send a negotiation message for a task."""
@@ -215,8 +284,14 @@ class TaskService:
         if task["author_principal"] != author_principal:
             return 403, {"error": "only task author can complete"}
 
-        if task["status"] != "accepted":
-            return 400, {"error": "task must be accepted before completion"}
+        # U10: a task is completable once a worker is engaged — either
+        # directly "accepted" (human flow) or "delivered" (an agent already
+        # submitted its work result over P2P).
+        if task["status"] not in ("accepted", "delivered"):
+            return 400, {
+                "error": "task must be accepted or delivered before "
+                "completion"
+            }
 
         if not task["worker_principal"]:
             return 400, {"error": "task has no worker assigned"}
@@ -280,6 +355,185 @@ class TaskService:
         # type: (dict) -> Tuple[int, dict]
         return 200, {
             "result": {"pong": True, "app_id": self.app_id},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    # -- P2P work coordination (U10) -------------------------------------------
+
+    @staticmethod
+    def _p2p_input(payload):
+        # type: (dict) -> Tuple[Optional[dict], Optional[Tuple[int, dict]]]
+        """Extract the ``input`` object of a P2P payload (422 on bad type)."""
+        p2p_input = payload.get("input")
+        if p2p_input is None:
+            p2p_input = {}
+        if not isinstance(p2p_input, dict):
+            return None, (422, {"error": "'input' must be a JSON object"})
+        return p2p_input, None
+
+    def _p2p_list_work_opportunities(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Open tasks an agent could bid on, optionally filtered by
+        capability (every marketplace task is 'marketplace.tasks' work)."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        capability_filter = p2p_input.get("capability_id")
+        if capability_filter is not None and not isinstance(
+            capability_filter, str
+        ):
+            return 422, {"error": "'capability_id' must be a string"}
+
+        opportunities = []
+        if not capability_filter or capability_filter == "marketplace.tasks":
+            with self.lock:
+                open_tasks = [
+                    t for t in self.tasks.values() if t["status"] == "open"
+                ]
+            open_tasks.sort(
+                key=lambda t: t.get("created_at", ""), reverse=True
+            )
+            opportunities = [
+                {
+                    "id": t["id"],
+                    "description": t["description"],
+                    "author_principal": t["author_principal"],
+                    "created_at": t["created_at"],
+                    "capability_id": "marketplace.tasks",
+                }
+                for t in open_tasks
+            ]
+
+        return 200, {
+            "result": {"opportunities": opportunities},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _p2p_submit_work_bid(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """An agent bids on an open task. A second bid from the same agent
+        replaces its pending bid (no duplicates)."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        task_id = p2p_input.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or invalid 'task_id'"}
+        proposed_terms = p2p_input.get("proposed_terms")
+        if not isinstance(proposed_terms, str) or not proposed_terms.strip():
+            return 422, {"error": "missing or invalid 'proposed_terms'"}
+        note = p2p_input.get("agent_reputation_note")
+        if note is not None and not isinstance(note, str):
+            return 422, {"error": "'agent_reputation_note' must be a string"}
+
+        agent_principal = payload["requester_principal_id"]
+
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return 404, {"error": "task not found"}
+            if task["status"] != "open":
+                return 400, {"error": "task is not open for bidding"}
+
+            bid = {
+                "bid_id": str(uuid.uuid4()),
+                "task_id": task_id,
+                "agent_principal_id": agent_principal,
+                "proposed_terms": proposed_terms.strip(),
+                "status": "pending",
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            if note is not None:
+                bid["agent_reputation_note"] = note
+
+            bids = task.setdefault("bids", [])
+            # Replace this agent's pending bid instead of duplicating it.
+            task["bids"] = [
+                b
+                for b in bids
+                if not (
+                    b["agent_principal_id"] == agent_principal
+                    and b["status"] == "pending"
+                )
+            ]
+            task["bids"].append(bid)
+
+        return 200, {
+            "result": {"bid": bid},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _p2p_get_task_status(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Task state plus the requester's own bid, so an agent can poll
+        whether its bid was accepted."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        task_id = p2p_input.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or invalid 'task_id'"}
+
+        requester = payload["requester_principal_id"]
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return 404, {"error": "task not found"}
+            my_bid = None
+            for bid in reversed(task.get("bids", [])):
+                if bid["agent_principal_id"] == requester:
+                    my_bid = bid
+                    break
+
+        return 200, {
+            "result": {"task": task, "my_bid": my_bid},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _p2p_submit_work_result(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """The accepted agent delivers its work: the task moves to
+        'delivered' and holds the work_result for author review."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        task_id = p2p_input.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or invalid 'task_id'"}
+        result_summary = p2p_input.get("result_summary")
+        if not isinstance(result_summary, str) or not result_summary.strip():
+            return 422, {"error": "missing or invalid 'result_summary'"}
+        evidence = p2p_input.get("evidence")
+        if evidence is not None and not isinstance(evidence, dict):
+            return 422, {"error": "'evidence' must be a JSON object"}
+
+        requester = payload["requester_principal_id"]
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return 404, {"error": "task not found"}
+            if task["status"] != "accepted":
+                return 400, {
+                    "error": "task must be accepted before submitting a "
+                    "work result"
+                }
+            if task["worker_principal"] != requester:
+                return 403, {
+                    "error": "permission denied",
+                    "reason": "only the accepted worker can submit the "
+                    "work result",
+                }
+
+            task["work_result"] = {
+                "result_summary": result_summary.strip(),
+                "evidence": evidence if evidence is not None else {},
+                "submitted_by": requester,
+                "submitted_at": datetime.utcnow().isoformat(),
+            }
+            task["status"] = "delivered"
+
+        return 200, {
+            "result": {"task": task},
             "evidence_id": str(uuid.uuid4()),
         }
 
@@ -489,6 +743,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
             status, body = self.service.get_task(segments[2])
             self._send_json(status, body)
         elif (
+            len(segments) == 4
+            and segments[0] == "api"
+            and segments[1] == "tasks"
+            and segments[3] == "bids"
+        ):
+            # GET /api/tasks/{task_id}/bids (U10)
+            status, body = self.service.list_bids(segments[2])
+            self._send_json(status, body)
+        elif (
             len(segments) == 3
             and segments[0] == "api"
             and segments[1] == "negotiations"
@@ -557,6 +820,20 @@ class _RequestHandler(BaseHTTPRequestHandler):
             status, response = self.service.accept_task(
                 segments[2],
                 body.get("worker_principal"),
+            )
+            self._send_json(status, response)
+        elif (
+            len(segments) == 6
+            and segments[0] == "api"
+            and segments[1] == "tasks"
+            and segments[3] == "bids"
+            and segments[5] == "accept"
+        ):
+            # POST /api/tasks/{task_id}/bids/{bid_id}/accept (U10)
+            status, response = self.service.accept_bid(
+                segments[2],
+                segments[4],
+                body.get("author_principal"),
             )
             self._send_json(status, response)
         elif (

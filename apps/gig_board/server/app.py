@@ -14,6 +14,9 @@ API endpoints:
 - POST   /p2p/request               # Direct P2P request from another
   app/agent (U6, RFC-0003): permission is checked with the Registry when
   configured; standalone mode (no --registry-url) processes without it.
+  Request types (U10 adds the work-coordination types): ping,
+  list.work_opportunities (discover offered services),
+  register.service (an agent registers itself as a provider).
 
 Run: python -m apps.gig_board.server.app [--port 8002] [--registry-url URL]
 """
@@ -52,7 +55,11 @@ class GigBoardService:
         # app_ids discovered at registration time (U9, RFC-0004).
         self.discovered_ecosystem = []  # type: list
         # request_type -> handler(payload); U10 plugs real work types in here.
-        self._p2p_handlers = {"ping": self._p2p_ping}
+        self._p2p_handlers = {
+            "ping": self._p2p_ping,
+            "list.work_opportunities": self._p2p_list_work_opportunities,
+            "register.service": self._p2p_register_service,
+        }
 
     def register_service(self, principal_id, service_name, description):
         # type: (str, str, str) -> Tuple[int, dict]
@@ -278,6 +285,105 @@ class GigBoardService:
         # type: (dict) -> Tuple[int, dict]
         return 200, {
             "result": {"pong": True, "app_id": self.app_id},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    # -- P2P work coordination (U10) -------------------------------------------
+
+    @staticmethod
+    def _p2p_input(payload):
+        # type: (dict) -> Tuple[Optional[dict], Optional[Tuple[int, dict]]]
+        """Extract the ``input`` object of a P2P payload (422 on bad type)."""
+        p2p_input = payload.get("input")
+        if p2p_input is None:
+            p2p_input = {}
+        if not isinstance(p2p_input, dict):
+            return None, (422, {"error": "'input' must be a JSON object"})
+        return p2p_input, None
+
+    def _p2p_list_work_opportunities(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Available services (with provider info) an agent can discover,
+        optionally filtered by capability. Services registered through the
+        human API default to the 'gig-board.gigs' capability."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        capability_filter = p2p_input.get("capability_id")
+        if capability_filter is not None and not isinstance(
+            capability_filter, str
+        ):
+            return 422, {"error": "'capability_id' must be a string"}
+
+        with self.lock:
+            all_services = list(self.services.values())
+        all_services.sort(
+            key=lambda s: s.get("created_at", ""), reverse=True
+        )
+
+        opportunities = []
+        for service in all_services:
+            capability = service.get("capability_id", "gig-board.gigs")
+            if capability_filter and capability != capability_filter:
+                continue
+            opportunities.append(
+                {
+                    "id": service["id"],
+                    "service_name": service["service_name"],
+                    "description": service["description"],
+                    "provider_principal": service["provider_principal"],
+                    "created_at": service["created_at"],
+                    "capability_id": capability,
+                    "gigs_completed": service.get("gigs_completed", 0),
+                }
+            )
+
+        return 200, {
+            "result": {"opportunities": opportunities},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _p2p_register_service(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """An agent registers ITSELF as a service provider (U10): the
+        requesting principal becomes ``provider_principal``, so the normal
+        buyer flow (create_gig -> complete_gig) then records the agent's
+        reputation."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        name = p2p_input.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return 422, {"error": "missing or invalid 'name'"}
+        description = p2p_input.get("description")
+        if not isinstance(description, str) or not description.strip():
+            return 422, {"error": "missing or invalid 'description'"}
+        capability_id = p2p_input.get("capability_id")
+        if capability_id is not None and (
+            not isinstance(capability_id, str) or not capability_id
+        ):
+            return 422, {"error": "'capability_id' must be a string"}
+        pricing = p2p_input.get("pricing")
+        if pricing is not None and not isinstance(pricing, (str, dict)):
+            return 422, {
+                "error": "'pricing' must be a string or JSON object"
+            }
+
+        requester = payload["requester_principal_id"]
+        status, response = self.register_service(requester, name, description)
+        if status != 200:
+            return status, response
+
+        service = response["service"]
+        with self.lock:
+            service["capability_id"] = (
+                capability_id if capability_id else "gig-board.gigs"
+            )
+            if pricing is not None:
+                service["pricing"] = pricing
+
+        return 200, {
+            "result": {"service": service},
             "evidence_id": str(uuid.uuid4()),
         }
 
