@@ -64,6 +64,7 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from registry.index_store import IndexStore, card_capability_ids
+from registry.user_index import UserIndex
 
 TRUST_EXTENSION_URI = "https://agenttrust.example/extensions/trust/v1"
 
@@ -105,8 +106,9 @@ class RegistryService(object):
         verification_url=None,
         admin_token=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
+        user_index=None,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex]) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
@@ -116,6 +118,7 @@ class RegistryService(object):
         # None = open (demo default). Never serialized.
         self.admin_token = admin_token
         self.http_timeout = http_timeout
+        self.user_index = user_index if user_index is not None else UserIndex()
 
     def admin_ok(self, token):
         # type: (Optional[str]) -> bool
@@ -198,6 +201,130 @@ class RegistryService(object):
         if registration is None:
             return 404, {"error": "no registration for that principal_id"}
         return 200, {"registration": registration}
+
+    # -- user endpoints (U1) ---------------------------------------------------
+
+    def register_user(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Register a new user Principal. Returns (http_status, response_body)."""
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        principal_id = payload.get("principal_id")
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        # Check for duplicate
+        if self.user_index.user_exists(principal_id):
+            return 409, {"error": "principal already registered"}
+
+        username = payload.get("username")
+        if username is not None and not isinstance(username, str):
+            return 422, {"error": "'username' must be a string if provided"}
+
+        # Create user
+        user = self.user_index.create_user(principal_id, username=username)
+        reputation = self.user_index.get_aggregated_reputation(principal_id)
+
+        return 200, {
+            "status": "registered",
+            "principal_id": principal_id,
+            "reputation": reputation,
+            "user": user,
+        }
+
+    def login_user(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Log in a user Principal. Returns (http_status, response_body)."""
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        principal_id = payload.get("principal_id")
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        # Check if user exists
+        user = self.user_index.get_user(principal_id)
+        if user is None:
+            return 404, {"error": "principal not found"}
+
+        # Update last_active
+        self.user_index.update_last_active(principal_id)
+
+        reputation = self.user_index.get_aggregated_reputation(principal_id)
+
+        return 200, {
+            "status": "ok",
+            "principal_id": principal_id,
+            "reputation": reputation,
+            "user": user,
+        }
+
+    def get_user(self, principal_id):
+        # type: (str) -> Tuple[int, dict]
+        """Get user reputation records. Returns (http_status, response_body)."""
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        user = self.user_index.get_user(principal_id)
+        if user is None:
+            return 404, {"error": "principal not found"}
+
+        reputation_records = self.user_index.get_reputation_records(
+            principal_id
+        )
+
+        return 200, {
+            "principal_id": principal_id,
+            "reputation_records": reputation_records,
+            "created_at": user.get("created_at"),
+            "last_active": user.get("last_active"),
+            "username": user.get("username"),
+        }
+
+    def update_user_reputation(self, principal_id, payload):
+        # type: (str, dict) -> Tuple[int, dict]
+        """Record a reputation event for a user.
+        Returns (http_status, response_body)."""
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        # Check if user exists
+        if not self.user_index.user_exists(principal_id):
+            return 404, {"error": "principal not found"}
+
+        # Validate required fields
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return 422, {"error": "missing or non-string 'task_id'"}
+
+        verified = payload.get("verified")
+        if not isinstance(verified, bool):
+            return 422, {"error": "'verified' must be a boolean"}
+
+        capability_id = payload.get("capability_id")
+        if not isinstance(capability_id, str) or not capability_id:
+            return 422, {"error": "missing or non-string 'capability_id'"}
+
+        # Record the reputation
+        record = self.user_index.record_reputation(
+            principal_id, capability_id, task_id, verified
+        )
+
+        return 200, {
+            "task_id": task_id,
+            "verified": verified,
+            "capability_id": capability_id,
+            "reputation_summary": {
+                "capability_id": capability_id,
+                "tasks_verified": record.get("tasks_verified", 0),
+                "tasks_rejected": record.get("tasks_rejected", 0),
+                "verification_rate": record.get("verification_rate"),
+            },
+        }
 
     # -- reputation sourcing -----------------------------------------------------
 
@@ -350,6 +477,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
         elif len(segments) == 2 and segments[0] == "agents":
             status, body = self.service.get_agent(segments[1])
             self._send_json(status, body)
+        elif len(segments) == 2 and segments[0] == "users":
+            # GET /users/{principal_id}
+            status, body = self.service.get_user(segments[1])
+            self._send_json(status, body)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -381,6 +512,20 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             self._send_json(200, {"api_key": self.service.create_api_key()})
+        elif segments == ["auth", "register"]:
+            # POST /auth/register — user registration
+            status, response = self.service.register_user(body)
+            self._send_json(status, response)
+        elif segments == ["auth", "login"]:
+            # POST /auth/login — user login
+            status, response = self.service.login_user(body)
+            self._send_json(status, response)
+        elif len(segments) == 3 and segments[0] == "users" and segments[2] == "reputation":
+            # POST /users/{principal_id}/reputation — record reputation
+            status, response = self.service.update_user_reputation(
+                segments[1], body
+            )
+            self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
 

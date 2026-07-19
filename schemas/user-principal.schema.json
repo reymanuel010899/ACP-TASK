@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenttrust.example/schemas/user-principal.schema.json",
+  "title": "UserPrincipal",
+  "description": "A user Principal registered in the AgentTrust federation. Users are identified by their ed25519 Principal and may have an optional username for display.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["principal_id", "created_at", "last_active"],
+  "properties": {
+    "principal_id": {
+      "type": "string",
+      "description": "Unique identifier for the user Principal (ed25519 key).",
+      "minLength": 1
+    },
+    "username": {
+      "type": "string",
+      "description": "Optional human-readable username. Not unique, not trusted.",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp when this user was registered.",
+      "format": "date-time"
+    },
+    "last_active": {
+      "type": "string",
+      "description": "RFC 3339 timestamp of the most recent user activity (login, reputation update).",
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Open bag for vendor or profile extensions. Keys SHOULD be namespaced (e.g. 'vendor.example/field')."
+    }
+  }
+}
