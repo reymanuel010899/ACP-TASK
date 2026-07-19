@@ -48,13 +48,23 @@ any registry (or several) that speaks this contract.
 - ``GET /agents?capability=<id>`` — agent Principals declaring that
   capability, ``{"agents": [...]}`` (empty list if none).
 - ``POST /apps/register`` — body ``{app_id, app_endpoint, p2p_endpoint,
-  capabilities}`` → ``{"app": ...}`` (U6, RFC-0003). Duplicate ``app_id``
-  re-registers (apps restart often): endpoints update in place. 422 on
-  missing/invalid fields.
-- ``GET /apps`` — ``{"apps": [...]}``; ``GET /apps/{app_id}`` —
+  capabilities}`` → ``{"app": ..., "ecosystem_apps": [...]}`` (U6,
+  RFC-0003; U9, RFC-0004). Duplicate ``app_id`` re-registers (apps restart
+  often): endpoints update in place. 422 on missing/invalid fields.
+  Optional boolean service flags (``agent_marketplace``,
+  ``credential_vault``, ``verification_service``) mark the registrant as a
+  shared-service provider; ``capabilities`` may be ``[]`` for service-only
+  registrations. ``ecosystem_apps`` lists every OTHER registered app so a
+  new app discovers the ecosystem in one round-trip.
+- ``GET /apps[?capability=<id>]`` — ``{"apps": [...]}``, optionally
+  filtered by capability (U9); ``GET /apps/{app_id}`` —
   ``{"app": ...}`` or 404. P2P endpoint discovery: requesters look up the
   target's ``p2p_endpoint`` here, then talk to the app DIRECTLY (the
   Registry never proxies P2P traffic).
+- ``GET /services?type=<agent_marketplace|credential_vault|
+  verification_service>`` — ``{"service_type": ..., "services":
+  [{app_id, endpoint, p2p_endpoint}]}`` (U9); empty list when nobody
+  provides the service, 400 for a missing/unknown type.
 - ``POST /p2p/permissions/check`` — body ``{requester_principal_id,
   target_app_id, capability_id}`` → ``{"allowed": bool, "reason": ...}``.
   MVP model: allowed iff the requester is a known principal (user or
@@ -89,7 +99,7 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from registry.agent_index import AgentIndex
-from registry.app_registry import AppRegistry
+from registry.app_registry import SERVICE_TYPES, AppRegistry
 from registry.index_store import IndexStore, card_capability_ids
 from registry.user_index import UserIndex
 
@@ -314,6 +324,15 @@ class RegistryService(object):
 
         Re-registration with the same ``app_id`` updates the endpoints
         (apps restart often), preserving ``registered_at``.
+
+        U9 (RFC-0004) extensions: optional boolean service flags
+        (``agent_marketplace``, ``credential_vault``,
+        ``verification_service``, all defaulting to false) mark the
+        registrant as a provider of that shared service; ``capabilities``
+        MAY be an empty list for service-only registrations (a vault is
+        not an "app" with capabilities). The response also carries
+        ``ecosystem_apps`` — every OTHER registered app — so a new app
+        discovers the whole ecosystem in a single round-trip.
         """
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
@@ -331,14 +350,30 @@ class RegistryService(object):
                 "error": "'capabilities' must be a list of non-empty strings"
             }
 
+        services = {}
+        for service_type in SERVICE_TYPES:
+            flag = payload.get(service_type, False)
+            if not isinstance(flag, bool):
+                return 422, {
+                    "error": "'%s' must be a boolean if provided"
+                    % service_type
+                }
+            services[service_type] = flag
+
         app = self.app_registry.register_app(
             payload["app_id"],
             payload["app_endpoint"],
             payload["p2p_endpoint"],
             capabilities,
             api_key=payload.get("api_key"),
+            services=services,
         )
-        return 200, {"app": app}
+        ecosystem_apps = [
+            other
+            for other in self.app_registry.list_apps()
+            if other["app_id"] != app["app_id"]
+        ]
+        return 200, {"app": app, "ecosystem_apps": ecosystem_apps}
 
     def get_registered_app(self, app_id):
         # type: (str) -> Tuple[int, dict]
@@ -348,9 +383,34 @@ class RegistryService(object):
             return 404, {"error": "no app registered with that app_id"}
         return 200, {"app": app}
 
-    def list_registered_apps(self):
-        # type: () -> Tuple[int, dict]
-        return 200, {"apps": self.app_registry.list_apps()}
+    def list_registered_apps(self, capability=None):
+        # type: (Optional[str]) -> Tuple[int, dict]
+        """All registered apps; with ``capability`` set, only apps
+        declaring that capability id (empty list when none match)."""
+        return 200, {"apps": self.app_registry.list_apps(capability)}
+
+    def list_services(self, service_type):
+        # type: (Optional[str]) -> Tuple[int, dict]
+        """Providers of a shared service type (U9, RFC-0004).
+
+        400 for a missing or unknown type; otherwise
+        ``{service_type, services: [{app_id, endpoint, p2p_endpoint}]}``
+        (empty list when nobody provides it).
+        """
+        if service_type not in SERVICE_TYPES:
+            return 400, {
+                "error": "missing or invalid 'type' parameter; expected "
+                "one of: %s" % ", ".join(SERVICE_TYPES)
+            }
+        services = [
+            {
+                "app_id": record["app_id"],
+                "endpoint": record["app_endpoint"],
+                "p2p_endpoint": record["p2p_endpoint"],
+            }
+            for record in self.app_registry.find_services(service_type)
+        ]
+        return 200, {"service_type": service_type, "services": services}
 
     def check_p2p_permission(self, payload):
         # type: (dict) -> Tuple[int, dict]
@@ -693,8 +753,18 @@ class _RequestHandler(BaseHTTPRequestHandler):
             status, body = self.service.get_agent(segments[1])
             self._send_json(status, body)
         elif segments == ["apps"]:
-            # GET /apps — all registered apps (U6)
-            status, body = self.service.list_registered_apps()
+            # GET /apps[?capability=<id>] — registered apps (U6),
+            # optionally filtered by capability (U9)
+            query = parse_qs(parts.query)
+            capability = query.get("capability", [None])[0]
+            status, body = self.service.list_registered_apps(capability)
+            self._send_json(status, body)
+        elif segments == ["services"]:
+            # GET /services?type=<service_type> — shared-service
+            # discovery (U9, RFC-0004)
+            query = parse_qs(parts.query)
+            service_type = query.get("type", [None])[0]
+            status, body = self.service.list_services(service_type)
             self._send_json(status, body)
         elif len(segments) == 2 and segments[0] == "apps":
             # GET /apps/{app_id} — P2P endpoint discovery (U6)

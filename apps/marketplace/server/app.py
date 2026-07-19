@@ -29,6 +29,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
+from libs.federation_client import FederationClient, FederationError
+
 
 class TaskService:
     """Core task marketplace logic; in-memory storage."""
@@ -46,6 +48,8 @@ class TaskService:
         self.lock = threading.Lock()
         self.app_id = self.APP_ID
         self.capabilities = list(self.P2P_CAPABILITIES)
+        # app_ids discovered at registration time (U9, RFC-0004).
+        self.discovered_ecosystem = []  # type: list
         # request_type -> handler(payload); U10 plugs real work types in here.
         self._p2p_handlers = {"ping": self._p2p_ping}
 
@@ -306,27 +310,34 @@ class TaskService:
 
     def register_with_registry(self, app_endpoint, p2p_endpoint=None):
         # type: (str, Optional[str]) -> bool
-        """POST this app's endpoints to the Registry (``/apps/register``).
+        """Register with the Registry and discover the ecosystem (U9).
 
         Called by ``main()`` at startup when ``--registry-url`` is set.
-        Tolerates the Registry being down: returns False, never raises.
+        Uses the federation client (RFC-0004): the registration response
+        carries ``ecosystem_apps``, so joining and discovering every other
+        registered app is one round-trip; the discovered app_ids are kept
+        on ``self.discovered_ecosystem``. Tolerates the Registry being
+        down: returns False, never raises.
         """
         if not self.registry_url:
             return False
+        client = FederationClient(
+            self.registry_url, timeout=self.http_timeout
+        )
         try:
-            resp = requests.post(
-                "%s/apps/register" % self.registry_url,
-                json={
-                    "app_id": self.app_id,
-                    "app_endpoint": app_endpoint,
-                    "p2p_endpoint": p2p_endpoint or app_endpoint,
-                    "capabilities": self.capabilities,
-                },
-                timeout=self.http_timeout,
+            result = client.register_app(
+                self.app_id,
+                app_endpoint,
+                p2p_endpoint or app_endpoint,
+                self.capabilities,
             )
-            return resp.status_code == 200
-        except requests.RequestException:
+        except FederationError:
             return False
+        self.discovered_ecosystem = [
+            app.get("app_id") for app in result.get("ecosystem_apps", [])
+        ]
+        print("Discovered ecosystem: %s" % self.discovered_ecosystem)
+        return True
 
     def _record_reputation(self, principal_id, task_id, outcome):
         # type: (str, str, str) -> Tuple[int, dict]

@@ -449,11 +449,33 @@ def main(argv=None):
     )
     parser.add_argument("--port", type=int, default=8003)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--registry-url",
+        default=None,
+        help="Registry URL; if set, the vault registers itself as a "
+        "credential_vault service at startup (U9, RFC-0004). Non-fatal "
+        "if the registry is down.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(port=args.port, host=args.host)
     host, port = server.server_address[:2]
     print("AgentTrust Vault listening on http://%s:%d" % (host, port))
+    if args.registry_url:
+        # Service registration (U9): the vault is a shared service, not an
+        # app with capabilities — it registers with capabilities=[] and the
+        # credential_vault flag so apps can find it via GET /services.
+        from libs.federation_client import FederationClient, FederationError
+
+        vault_endpoint = "http://%s:%d" % (host, port)
+        try:
+            FederationClient(args.registry_url).register_app(
+                "vault", vault_endpoint, vault_endpoint, [],
+                credential_vault=True,
+            )
+            print("(registered as credential_vault service with registry)")
+        except FederationError:
+            print("(warning: could not register vault with registry)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
