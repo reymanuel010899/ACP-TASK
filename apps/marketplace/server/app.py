@@ -712,11 +712,21 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 data = resp.json()
                 records = data.get("reputation_records", [])
                 if records:
-                    latest = records[-1]
+                    # Aggregate across all capabilities: a principal may have
+                    # reputation from several apps (marketplace, gig-board...).
+                    verified = sum(
+                        r.get("tasks_verified", 0) for r in records
+                    )
+                    rejected = sum(
+                        r.get("tasks_rejected", 0) for r in records
+                    )
+                    total = verified + rejected
                     return {
-                        "tasks_verified": latest.get("tasks_verified", 0),
-                        "tasks_rejected": latest.get("tasks_rejected", 0),
-                        "verification_rate": latest.get("verification_rate")
+                        "tasks_verified": verified,
+                        "tasks_rejected": rejected,
+                        "verification_rate": (
+                            verified / total if total else None
+                        )
                     }
             return {
                 "tasks_verified": 0,

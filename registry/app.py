@@ -256,6 +256,9 @@ class RegistryService(object):
                 "reputation": self.user_index.get_aggregated_reputation(
                     principal_id
                 ),
+                "reputation_records": self.user_index.get_reputation_records(
+                    principal_id
+                ),
             }
         registration = self.index.get(principal_id)
         if registration is None:
