@@ -36,6 +36,7 @@ import requests
 
 from libs.audit_client import make_audit_client
 from libs.federation_client import FederationClient, FederationError
+from libs.request_auth import RequestAuthenticator
 
 
 class TaskService:
@@ -44,8 +45,9 @@ class TaskService:
     APP_ID = "marketplace"
     P2P_CAPABILITIES = ["marketplace.tasks", "p2p.ping"]
 
-    def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None):
-        # type: (Optional[str], float, Optional[str]) -> None
+    def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None,
+                 require_signatures=False, public_key_resolver=None):
+        # type: (Optional[str], float, Optional[str], bool, object) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
@@ -53,6 +55,19 @@ class TaskService:
         # Central audit emitter (U12): best-effort, fire-and-forget; a
         # NullAuditClient (no-op) when no audit_url is configured.
         self.audit_client = make_audit_client(audit_url)
+        # Request authentication (U18, RFC-0005): a no-op pass-through when
+        # require_signatures is False (today's behavior). When on, P2P
+        # requests must carry a valid two-link signature and the verified
+        # principal must equal the payload's requester_principal_id. The
+        # resolver is injectable for tests; by default it fetches public keys
+        # from the Registry authority endpoint.
+        self.require_signatures = require_signatures
+        self.authenticator = RequestAuthenticator(
+            self.registry_url,
+            require_signatures=require_signatures,
+            http_timeout=http_timeout,
+            public_key_resolver=public_key_resolver,
+        )
         self.tasks = {}  # type: Dict[str, dict]
         self.lock = threading.Lock()
         self.app_id = self.APP_ID
@@ -322,15 +337,18 @@ class TaskService:
 
     # -- P2P (U6, RFC-0003) ---------------------------------------------------
 
-    def handle_p2p_request(self, payload):
-        # type: (dict) -> Tuple[int, dict]
+    def handle_p2p_request(self, payload, raw_body=None, headers=None):
+        # type: (dict, Optional[bytes], object) -> Tuple[int, dict]
         """Process a direct P2P request from another app or agent.
 
-        Flow: validate required fields (422) → check permission with the
-        Registry when one is configured (403 on denial, 502 if the Registry
-        is unreachable — fail closed) → dispatch on ``request_type``
-        (400 for unknown types). New request types plug into
-        ``self._p2p_handlers``.
+        Flow: validate required fields (422) → authenticate the request
+        cryptographically and bind identity (U18: only when
+        ``require_signatures`` is on — 401 on a bad/missing signature, 403 if
+        the verified principal is not the claimed ``requester_principal_id``;
+        a pure no-op otherwise) → check permission with the Registry when one
+        is configured (403 on denial, 502 if the Registry is unreachable —
+        fail closed) → dispatch on ``request_type`` (400 for unknown types).
+        New request types plug into ``self._p2p_handlers``.
         """
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
@@ -341,6 +359,25 @@ class TaskService:
             value = payload.get(field)
             if not isinstance(value, str) or not value:
                 return 422, {"error": "missing or invalid '%s'" % field}
+
+        # U18: authenticate FIRST, then bind identity. When the flag is off the
+        # authenticator returns (None, None) and both steps are skipped, so the
+        # legacy flow below is preserved byte-for-byte.
+        verified_principal, auth_error = self.authenticator.authenticate(
+            "POST", "/p2p/request",
+            raw_body if raw_body is not None else b"",
+            headers if headers is not None else {},
+        )
+        if auth_error is not None:
+            return auth_error.status, {"error": auth_error.message}
+        if verified_principal is not None and (
+            verified_principal != payload["requester_principal_id"]
+        ):
+            return 403, {
+                "error": "identity mismatch",
+                "reason": "authenticated principal does not match "
+                "requester_principal_id",
+            }
 
         if self.registry_url:
             status, verdict = self._check_p2p_permission(
@@ -679,21 +716,24 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json_body(self):
-        # type: () -> Tuple[Optional[dict], Optional[str]]
+        # type: () -> Tuple[Optional[dict], bytes, Optional[str]]
+        """Return ``(parsed_body, raw_bytes, error)``. The RAW bytes are the
+        exact payload the client signed — U18 hands them to the authenticator
+        unchanged."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return None, "invalid Content-Length"
+            return None, b"", "invalid Content-Length"
         raw = self.rfile.read(length) if length else b""
         if not raw:
-            return {}, None
+            return {}, raw, None
         try:
             body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return None, "request body is not valid JSON"
+            return None, raw, "request body is not valid JSON"
         if not isinstance(body, dict):
-            return None, "request body must be a JSON object"
-        return body, None
+            return None, raw, "request body must be a JSON object"
+        return body, raw, None
 
     def _get_reputation(self, principal_id):
         # Fetch federated reputation from registry if available
@@ -795,7 +835,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
-        body, error = self._read_json_body()
+        body, raw_body, error = self._read_json_body()
         if error:
             self._send_json(400, {"error": error})
             return
@@ -892,8 +932,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(status, response)
         elif segments == ["p2p", "request"]:
-            # POST /p2p/request - direct P2P request (U6, RFC-0003)
-            status, response = self.service.handle_p2p_request(body)
+            # POST /p2p/request - direct P2P request (U6, RFC-0003). The RAW
+            # signed bytes + headers are handed through for U18 authentication.
+            status, response = self.service.handle_p2p_request(
+                body, raw_body=raw_body, headers=self.headers
+            )
             self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
@@ -904,10 +947,17 @@ def make_server(
     host="127.0.0.1",
     registry_url=None,
     audit_url=None,
+    require_signatures=False,
+    public_key_resolver=None,
 ):
-    # type: (int, str, Optional[str], Optional[str]) -> MarketplaceHTTPServer
+    # type: (int, str, Optional[str], Optional[str], bool, object) -> MarketplaceHTTPServer
     """Build the marketplace server."""
-    service = TaskService(registry_url=registry_url, audit_url=audit_url)
+    service = TaskService(
+        registry_url=registry_url,
+        audit_url=audit_url,
+        require_signatures=require_signatures,
+        public_key_resolver=public_key_resolver,
+    )
     return MarketplaceHTTPServer((host, port), service)
 
 
@@ -928,6 +978,12 @@ def main(argv=None):
         help="Base URL of the central Audit service (U12). Emission is "
         "best-effort: a down audit service is never fatal.",
     )
+    parser.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Enforce cryptographic authentication on P2P requests (U18, "
+        "RFC-0005). Off by default (unsigned P2P is accepted).",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
@@ -935,6 +991,7 @@ def main(argv=None):
         host=args.host,
         registry_url=args.registry_url,
         audit_url=args.audit_url,
+        require_signatures=args.require_signatures,
     )
     host, port = server.server_address[:2]
     print("AgentTrust Marketplace listening on http://%s:%d" % (host, port))
