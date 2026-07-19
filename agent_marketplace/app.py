@@ -42,6 +42,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import requests
 
 from agent_marketplace.hiring import HiringStore, parse_expires_at
+from libs.audit_client import make_audit_client
 
 DEFAULT_HTTP_TIMEOUT = 3.0
 
@@ -50,8 +51,9 @@ class MarketplaceService(object):
     """Core agent-marketplace logic; callable directly from tests."""
 
     def __init__(self, registry_url=None, vault_url=None,
-                 http_timeout=DEFAULT_HTTP_TIMEOUT, hiring_store=None):
-        # type: (Optional[str], Optional[str], float, Optional[HiringStore]) -> None
+                 http_timeout=DEFAULT_HTTP_TIMEOUT, hiring_store=None,
+                 audit_url=None):
+        # type: (Optional[str], Optional[str], float, Optional[HiringStore], Optional[str]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
@@ -60,6 +62,9 @@ class MarketplaceService(object):
         self.hiring = (
             hiring_store if hiring_store is not None else HiringStore()
         )
+        # Central audit emitter (U12): best-effort, fire-and-forget; a
+        # NullAuditClient (no-op) when no audit_url is configured.
+        self.audit_client = make_audit_client(audit_url)
         self._vault_client = None
         if self.vault_url:
             from libs.vault_client import VaultClient
@@ -273,6 +278,14 @@ class MarketplaceService(object):
             credential_scopes=credential_scopes,
             expires_at=expires_at,
         )
+        self.audit_client.log(
+            user_principal_id, "agent.hire",
+            resource_id=grant["grant_id"],
+            details={
+                "agent_principal_id": agent_principal_id,
+                "scoped_capabilities": scoped_capabilities,
+            },
+        )
         return 200, {"grant": grant}
 
     def list_hiring_grants(self, agent_principal_id=None,
@@ -317,6 +330,13 @@ class MarketplaceService(object):
                 except requests.RequestException:
                     pass
 
+        self.audit_client.log(
+            user_principal_id, "agent.revoke",
+            resource_id=grant_id,
+            details={
+                "agent_principal_id": revoked["agent_principal_id"],
+            },
+        )
         return 200, {"grant": revoked}
 
     # -- ratings ------------------------------------------------------------
@@ -366,6 +386,14 @@ class MarketplaceService(object):
         )
         avg_rating, rating_count = self.hiring.rating_summary(
             agent_principal_id
+        )
+        self.audit_client.log(
+            user_principal_id, "agent.rate",
+            resource_id=agent_principal_id,
+            details={
+                "agent_principal_id": agent_principal_id,
+                "rating": rating,
+            },
         )
         return 200, {
             "agent_principal_id": agent_principal_id,
@@ -521,11 +549,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(port=8004, host="127.0.0.1", registry_url=None,
-                vault_url=None):
-    # type: (int, str, Optional[str], Optional[str]) -> AgentMarketplaceHTTPServer
+                vault_url=None, audit_url=None):
+    # type: (int, str, Optional[str], Optional[str], Optional[str]) -> AgentMarketplaceHTTPServer
     """Build the agent-marketplace server; ``port=0`` picks a free port."""
     service = MarketplaceService(
-        registry_url=registry_url, vault_url=vault_url
+        registry_url=registry_url, vault_url=vault_url, audit_url=audit_url
     )
     return AgentMarketplaceHTTPServer((host, port), service)
 
@@ -548,6 +576,12 @@ def main(argv=None):
         help="Base URL of the Vault (U7). When set, credential_scopes in "
         "hires become real Vault grants (revoked with the hire).",
     )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
@@ -555,6 +589,7 @@ def main(argv=None):
         host=args.host,
         registry_url=args.registry_url,
         vault_url=args.vault_url,
+        audit_url=args.audit_url,
     )
     host, port = server.server_address[:2]
     print(

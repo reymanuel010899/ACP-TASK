@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
+from libs.audit_client import make_audit_client
 from libs.federation_client import FederationClient, FederationError
 
 
@@ -43,12 +44,15 @@ class TaskService:
     APP_ID = "marketplace"
     P2P_CAPABILITIES = ["marketplace.tasks", "p2p.ping"]
 
-    def __init__(self, registry_url=None, http_timeout=3.0):
-        # type: (Optional[str], float) -> None
+    def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None):
+        # type: (Optional[str], float, Optional[str]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
         self.http_timeout = http_timeout
+        # Central audit emitter (U12): best-effort, fire-and-forget; a
+        # NullAuditClient (no-op) when no audit_url is configured.
+        self.audit_client = make_audit_client(audit_url)
         self.tasks = {}  # type: Dict[str, dict]
         self.lock = threading.Lock()
         self.app_id = self.APP_ID
@@ -308,6 +312,12 @@ class TaskService:
             task["status"] = "completed"
             task["outcome"] = outcome.strip()
 
+        self.audit_client.log(
+            task["worker_principal"], "work.complete",
+            resource_id=task_id,
+            details={"app_id": self.app_id,
+                     "author_principal": author_principal},
+        )
         return 200, {"task": task}
 
     # -- P2P (U6, RFC-0003) ---------------------------------------------------
@@ -458,6 +468,11 @@ class TaskService:
             ]
             task["bids"].append(bid)
 
+        self.audit_client.log(
+            agent_principal, "work.bid",
+            resource_id=task_id,
+            details={"app_id": self.app_id, "bid_id": bid["bid_id"]},
+        )
         return 200, {
             "result": {"bid": bid},
             "evidence_id": str(uuid.uuid4()),
@@ -532,6 +547,11 @@ class TaskService:
             }
             task["status"] = "delivered"
 
+        self.audit_client.log(
+            requester, "work.submit",
+            resource_id=task_id,
+            details={"app_id": self.app_id},
+        )
         return 200, {
             "result": {"task": task},
             "evidence_id": str(uuid.uuid4()),
@@ -873,10 +893,11 @@ def make_server(
     port=8001,
     host="127.0.0.1",
     registry_url=None,
+    audit_url=None,
 ):
-    # type: (int, str, Optional[str]) -> MarketplaceHTTPServer
+    # type: (int, str, Optional[str], Optional[str]) -> MarketplaceHTTPServer
     """Build the marketplace server."""
-    service = TaskService(registry_url=registry_url)
+    service = TaskService(registry_url=registry_url, audit_url=audit_url)
     return MarketplaceHTTPServer((host, port), service)
 
 
@@ -891,12 +912,19 @@ def main(argv=None):
         default=None,
         help="Registry URL for recording reputation (optional).",
     )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
         port=args.port,
         host=args.host,
         registry_url=args.registry_url,
+        audit_url=args.audit_url,
     )
     host, port = server.server_address[:2]
     print("AgentTrust Marketplace listening on http://%s:%d" % (host, port))

@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
+from libs.audit_client import make_audit_client
 from libs.federation_client import FederationClient, FederationError
 
 
@@ -41,12 +42,15 @@ class GigBoardService:
     APP_ID = "gig-board"
     P2P_CAPABILITIES = ["gig-board.gigs", "p2p.ping"]
 
-    def __init__(self, registry_url=None, http_timeout=3.0):
-        # type: (Optional[str], float) -> None
+    def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None):
+        # type: (Optional[str], float, Optional[str]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
         self.http_timeout = http_timeout
+        # Central audit emitter (U12): best-effort, fire-and-forget; a
+        # NullAuditClient (no-op) when no audit_url is configured.
+        self.audit_client = make_audit_client(audit_url)
         self.services = {}  # type: Dict[str, dict]
         self.gigs = {}  # type: Dict[str, dict]
         self.lock = threading.Lock()
@@ -238,6 +242,12 @@ class GigBoardService:
                     service.get("gigs_completed", 0) + 1
                 )
 
+        self.audit_client.log(
+            gig["provider_principal"], "work.complete",
+            resource_id=gig_id,
+            details={"app_id": self.app_id,
+                     "buyer_principal": buyer_principal},
+        )
         return 200, {"gig": gig}
 
     # -- P2P (U6, RFC-0003) ---------------------------------------------------
@@ -382,6 +392,15 @@ class GigBoardService:
             if pricing is not None:
                 service["pricing"] = pricing
 
+        # "service.register" extends the standard audit vocabulary (the
+        # vocabulary is open by design): an agent registered ITSELF as a
+        # gig-board service provider via P2P.
+        self.audit_client.log(
+            requester, "service.register",
+            resource_id=service["id"],
+            details={"app_id": self.app_id,
+                     "capability_id": service["capability_id"]},
+        )
         return 200, {
             "result": {"service": service},
             "evidence_id": str(uuid.uuid4()),
@@ -688,10 +707,11 @@ def make_server(
     port=8002,
     host="127.0.0.1",
     registry_url=None,
+    audit_url=None,
 ):
-    # type: (int, str, Optional[str]) -> GigBoardHTTPServer
+    # type: (int, str, Optional[str], Optional[str]) -> GigBoardHTTPServer
     """Build the gig board server."""
-    service = GigBoardService(registry_url=registry_url)
+    service = GigBoardService(registry_url=registry_url, audit_url=audit_url)
     return GigBoardHTTPServer((host, port), service)
 
 
@@ -706,12 +726,19 @@ def main(argv=None):
         default=None,
         help="Registry URL for recording reputation (optional).",
     )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
         port=args.port,
         host=args.host,
         registry_url=args.registry_url,
+        audit_url=args.audit_url,
     )
     host, port = server.server_address[:2]
     print("AgentTrust Gig Board listening on http://%s:%d" % (host, port))

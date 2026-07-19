@@ -98,6 +98,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from libs.audit_client import make_audit_client
 from registry.agent_index import AgentIndex
 from registry.app_registry import SERVICE_TYPES, AppRegistry
 from registry.index_store import IndexStore, card_capability_ids
@@ -146,8 +147,9 @@ class RegistryService(object):
         user_index=None,
         agent_index=None,
         app_registry=None,
+        audit_url=None,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry]) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry], Optional[str]) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
@@ -164,6 +166,9 @@ class RegistryService(object):
         self.app_registry = (
             app_registry if app_registry is not None else AppRegistry()
         )
+        # Central audit emitter (U12): best-effort, fire-and-forget; a
+        # NullAuditClient (no-op) when no audit_url is configured.
+        self.audit_client = make_audit_client(audit_url)
 
     def admin_ok(self, token):
         # type: (Optional[str]) -> bool
@@ -306,6 +311,10 @@ class RegistryService(object):
         except ValueError:
             return 409, {"error": "agent principal already registered"}
 
+        self.audit_client.log(
+            principal_id, "agent.register",
+            details={"created_by": created_by},
+        )
         return 200, {"agent": agent}
 
     def list_agents(self, capability_id):
@@ -373,6 +382,10 @@ class RegistryService(object):
             for other in self.app_registry.list_apps()
             if other["app_id"] != app["app_id"]
         ]
+        self.audit_client.log(
+            payload["app_id"], "app.register",
+            details={"capabilities": capabilities},
+        )
         return 200, {"app": app, "ecosystem_apps": ecosystem_apps}
 
     def get_registered_app(self, app_id):
@@ -435,33 +448,42 @@ class RegistryService(object):
         target_app_id = payload["target_app_id"]
         capability_id = payload["capability_id"]
 
+        app = self.app_registry.get_app(target_app_id)
         if not self.user_index.user_exists(
             requester
         ) and not self.agent_index.agent_exists(requester):
-            return 200, {
+            verdict = {
                 "allowed": False,
                 "reason": "unknown requester principal: %s" % requester,
             }
-
-        app = self.app_registry.get_app(target_app_id)
-        if app is None:
-            return 200, {
+        elif app is None:
+            verdict = {
                 "allowed": False,
                 "reason": "target app not registered: %s" % target_app_id,
             }
-
-        if capability_id not in app.get("capabilities", []):
-            return 200, {
+        elif capability_id not in app.get("capabilities", []):
+            verdict = {
                 "allowed": False,
                 "reason": "capability '%s' not supported by app '%s'"
                 % (capability_id, target_app_id),
             }
+        else:
+            verdict = {
+                "allowed": True,
+                "reason": "requester principal known, target app "
+                "registered, capability supported",
+            }
 
-        return 200, {
-            "allowed": True,
-            "reason": "requester principal known, target app registered, "
-            "capability supported",
-        }
+        self.audit_client.log(
+            requester, "permission.check",
+            resource_id=target_app_id,
+            details={
+                "allowed": verdict["allowed"],
+                "capability_id": capability_id,
+                "reason": verdict["reason"],
+            },
+        )
+        return 200, verdict
 
     # -- user endpoints (U1) ---------------------------------------------------
 
@@ -487,6 +509,7 @@ class RegistryService(object):
         user = self.user_index.create_user(principal_id, username=username)
         reputation = self.user_index.get_aggregated_reputation(principal_id)
 
+        self.audit_client.log(principal_id, "principal.register")
         return 200, {
             "status": "registered",
             "principal_id": principal_id,
@@ -578,6 +601,11 @@ class RegistryService(object):
             principal_id, capability_id, task_id, verified
         )
 
+        self.audit_client.log(
+            principal_id, "reputation.update",
+            resource_id=task_id,
+            details={"verified": verified, "capability_id": capability_id},
+        )
         return 200, {
             "task_id": task_id,
             "verified": verified,
@@ -844,8 +872,9 @@ def make_server(
     verification_url=None,
     admin_token=None,
     rate_limiter=None,
+    audit_url=None,
 ):
-    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str], object) -> RegistryHTTPServer
+    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str], object, Optional[str]) -> RegistryHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     if service is None:
         service = RegistryService(
@@ -853,6 +882,7 @@ def make_server(
             reputation_store=reputation_store,
             verification_url=verification_url,
             admin_token=admin_token,
+            audit_url=audit_url,
         )
     return RegistryHTTPServer((host, port), service, rate_limiter=rate_limiter)
 
@@ -896,6 +926,12 @@ def main(argv=None):
         default=None,
         help="Optional JSON file for persisting user principals and reputation records.",
     )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
     args = parser.parse_args(argv)
 
     index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
@@ -905,6 +941,7 @@ def main(argv=None):
         verification_url=args.verification_url,
         admin_token=args.admin_token,
         user_index=user_index,
+        audit_url=args.audit_url,
     )
     rate_limiter = None
     if args.rate_limit > 0:

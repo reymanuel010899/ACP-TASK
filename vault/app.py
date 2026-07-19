@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from libs.audit_client import make_audit_client
 from vault.audit_log import AuditLog
 from vault.crypto import UnsupportedKDFError, validate_kdf
 
@@ -49,11 +50,15 @@ _CREDENTIAL_FIELDS = (
 class VaultService:
     """Core vault logic; in-memory storage of wrapped blobs only."""
 
-    def __init__(self):
-        # type: () -> None
+    def __init__(self, audit_url=None):
+        # type: (Optional[str]) -> None
         self.keyrings = {}  # type: Dict[str, dict]
         self.credentials = {}  # type: Dict[str, dict]
+        # Local audit log is part of the U7 contract and stays; the central
+        # audit client (U12) ADDITIONALLY mirrors significant events to the
+        # ecosystem-wide audit service, best-effort (no-op without a URL).
         self.audit = AuditLog()
+        self.audit_client = make_audit_client(audit_url)
         self.lock = threading.Lock()
 
     # -- keyring -----------------------------------------------------------
@@ -128,6 +133,10 @@ class VaultService:
             action="keyring_rotated",
             status="ok",
             reason=rotation_reason.strip(),
+        )
+        self.audit_client.log(
+            user_principal_id, "keyring.rotate",
+            details={"reason": rotation_reason.strip()},
         )
         return 200, {
             "user_principal_id": user_principal_id,
@@ -217,6 +226,12 @@ class VaultService:
                 "granted_at": datetime.utcnow().isoformat(),
             }
 
+        self.audit_client.log(
+            granted_by, "credential.grant",
+            resource_id=credential_id,
+            details={"agent_principal_id": agent_principal_id,
+                     "scope": scope},
+        )
         return 200, {"grant_id": grant_id}
 
     def request_access(self, credential_id, body):
@@ -240,6 +255,10 @@ class VaultService:
                 action="access",
                 status="denied",
             )
+            self.audit_client.log(
+                agent_principal_id, "credential.access",
+                resource_id=credential_id, status="denied",
+            )
             return 403, {"access_granted": False}
 
         self.audit.append(
@@ -247,6 +266,11 @@ class VaultService:
             credential_id=credential_id,
             action="access",
             status="granted",
+        )
+        self.audit_client.log(
+            agent_principal_id, "credential.access",
+            resource_id=credential_id, status="granted",
+            details={"scope": grant["scope"]},
         )
         return 200, {
             "access_granted": True,
@@ -264,6 +288,11 @@ class VaultService:
             grant = credential["grants"].pop(agent_principal_id, None)
         if grant is None:
             return 404, {"error": "grant not found"}
+        self.audit_client.log(
+            agent_principal_id, "credential.revoke",
+            resource_id=credential_id,
+            details={"granted_by": grant.get("granted_by")},
+        )
         return 200, {
             "revoked": True,
             "credential_id": credential_id,
@@ -436,10 +465,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
 
-def make_server(port=8003, host="127.0.0.1"):
-    # type: (int, str) -> VaultHTTPServer
+def make_server(port=8003, host="127.0.0.1", audit_url=None):
+    # type: (int, str, Optional[str]) -> VaultHTTPServer
     """Build the vault server."""
-    service = VaultService()
+    service = VaultService(audit_url=audit_url)
     return VaultHTTPServer((host, port), service)
 
 
@@ -456,9 +485,17 @@ def main(argv=None):
         "credential_vault service at startup (U9, RFC-0004). Non-fatal "
         "if the registry is down.",
     )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
     args = parser.parse_args(argv)
 
-    server = make_server(port=args.port, host=args.host)
+    server = make_server(
+        port=args.port, host=args.host, audit_url=args.audit_url
+    )
     host, port = server.server_address[:2]
     print("AgentTrust Vault listening on http://%s:%d" % (host, port))
     if args.registry_url:
