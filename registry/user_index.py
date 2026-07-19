@@ -85,9 +85,14 @@ class UserIndex(object):
 
     # -- user registration ----------------------------------------------------
 
-    def create_user(self, principal_id, username=None):
-        # type: (str, Optional[str]) -> dict
-        """Create a new user; return the user record."""
+    def create_user(self, principal_id, username=None, public_key=None):
+        # type: (str, Optional[str], Optional[str]) -> dict
+        """Create a new user; return the user record.
+
+        Key custody (Decision 8): only the PUBLIC side is ever stored — an
+        optional ``public_key`` for signature verification; the Registry
+        never receives private keys.
+        """
         now = _utcnow_rfc3339()
         user = {
             "principal_id": principal_id,
@@ -96,10 +101,22 @@ class UserIndex(object):
         }
         if username:
             user["username"] = username
+        if public_key:
+            user["public_key"] = public_key
         with self._lock:
             self._users[principal_id] = user
             self._save()
             return user
+
+    def get_public_key(self, principal_id):
+        # type: (str) -> Optional[str]
+        """The user's registered public key, or None (unknown user OR a user
+        who registered without one — callers distinguish via user_exists)."""
+        with self._lock:
+            user = self._users.get(principal_id)
+            if user is None:
+                return None
+            return user.get("public_key")
 
     def get_user(self, principal_id):
         # type: (str) -> Optional[dict]

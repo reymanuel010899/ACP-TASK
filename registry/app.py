@@ -69,6 +69,16 @@ any registry (or several) that speaks this contract.
   target_app_id, capability_id}`` → ``{"allowed": bool, "reason": ...}``.
   MVP model: allowed iff the requester is a known principal (user or
   agent), the target app is registered, and it declares the capability.
+- ``POST /auth/register`` — body ``{"principal_id": ..., "username"?: ...,
+  "public_key"?: ...}``. Registers a user Principal. Per Decision 8 only the
+  PUBLIC side is registered — ``public_key`` is optional (a non-string is
+  422), for signature verification (U14); registering without it still
+  returns 200.
+- ``GET /principals/{principal_id}/public_key`` — the Registry as public-key
+  authority (U14): resolves the principal in EITHER the user index OR the
+  agent index and returns ``{principal_id, public_key}`` (``public_key`` is
+  null when the principal registered without one); 404 when the principal
+  exists in neither.
 - ``GET /healthz`` — 200.
 
 Reputation sourcing (integration decision)
@@ -508,8 +518,17 @@ class RegistryService(object):
         if username is not None and not isinstance(username, str):
             return 422, {"error": "'username' must be a string if provided"}
 
+        # Key custody (Decision 8): only the PUBLIC side is registered — an
+        # optional public_key for signature verification (U14). The Registry
+        # never receives private keys.
+        public_key = payload.get("public_key")
+        if public_key is not None and not isinstance(public_key, str):
+            return 422, {"error": "'public_key' must be a string if provided"}
+
         # Create user
-        user = self.user_index.create_user(principal_id, username=username)
+        user = self.user_index.create_user(
+            principal_id, username=username, public_key=public_key
+        )
         reputation = self.user_index.get_aggregated_reputation(principal_id)
 
         self.audit_client.log(principal_id, "principal.register")
@@ -567,6 +586,29 @@ class RegistryService(object):
             "created_at": user.get("created_at"),
             "last_active": user.get("last_active"),
             "username": user.get("username"),
+        }
+
+    def get_principal_public_key(self, principal_id):
+        # type: (str) -> Tuple[int, dict]
+        """Serve ANY principal's public key as the authority for signature
+        verification (U14). Resolves the principal in EITHER the user index
+        OR the agent index; ``public_key`` may be null when the principal
+        registered without one. 404 only when the principal exists in
+        neither. Returns (http_status, response_body)."""
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        if self.user_index.user_exists(principal_id):
+            public_key = self.user_index.get_public_key(principal_id)
+        elif self.agent_index.agent_exists(principal_id):
+            agent = self.agent_index.get_agent(principal_id)
+            public_key = agent.get("public_key")
+        else:
+            return 404, {"error": "no principal registered with that id"}
+
+        return 200, {
+            "principal_id": principal_id,
+            "public_key": public_key,
         }
 
     def update_user_reputation(self, principal_id, payload):
@@ -804,6 +846,15 @@ class _RequestHandler(BaseHTTPRequestHandler):
         elif len(segments) == 2 and segments[0] == "users":
             # GET /users/{principal_id}
             status, body = self.service.get_user(segments[1])
+            self._send_json(status, body)
+        elif (
+            len(segments) == 3
+            and segments[0] == "principals"
+            and segments[2] == "public_key"
+        ):
+            # GET /principals/{principal_id}/public_key — the Registry as
+            # public-key authority (U14); resolves users OR agents.
+            status, body = self.service.get_principal_public_key(segments[1])
             self._send_json(status, body)
         else:
             self._send_json(404, {"error": "not found"})
