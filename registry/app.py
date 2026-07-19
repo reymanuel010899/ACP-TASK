@@ -109,6 +109,7 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from libs.audit_client import make_audit_client
+from libs.request_auth import RequestAuthenticator
 from registry.agent_index import AgentIndex
 from registry.app_registry import SERVICE_TYPES, AppRegistry
 from registry.index_store import IndexStore, card_capability_ids
@@ -158,8 +159,9 @@ class RegistryService(object):
         agent_index=None,
         app_registry=None,
         audit_url=None,
+        require_signatures=False,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry], Optional[str]) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry], Optional[str], bool) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
@@ -179,6 +181,31 @@ class RegistryService(object):
         # Central audit emitter (U12): best-effort, fire-and-forget; a
         # NullAuditClient (no-op) when no audit_url is configured.
         self.audit_client = make_audit_client(audit_url)
+        # Optional signature enforcement (U16, RFC-0005). OFF by default so the
+        # authenticator is a pure no-op and legacy unsigned callers are
+        # untouched. When ON, MUTATING HTTP routes require a valid two-link
+        # signature. The Registry IS the public-key authority, so the
+        # authenticator resolves keys IN-PROCESS via this service's own
+        # get_principal_public_key — never an HTTP self-call.
+        self.require_signatures = require_signatures
+        self.authenticator = RequestAuthenticator(
+            registry_url="",
+            require_signatures=require_signatures,
+            public_key_resolver=self._resolve_own_public_key,
+        )
+
+    def _resolve_own_public_key(self, principal_id):
+        # type: (str) -> Optional[str]
+        """In-process public-key resolver for the request authenticator.
+
+        Returns the principal's registered public key (which MAY be null) or
+        None when the principal is unknown — mirroring the HTTP authority
+        endpoint (U14) without a self-referential network round-trip.
+        """
+        status, body = self.get_principal_public_key(principal_id)
+        if status == 200:
+            return body.get("public_key")
+        return None
 
     def admin_ok(self, token):
         # type: (Optional[str]) -> bool
@@ -764,13 +791,19 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._send_json(429, {"error": "rate limit exceeded"})
         return False
 
-    def _read_json_body(self):
-        # type: () -> Tuple[Optional[dict], Optional[str]]
+    def _read_raw_body(self):
+        # type: () -> Tuple[Optional[bytes], Optional[str]]
+        """Read the raw request body bytes (the EXACT bytes a client signs)."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return None, "invalid Content-Length"
         raw = self.rfile.read(length) if length else b""
+        return raw, None
+
+    def _parse_json_body(self, raw):
+        # type: (bytes) -> Tuple[Optional[dict], Optional[str]]
+        """Parse already-read raw bytes as a JSON object (``{}`` when empty)."""
         if not raw:
             return {}, None
         try:
@@ -780,6 +813,24 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return None, "request body must be a JSON object"
         return body, None
+
+    @staticmethod
+    def _requires_signature(segments):
+        # type: (list) -> bool
+        """MUTATING routes gated by signature enforcement when the flag is ON
+        (U16). GET routes are never listed here — reads stay open."""
+        if segments in (
+            ["agents", "register"],
+            ["apps", "register"],
+            ["admin", "api-keys"],
+            ["auth", "register"],
+        ):
+            return True
+        return (
+            len(segments) == 3
+            and segments[0] == "users"
+            and segments[2] == "reputation"
+        )
 
     def do_GET(self):
         if not self._rate_ok():
@@ -864,7 +915,29 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
-        body, error = self._read_json_body()
+
+        # Read the RAW body once: it is both what the signature is verified
+        # against (U16) and what gets parsed as JSON.
+        raw, error = self._read_raw_body()
+        if error:
+            self._send_json(400, {"error": error})
+            return
+
+        # Signature enforcement (U16): a no-op when the flag is OFF (the
+        # authenticator returns (None, None) without touching anything), so
+        # legacy unsigned callers are unaffected. When ON, MUTATING routes
+        # demand a valid signature over the exact bytes just read.
+        if self._requires_signature(segments):
+            _principal, auth_error = self.service.authenticator.authenticate(
+                "POST", parts.path, raw, self.headers
+            )
+            if auth_error is not None:
+                self._send_json(
+                    auth_error.status, {"error": auth_error.message}
+                )
+                return
+
+        body, error = self._parse_json_body(raw)
         if error:
             self._send_json(400, {"error": error})
             return
@@ -927,8 +1000,9 @@ def make_server(
     admin_token=None,
     rate_limiter=None,
     audit_url=None,
+    require_signatures=False,
 ):
-    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str], object, Optional[str]) -> RegistryHTTPServer
+    # type: (int, str, Optional[IndexStore], Optional[RegistryService], Optional[object], Optional[str], Optional[str], object, Optional[str], bool) -> RegistryHTTPServer
     """Build a (threading) HTTP server; ``port=0`` picks a free port."""
     if service is None:
         service = RegistryService(
@@ -937,6 +1011,7 @@ def make_server(
             verification_url=verification_url,
             admin_token=admin_token,
             audit_url=audit_url,
+            require_signatures=require_signatures,
         )
     return RegistryHTTPServer((host, port), service, rate_limiter=rate_limiter)
 
@@ -986,6 +1061,12 @@ def main(argv=None):
         help="Base URL of the central Audit service (U12). Emission is "
         "best-effort: a down audit service is never fatal.",
     )
+    parser.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Enforce request signatures on MUTATING endpoints (U16, "
+        "RFC-0005). Off by default (unsigned callers accepted).",
+    )
     args = parser.parse_args(argv)
 
     index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
@@ -996,6 +1077,7 @@ def main(argv=None):
         admin_token=args.admin_token,
         user_index=user_index,
         audit_url=args.audit_url,
+        require_signatures=args.require_signatures,
     )
     rate_limiter = None
     if args.rate_limit > 0:
