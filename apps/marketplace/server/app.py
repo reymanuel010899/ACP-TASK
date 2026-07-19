@@ -11,6 +11,9 @@ API endpoints:
 - POST /api/negotiations/{task_id} - Send negotiation message
 - GET /api/negotiations/{task_id} - Get negotiation thread
 - POST /api/negotiations/{task_id}/complete - Mark task complete with outcome
+- POST /p2p/request - Direct P2P request from another app/agent (U6,
+  RFC-0003): permission is checked with the Registry when configured;
+  standalone mode (no --registry-url) processes without the check.
 
 Run: python -m apps.marketplace.server.app [--port 8001] [--registry-url URL]
 """
@@ -30,6 +33,9 @@ import requests
 class TaskService:
     """Core task marketplace logic; in-memory storage."""
 
+    APP_ID = "marketplace"
+    P2P_CAPABILITIES = ["marketplace.tasks", "p2p.ping"]
+
     def __init__(self, registry_url=None, http_timeout=3.0):
         # type: (Optional[str], float) -> None
         self.registry_url = (
@@ -38,6 +44,10 @@ class TaskService:
         self.http_timeout = http_timeout
         self.tasks = {}  # type: Dict[str, dict]
         self.lock = threading.Lock()
+        self.app_id = self.APP_ID
+        self.capabilities = list(self.P2P_CAPABILITIES)
+        # request_type -> handler(payload); U10 plugs real work types in here.
+        self._p2p_handlers = {"ping": self._p2p_ping}
 
     def create_task(self, principal_id, description):
         # type: (str, str) -> Tuple[int, dict]
@@ -220,6 +230,103 @@ class TaskService:
             task["outcome"] = outcome.strip()
 
         return 200, {"task": task}
+
+    # -- P2P (U6, RFC-0003) ---------------------------------------------------
+
+    def handle_p2p_request(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Process a direct P2P request from another app or agent.
+
+        Flow: validate required fields (422) → check permission with the
+        Registry when one is configured (403 on denial, 502 if the Registry
+        is unreachable — fail closed) → dispatch on ``request_type``
+        (400 for unknown types). New request types plug into
+        ``self._p2p_handlers``.
+        """
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        for field in (
+            "requester_principal_id", "request_type", "capability_id"
+        ):
+            value = payload.get(field)
+            if not isinstance(value, str) or not value:
+                return 422, {"error": "missing or invalid '%s'" % field}
+
+        if self.registry_url:
+            status, verdict = self._check_p2p_permission(
+                payload["requester_principal_id"], payload["capability_id"]
+            )
+            if status != 200:
+                return status, verdict
+            if not verdict.get("allowed"):
+                return 403, {
+                    "error": "permission denied",
+                    "reason": verdict.get("reason", "denied by registry"),
+                }
+
+        handler = self._p2p_handlers.get(payload["request_type"])
+        if handler is None:
+            return 400, {
+                "error": "unknown request_type: %s" % payload["request_type"]
+            }
+        return handler(payload)
+
+    def _p2p_ping(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        return 200, {
+            "result": {"pong": True, "app_id": self.app_id},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _check_p2p_permission(self, requester_principal_id, capability_id):
+        # type: (str, str) -> Tuple[int, dict]
+        """Ask the Registry for a P2P permission verdict (fail closed)."""
+        try:
+            resp = requests.post(
+                "%s/p2p/permissions/check" % self.registry_url,
+                json={
+                    "requester_principal_id": requester_principal_id,
+                    "target_app_id": self.app_id,
+                    "capability_id": capability_id,
+                },
+                timeout=self.http_timeout,
+            )
+            if resp.status_code != 200:
+                return 403, {
+                    "error": "permission denied",
+                    "reason": "registry permission check returned %d"
+                    % resp.status_code,
+                }
+            return 200, resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            return 502, {
+                "error": "registry unreachable for permission check: %s" % exc
+            }
+
+    def register_with_registry(self, app_endpoint, p2p_endpoint=None):
+        # type: (str, Optional[str]) -> bool
+        """POST this app's endpoints to the Registry (``/apps/register``).
+
+        Called by ``main()`` at startup when ``--registry-url`` is set.
+        Tolerates the Registry being down: returns False, never raises.
+        """
+        if not self.registry_url:
+            return False
+        try:
+            resp = requests.post(
+                "%s/apps/register" % self.registry_url,
+                json={
+                    "app_id": self.app_id,
+                    "app_endpoint": app_endpoint,
+                    "p2p_endpoint": p2p_endpoint or app_endpoint,
+                    "capabilities": self.capabilities,
+                },
+                timeout=self.http_timeout,
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
 
     def _record_reputation(self, principal_id, task_id, outcome):
         # type: (str, str, str) -> Tuple[int, dict]
@@ -466,6 +573,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 body.get("outcome"),
             )
             self._send_json(status, response)
+        elif segments == ["p2p", "request"]:
+            # POST /p2p/request - direct P2P request (U6, RFC-0003)
+            status, response = self.service.handle_p2p_request(body)
+            self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -503,6 +614,14 @@ def main(argv=None):
     print("AgentTrust Marketplace listening on http://%s:%d" % (host, port))
     if args.registry_url:
         print("(connected to registry: %s)" % args.registry_url)
+        # Register this app's P2P endpoint with the Registry (tolerates the
+        # registry being down; P2P discovery just won't find us until it is
+        # up and we re-register on next restart).
+        app_endpoint = "http://%s:%d" % (host, port)
+        if server.service.register_with_registry(app_endpoint):
+            print("(registered P2P endpoint with registry)")
+        else:
+            print("(warning: could not register P2P endpoint with registry)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

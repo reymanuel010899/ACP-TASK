@@ -47,6 +47,18 @@ any registry (or several) that speaks this contract.
   ``POST /users/{principal_id}/reputation`` accepts agent principals.
 - ``GET /agents?capability=<id>`` — agent Principals declaring that
   capability, ``{"agents": [...]}`` (empty list if none).
+- ``POST /apps/register`` — body ``{app_id, app_endpoint, p2p_endpoint,
+  capabilities}`` → ``{"app": ...}`` (U6, RFC-0003). Duplicate ``app_id``
+  re-registers (apps restart often): endpoints update in place. 422 on
+  missing/invalid fields.
+- ``GET /apps`` — ``{"apps": [...]}``; ``GET /apps/{app_id}`` —
+  ``{"app": ...}`` or 404. P2P endpoint discovery: requesters look up the
+  target's ``p2p_endpoint`` here, then talk to the app DIRECTLY (the
+  Registry never proxies P2P traffic).
+- ``POST /p2p/permissions/check`` — body ``{requester_principal_id,
+  target_app_id, capability_id}`` → ``{"allowed": bool, "reason": ...}``.
+  MVP model: allowed iff the requester is a known principal (user or
+  agent), the target app is registered, and it declares the capability.
 - ``GET /healthz`` — 200.
 
 Reputation sourcing (integration decision)
@@ -77,6 +89,7 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from registry.agent_index import AgentIndex
+from registry.app_registry import AppRegistry
 from registry.index_store import IndexStore, card_capability_ids
 from registry.user_index import UserIndex
 
@@ -122,8 +135,9 @@ class RegistryService(object):
         http_timeout=DEFAULT_HTTP_TIMEOUT,
         user_index=None,
         agent_index=None,
+        app_registry=None,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex]) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry]) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
@@ -136,6 +150,9 @@ class RegistryService(object):
         self.user_index = user_index if user_index is not None else UserIndex()
         self.agent_index = (
             agent_index if agent_index is not None else AgentIndex()
+        )
+        self.app_registry = (
+            app_registry if app_registry is not None else AppRegistry()
         )
 
     def admin_ok(self, token):
@@ -288,6 +305,103 @@ class RegistryService(object):
             return 400, {"error": "missing 'capability' parameter"}
         agents = self.agent_index.find_by_capability(capability_id)
         return 200, {"capability": capability_id, "agents": agents}
+
+    # -- app registration & P2P permissions (U6, RFC-0003) ---------------------
+
+    def register_app(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Register an app's endpoints for direct P2P communication.
+
+        Re-registration with the same ``app_id`` updates the endpoints
+        (apps restart often), preserving ``registered_at``.
+        """
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        for field in ("app_id", "app_endpoint", "p2p_endpoint"):
+            value = payload.get(field)
+            if not isinstance(value, str) or not value:
+                return 422, {"error": "missing or non-string '%s'" % field}
+
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, list) or not all(
+            isinstance(c, str) and c for c in capabilities
+        ):
+            return 422, {
+                "error": "'capabilities' must be a list of non-empty strings"
+            }
+
+        app = self.app_registry.register_app(
+            payload["app_id"],
+            payload["app_endpoint"],
+            payload["p2p_endpoint"],
+            capabilities,
+            api_key=payload.get("api_key"),
+        )
+        return 200, {"app": app}
+
+    def get_registered_app(self, app_id):
+        # type: (str) -> Tuple[int, dict]
+        """Look up an app's record (endpoint discovery)."""
+        app = self.app_registry.get_app(app_id)
+        if app is None:
+            return 404, {"error": "no app registered with that app_id"}
+        return 200, {"app": app}
+
+    def list_registered_apps(self):
+        # type: () -> Tuple[int, dict]
+        return 200, {"apps": self.app_registry.list_apps()}
+
+    def check_p2p_permission(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """MVP P2P permission model (RFC-0003 §permission-check).
+
+        Allowed iff: the requester principal exists in this Registry (as a
+        user OR an agent), the target app is registered, and the requested
+        capability is one the target app declares. Anything else is a
+        denial with an explicit reason.
+        """
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        for field in (
+            "requester_principal_id", "target_app_id", "capability_id"
+        ):
+            value = payload.get(field)
+            if not isinstance(value, str) or not value:
+                return 422, {"error": "missing or non-string '%s'" % field}
+
+        requester = payload["requester_principal_id"]
+        target_app_id = payload["target_app_id"]
+        capability_id = payload["capability_id"]
+
+        if not self.user_index.user_exists(
+            requester
+        ) and not self.agent_index.agent_exists(requester):
+            return 200, {
+                "allowed": False,
+                "reason": "unknown requester principal: %s" % requester,
+            }
+
+        app = self.app_registry.get_app(target_app_id)
+        if app is None:
+            return 200, {
+                "allowed": False,
+                "reason": "target app not registered: %s" % target_app_id,
+            }
+
+        if capability_id not in app.get("capabilities", []):
+            return 200, {
+                "allowed": False,
+                "reason": "capability '%s' not supported by app '%s'"
+                % (capability_id, target_app_id),
+            }
+
+        return 200, {
+            "allowed": True,
+            "reason": "requester principal known, target app registered, "
+            "capability supported",
+        }
 
     # -- user endpoints (U1) ---------------------------------------------------
 
@@ -578,6 +692,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
         elif len(segments) == 2 and segments[0] == "agents":
             status, body = self.service.get_agent(segments[1])
             self._send_json(status, body)
+        elif segments == ["apps"]:
+            # GET /apps — all registered apps (U6)
+            status, body = self.service.list_registered_apps()
+            self._send_json(status, body)
+        elif len(segments) == 2 and segments[0] == "apps":
+            # GET /apps/{app_id} — P2P endpoint discovery (U6)
+            status, body = self.service.get_registered_app(segments[1])
+            self._send_json(status, body)
         elif len(segments) == 2 and segments[0] == "users":
             # GET /users/{principal_id}
             status, body = self.service.get_user(segments[1])
@@ -616,6 +738,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
         elif segments == ["agents", "register"]:
             # POST /agents/register — agent Principal registration (U5)
             status, response = self.service.register_agent(body)
+            self._send_json(status, response)
+        elif segments == ["apps", "register"]:
+            # POST /apps/register — app endpoint registration for P2P (U6)
+            status, response = self.service.register_app(body)
+            self._send_json(status, response)
+        elif segments == ["p2p", "permissions", "check"]:
+            # POST /p2p/permissions/check — P2P permission verdict (U6)
+            status, response = self.service.check_p2p_permission(body)
             self._send_json(status, response)
         elif segments == ["auth", "register"]:
             # POST /auth/register — user registration
