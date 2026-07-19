@@ -6,9 +6,10 @@ import ReputationDisplay from './components/ReputationDisplay';
 import ServiceList from './components/ServiceList';
 import PostServiceForm from './components/PostServiceForm';
 import MyGigs from './components/MyGigs';
+import MyServices from './components/MyServices';
 import './index.css';
 
-type ViewType = 'browse' | 'post' | 'my-gigs' | 'auth';
+type ViewType = 'browse' | 'post' | 'my-gigs' | 'my-services' | 'auth';
 
 export default function App() {
   const { session, reputation, login, register, logout, loading } = useUserSession();
@@ -84,6 +85,12 @@ export default function App() {
           Browse Services
         </button>
         <button
+          className={`nav-item ${currentView === 'my-services' ? 'active' : ''}`}
+          onClick={() => setCurrentView('my-services')}
+        >
+          My Services
+        </button>
+        <button
           className={`nav-item ${currentView === 'post' ? 'active' : ''}`}
           onClick={() => setCurrentView('post')}
         >
@@ -108,10 +115,14 @@ export default function App() {
           />
         )}
 
+        {currentView === 'my-services' && (
+          <MyServices currentPrincipal={session.principal_id} />
+        )}
+
         {currentView === 'post' && (
           <PostServiceForm
             currentPrincipal={session.principal_id}
-            onServiceCreated={() => setCurrentView('browse')}
+            onServiceCreated={() => setCurrentView('my-services')}
           />
         )}
 

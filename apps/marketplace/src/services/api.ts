@@ -12,7 +12,7 @@ import {
   NegotiationsResponse,
 } from '../types/marketplace';
 
-const API_BASE_URL = process.env.REACT_APP_MARKETPLACE_URL || '/api';
+const API_BASE_URL = (import.meta.env.VITE_MARKETPLACE_URL || '/api') as string;
 
 interface ApiError {
   error: string;

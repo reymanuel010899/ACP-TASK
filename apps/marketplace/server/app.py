@@ -280,6 +280,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(data)
 
@@ -299,6 +302,50 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return None, "request body must be a JSON object"
         return body, None
+
+    def _get_reputation(self, principal_id):
+        # Fetch federated reputation from registry if available
+        if not self.service.registry_url:
+            return {
+                "tasks_verified": 0,
+                "tasks_rejected": 0,
+                "verification_rate": None
+            }
+        try:
+            resp = requests.get(
+                "%s/users/%s" % (self.service.registry_url, principal_id),
+                timeout=2.0
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                records = data.get("reputation_records", [])
+                if records:
+                    latest = records[-1]
+                    return {
+                        "tasks_verified": latest.get("tasks_verified", 0),
+                        "tasks_rejected": latest.get("tasks_rejected", 0),
+                        "verification_rate": latest.get("verification_rate")
+                    }
+            return {
+                "tasks_verified": 0,
+                "tasks_rejected": 0,
+                "verification_rate": None
+            }
+        except Exception:
+            return {
+                "tasks_verified": 0,
+                "tasks_rejected": 0,
+                "verification_rate": None
+            }
+
+    def do_OPTIONS(self):
+        # type: () -> None
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_GET(self):
         parts = urlsplit(self.path)
@@ -342,7 +389,40 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
-        if segments == ["api", "tasks"]:
+        if segments == ["api", "auth", "register"]:
+            # POST /api/auth/register - Register and optionally sync to registry
+            principal_id = body.get("principal_id")
+            if not principal_id:
+                self._send_json(422, {"error": "missing principal_id"})
+                return
+            # Register in central registry if configured
+            if self.service.registry_url:
+                try:
+                    requests.post(
+                        "%s/auth/register" % self.service.registry_url,
+                        json={"principal_id": principal_id},
+                        timeout=2.0
+                    )
+                except Exception:
+                    pass  # Ignore registry sync errors during registration
+            reputation = self._get_reputation(principal_id)
+            self._send_json(200, {
+                "principal_id": principal_id,
+                "reputation": reputation
+            })
+        elif segments == ["api", "auth", "login"]:
+            # POST /api/auth/login - Login and fetch federated reputation from registry
+            principal_id = body.get("principal_id")
+            if not principal_id:
+                self._send_json(422, {"error": "missing principal_id"})
+                return
+            # Fetch reputation from registry if available
+            reputation = self._get_reputation(principal_id)
+            self._send_json(200, {
+                "principal_id": principal_id,
+                "reputation": reputation
+            })
+        elif segments == ["api", "tasks"]:
             # POST /api/tasks
             status, response = self.service.create_task(
                 body.get("principal_id"),

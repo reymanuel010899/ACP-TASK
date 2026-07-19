@@ -20,8 +20,8 @@
 import { useState, useEffect, useCallback } from 'react';
 
 const SESSION_STORAGE_KEY = 'agentTrust_session';
-const REGISTRY_URL = process.env.REACT_APP_REGISTRY_URL || 'http://localhost:8090';
-const CONSOLE_API_URL = process.env.REACT_APP_CONSOLE_URL || 'http://localhost:8000';
+const REGISTRY_URL = (import.meta.env.VITE_REGISTRY_URL || 'http://localhost:8090') as string;
+const CONSOLE_API_URL = (import.meta.env.VITE_CONSOLE_URL || 'http://localhost:8000') as string;
 
 export interface UserSession {
   principal_id: string;

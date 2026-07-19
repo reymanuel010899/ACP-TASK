@@ -14,10 +14,11 @@ import TaskList from './components/TaskList';
 import PostTaskForm from './components/PostTaskForm';
 import TaskDetail from './components/TaskDetail';
 import NegotiationThread from './components/NegotiationThread';
+import MyTasks from './components/MyTasks';
 import { Task } from './types/marketplace';
 import './App.css';
 
-type ViewType = 'discover' | 'post' | 'negotiations' | 'auth';
+type ViewType = 'discover' | 'my-tasks' | 'post' | 'negotiations' | 'auth';
 
 export default function App() {
   const { session, reputation, login, register, logout, loading } = useUserSession();
@@ -96,6 +97,12 @@ export default function App() {
           Browse Tasks
         </button>
         <button
+          className={`nav-item ${currentView === 'my-tasks' ? 'active' : ''}`}
+          onClick={() => setCurrentView('my-tasks')}
+        >
+          My Tasks
+        </button>
+        <button
           className={`nav-item ${currentView === 'post' ? 'active' : ''}`}
           onClick={() => setCurrentView('post')}
         >
@@ -120,7 +127,6 @@ export default function App() {
             }}
             onAcceptTask={(task) => {
               setSelectedTask(task);
-              setCurrentView('negotiations');
             }}
           />
         )}
@@ -139,11 +145,15 @@ export default function App() {
           />
         )}
 
+        {currentView === 'my-tasks' && (
+          <MyTasks currentPrincipal={session.principal_id} />
+        )}
+
         {currentView === 'post' && (
           <PostTaskForm
             currentPrincipal={session.principal_id}
             onTaskCreated={(task) => {
-              setCurrentView('discover');
+              setCurrentView('my-tasks');
               setSelectedTask(task);
             }}
           />
