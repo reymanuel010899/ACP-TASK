@@ -31,6 +31,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from libs.audit_client import make_audit_client
+from libs.request_auth import RequestAuthenticator
 from vault.audit_log import AuditLog
 from vault.crypto import UnsupportedKDFError, validate_kdf
 
@@ -50,8 +51,9 @@ _CREDENTIAL_FIELDS = (
 class VaultService:
     """Core vault logic; in-memory storage of wrapped blobs only."""
 
-    def __init__(self, audit_url=None):
-        # type: (Optional[str]) -> None
+    def __init__(self, audit_url=None, registry_url=None,
+                 require_signatures=False, public_key_resolver=None):
+        # type: (Optional[str], Optional[str], bool, Optional[object]) -> None
         self.keyrings = {}  # type: Dict[str, dict]
         self.credentials = {}  # type: Dict[str, dict]
         # Local audit log is part of the U7 contract and stays; the central
@@ -59,15 +61,31 @@ class VaultService:
         # ecosystem-wide audit service, best-effort (no-op without a URL).
         self.audit = AuditLog()
         self.audit_client = make_audit_client(audit_url)
+        # Shared request-authentication middleware (U15). A pure no-op
+        # pass-through while ``require_signatures`` is off, so the default
+        # deployment keeps today's behavior byte-for-byte. When on, every
+        # mutating route authenticates and the verified signer is bound to the
+        # credential owner/agent by the handlers below. Tests inject
+        # ``public_key_resolver`` so no live Registry is needed.
+        self.require_signatures = require_signatures
+        self.authenticator = RequestAuthenticator(
+            registry_url,
+            require_signatures=require_signatures,
+            public_key_resolver=public_key_resolver,
+        )
         self.lock = threading.Lock()
 
     # -- keyring -----------------------------------------------------------
 
-    def store_keyring(self, body):
-        # type: (dict) -> Tuple[int, dict]
+    def store_keyring(self, body, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
         user_principal_id = body.get("user_principal_id")
         if not isinstance(user_principal_id, str) or not user_principal_id:
             return 422, {"error": "missing or invalid 'user_principal_id'"}
+        # Identity binding (only when authenticated, i.e. flag on): the signer
+        # may only store a keyring under its OWN principal id.
+        if signer is not None and signer != user_principal_id:
+            return 403, {"error": "signer does not match keyring owner"}
         for field in _KEYRING_FIELDS:
             if field not in body:
                 return 422, {"error": "missing '%s'" % field}
@@ -98,13 +116,16 @@ class VaultService:
             return 404, {"error": "keyring not found"}
         return 200, dict(record)
 
-    def rotate_keyring(self, user_principal_id, body):
-        # type: (str, dict) -> Tuple[int, dict]
+    def rotate_keyring(self, user_principal_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
         """Re-wrap the DEK (password change / event-based rotation).
 
         Only the wrapping changes — stored credential ciphertexts are never
         re-encrypted because the DEK itself is unchanged.
         """
+        # Identity binding (flag on): only the keyring owner may rotate it.
+        if signer is not None and signer != user_principal_id:
+            return 403, {"error": "signer does not match keyring owner"}
         for field in _ROTATION_FIELDS:
             if field not in body:
                 return 422, {"error": "missing '%s'" % field}
@@ -145,12 +166,17 @@ class VaultService:
 
     # -- credentials -------------------------------------------------------
 
-    def store_credential(self, body):
-        # type: (dict) -> Tuple[int, dict]
+    def store_credential(self, body, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
         for field in _CREDENTIAL_FIELDS:
             value = body.get(field)
             if not isinstance(value, str) or not value:
                 return 422, {"error": "missing or invalid '%s'" % field}
+
+        # Identity binding (flag on): the signer may only store credentials
+        # under its OWN principal id.
+        if signer is not None and signer != body["user_principal_id"]:
+            return 403, {"error": "signer does not match credential owner"}
 
         credential_id = str(uuid.uuid4())
         created_at = datetime.utcnow().isoformat()
@@ -197,8 +223,8 @@ class VaultService:
 
     # -- grants + access ---------------------------------------------------
 
-    def grant_access(self, credential_id, body):
-        # type: (str, dict) -> Tuple[int, dict]
+    def grant_access(self, credential_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
         agent_principal_id = body.get("agent_principal_id")
         scope = body.get("scope")
         granted_by = body.get("granted_by")
@@ -208,6 +234,12 @@ class VaultService:
             return 422, {"error": "missing or invalid 'scope'"}
         if not isinstance(granted_by, str) or not granted_by:
             return 422, {"error": "missing or invalid 'granted_by'"}
+
+        # Identity binding (flag on): the signer must be the party it claims to
+        # grant as; combined with the owner check below this means only the
+        # owner, acting as themselves, can grant.
+        if signer is not None and signer != granted_by:
+            return 403, {"error": "signer does not match 'granted_by'"}
 
         with self.lock:
             credential = self.credentials.get(credential_id)
@@ -234,11 +266,19 @@ class VaultService:
         )
         return 200, {"grant_id": grant_id}
 
-    def request_access(self, credential_id, body):
-        # type: (str, dict) -> Tuple[int, dict]
+    def request_access(self, credential_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
         agent_principal_id = body.get("agent_principal_id")
         if not isinstance(agent_principal_id, str) or not agent_principal_id:
             return 422, {"error": "missing or invalid 'agent_principal_id'"}
+
+        # Identity binding (flag on): an agent may only request access AS
+        # itself — it cannot fetch a credential granted to a different agent.
+        if signer is not None and signer != agent_principal_id:
+            return 403, {
+                "access_granted": False,
+                "error": "signer does not match 'agent_principal_id'",
+            }
 
         with self.lock:
             credential = self.credentials.get(credential_id)
@@ -279,12 +319,19 @@ class VaultService:
             "scope": grant["scope"],
         }
 
-    def revoke_access(self, credential_id, agent_principal_id):
-        # type: (str, str) -> Tuple[int, dict]
+    def revoke_access(self, credential_id, agent_principal_id, signer=None):
+        # type: (str, str, Optional[str]) -> Tuple[int, dict]
         with self.lock:
             credential = self.credentials.get(credential_id)
             if credential is None:
                 return 404, {"error": "credential not found"}
+            # Identity binding (flag on): ONLY the credential owner may revoke.
+            # This closes the historical asymmetry with grant_access — flag OFF
+            # (signer is None) preserves the original permissive revoke.
+            if signer is not None and signer != credential["user_principal_id"]:
+                return 403, {
+                    "error": "only the credential owner can revoke access"
+                }
             grant = credential["grants"].pop(agent_principal_id, None)
         if grant is None:
             return 404, {"error": "grant not found"}
@@ -345,21 +392,44 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json_body(self):
-        # type: () -> Tuple[Optional[dict], Optional[str]]
+        # type: () -> Tuple[bytes, Optional[dict], Optional[str]]
+        """Read the request body ONCE, returning ``(raw, parsed, error)``.
+
+        The raw bytes are returned alongside the parsed JSON because the
+        request signature (U15) is computed over the exact body bytes, and
+        ``rfile`` can only be consumed a single time.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return None, "invalid Content-Length"
+            return b"", None, "invalid Content-Length"
         raw = self.rfile.read(length) if length else b""
         if not raw:
-            return {}, None
+            return raw, {}, None
         try:
             body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return None, "request body is not valid JSON"
+            return raw, None, "request body is not valid JSON"
         if not isinstance(body, dict):
-            return None, "request body must be a JSON object"
-        return body, None
+            return raw, None, "request body must be a JSON object"
+        return raw, body, None
+
+    def _authenticate(self, raw_body):
+        # type: (bytes) -> Tuple[Optional[str], bool]
+        """Authenticate the current request via the shared middleware (U15).
+
+        Returns ``(principal_id, handled)``. When signatures are off this is a
+        no-op returning ``(None, False)`` — every downstream identity-binding
+        check is skipped, so behavior is byte-for-byte the pre-U17 vault. On an
+        AuthError the 401 response is sent here and ``handled`` is True.
+        """
+        principal_id, error = self.service.authenticator.authenticate(
+            self.command, self.path, raw_body, self.headers
+        )
+        if error is not None:
+            self._send_json(error.status, {"error": error.message})
+            return None, True
+        return principal_id, False
 
     def do_OPTIONS(self):
         # type: () -> None
@@ -400,18 +470,23 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
-        body, error = self._read_json_body()
+        raw, body, error = self._read_json_body()
         if error:
             self._send_json(400, {"error": error})
+            return
+        signer, handled = self._authenticate(raw)
+        if handled:
             return
 
         if segments == ["keyring"]:
             # POST /keyring
-            status, response = self.service.store_keyring(body)
+            status, response = self.service.store_keyring(body, signer=signer)
             self._send_json(status, response)
         elif segments == ["credentials"]:
             # POST /credentials
-            status, response = self.service.store_credential(body)
+            status, response = self.service.store_credential(
+                body, signer=signer
+            )
             self._send_json(status, response)
         elif (
             len(segments) == 3
@@ -419,7 +494,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "grants"
         ):
             # POST /credentials/{credential_id}/grants
-            status, response = self.service.grant_access(segments[1], body)
+            status, response = self.service.grant_access(
+                segments[1], body, signer=signer
+            )
             self._send_json(status, response)
         elif (
             len(segments) == 3
@@ -427,7 +504,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             and segments[2] == "access"
         ):
             # POST /credentials/{credential_id}/access
-            status, response = self.service.request_access(segments[1], body)
+            status, response = self.service.request_access(
+                segments[1], body, signer=signer
+            )
             self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
@@ -435,14 +514,19 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
-        body, error = self._read_json_body()
+        raw, body, error = self._read_json_body()
         if error:
             self._send_json(400, {"error": error})
+            return
+        signer, handled = self._authenticate(raw)
+        if handled:
             return
 
         if len(segments) == 2 and segments[0] == "keyring":
             # PUT /keyring/{user_principal_id}
-            status, response = self.service.rotate_keyring(segments[1], body)
+            status, response = self.service.rotate_keyring(
+                segments[1], body, signer=signer
+            )
             self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
@@ -450,6 +534,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
+        signer, handled = self._authenticate(b"")
+        if handled:
+            return
 
         if (
             len(segments) == 4
@@ -458,17 +545,30 @@ class _RequestHandler(BaseHTTPRequestHandler):
         ):
             # DELETE /credentials/{credential_id}/grants/{agent_principal_id}
             status, response = self.service.revoke_access(
-                segments[1], segments[3]
+                segments[1], segments[3], signer=signer
             )
             self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
 
 
-def make_server(port=8003, host="127.0.0.1", audit_url=None):
-    # type: (int, str, Optional[str]) -> VaultHTTPServer
-    """Build the vault server."""
-    service = VaultService(audit_url=audit_url)
+def make_server(port=8003, host="127.0.0.1", audit_url=None,
+                registry_url=None, require_signatures=False,
+                public_key_resolver=None):
+    # type: (int, str, Optional[str], Optional[str], bool, Optional[object]) -> VaultHTTPServer
+    """Build the vault server.
+
+    ``require_signatures`` opts the vault into signed-request enforcement
+    (U15/U17); when off (default) the vault behaves exactly as before. The
+    optional ``public_key_resolver`` lets tests supply principal public keys
+    without a live Registry.
+    """
+    service = VaultService(
+        audit_url=audit_url,
+        registry_url=registry_url,
+        require_signatures=require_signatures,
+        public_key_resolver=public_key_resolver,
+    )
     return VaultHTTPServer((host, port), service)
 
 
@@ -491,10 +591,20 @@ def main(argv=None):
         help="Base URL of the central Audit service (U12). Emission is "
         "best-effort: a down audit service is never fatal.",
     )
+    parser.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Enforce signed requests (U15/U17): every mutating endpoint "
+        "authenticates against the Registry and the verified signer is bound "
+        "to the credential owner/agent. Off by default (backward-compatible). "
+        "Requires --registry-url to resolve principal public keys.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
-        port=args.port, host=args.host, audit_url=args.audit_url
+        port=args.port, host=args.host, audit_url=args.audit_url,
+        registry_url=args.registry_url,
+        require_signatures=args.require_signatures,
     )
     host, port = server.server_address[:2]
     print("AgentTrust Vault listening on http://%s:%d" % (host, port))
