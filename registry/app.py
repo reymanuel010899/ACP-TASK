@@ -33,7 +33,20 @@ any registry (or several) that speaks this contract.
   candidates whose ``verification_rate`` is null OR below the threshold are
   excluded — an explicit threshold is an opt-in to "proven only", so a
   no-history (neutral) agent does not pass it.
-- ``GET /agents/{principal_id}`` — the stored registration, or 404.
+- ``GET /agents/{principal_id}`` — an agent Principal (U5) as
+  ``{"agent": ..., "reputation": ...}``, falling back to the stored U4
+  agent-card registration as ``{"registration": ...}``; 404 for neither.
+- ``POST /agents/register`` — body ``{"agent_card": {name, description,
+  capabilities: [str], pricing?}, "principal_id": ..., "created_by":
+  <user principal_id>, "public_key"?: ...}``. Registers an agent as a
+  first-class Principal (U5) with independent reputation. Per Decision 8
+  only the PUBLIC side is registered — the Registry never receives private
+  keys; ``public_key`` is optional, for future signature verification.
+  Duplicate principal_id is 409; bad/missing fields are 422. Agent
+  reputation flows through the SAME mechanism as users:
+  ``POST /users/{principal_id}/reputation`` accepts agent principals.
+- ``GET /agents?capability=<id>`` — agent Principals declaring that
+  capability, ``{"agents": [...]}`` (empty list if none).
 - ``GET /healthz`` — 200.
 
 Reputation sourcing (integration decision)
@@ -63,6 +76,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from registry.agent_index import AgentIndex
 from registry.index_store import IndexStore, card_capability_ids
 from registry.user_index import UserIndex
 
@@ -107,8 +121,9 @@ class RegistryService(object):
         admin_token=None,
         http_timeout=DEFAULT_HTTP_TIMEOUT,
         user_index=None,
+        agent_index=None,
     ):
-        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex]) -> None
+        # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex]) -> None
         self.index = index
         self.reputation_store = reputation_store
         self.verification_url = (
@@ -119,6 +134,9 @@ class RegistryService(object):
         self.admin_token = admin_token
         self.http_timeout = http_timeout
         self.user_index = user_index if user_index is not None else UserIndex()
+        self.agent_index = (
+            agent_index if agent_index is not None else AgentIndex()
+        )
 
     def admin_ok(self, token):
         # type: (Optional[str]) -> bool
@@ -197,10 +215,79 @@ class RegistryService(object):
 
     def get_agent(self, principal_id):
         # type: (str) -> Tuple[int, dict]
+        # Agent Principals (U5) first; legacy agent-card registrations (U4)
+        # as a fallback so the pre-existing lookup contract keeps working.
+        agent = self.agent_index.get_agent(principal_id)
+        if agent is not None:
+            return 200, {
+                "agent": agent,
+                "reputation": self.user_index.get_aggregated_reputation(
+                    principal_id
+                ),
+            }
         registration = self.index.get(principal_id)
         if registration is None:
             return 404, {"error": "no registration for that principal_id"}
         return 200, {"registration": registration}
+
+    # -- agent principal endpoints (U5) ----------------------------------------
+
+    def register_agent(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """Register an agent as a first-class Principal.
+
+        Key custody (Decision 8): only the PUBLIC side is registered
+        (``principal_id`` + optional ``public_key``); the Registry never
+        receives private keys. Returns ``(http_status, response_body)``.
+        """
+        if not isinstance(payload, dict):
+            return 422, {"error": "request body must be a JSON object"}
+
+        principal_id = payload.get("principal_id")
+        if not isinstance(principal_id, str) or not principal_id:
+            return 422, {"error": "missing or non-string 'principal_id'"}
+
+        created_by = payload.get("created_by")
+        if not isinstance(created_by, str) or not created_by:
+            return 422, {"error": "missing or non-string 'created_by'"}
+
+        agent_card = payload.get("agent_card")
+        if not isinstance(agent_card, dict):
+            return 422, {"error": "missing or non-object 'agent_card'"}
+
+        capabilities = agent_card.get("capabilities")
+        if (
+            not isinstance(capabilities, list)
+            or not capabilities
+            or not all(
+                isinstance(c, str) and c for c in capabilities
+            )
+        ):
+            return 422, {
+                "error": "'agent_card.capabilities' must be a non-empty "
+                "list of non-empty strings"
+            }
+
+        public_key = payload.get("public_key")
+        if public_key is not None and not isinstance(public_key, str):
+            return 422, {"error": "'public_key' must be a string if provided"}
+
+        try:
+            agent = self.agent_index.register_agent(
+                principal_id, agent_card, created_by, public_key=public_key
+            )
+        except ValueError:
+            return 409, {"error": "agent principal already registered"}
+
+        return 200, {"agent": agent}
+
+    def list_agents(self, capability_id):
+        # type: (str) -> Tuple[int, dict]
+        """Agents declaring ``capability_id`` (empty list when none match)."""
+        if not isinstance(capability_id, str) or not capability_id:
+            return 400, {"error": "missing 'capability' parameter"}
+        agents = self.agent_index.find_by_capability(capability_id)
+        return 200, {"capability": capability_id, "agents": agents}
 
     # -- user endpoints (U1) ---------------------------------------------------
 
@@ -284,7 +371,8 @@ class RegistryService(object):
 
     def update_user_reputation(self, principal_id, payload):
         # type: (str, dict) -> Tuple[int, dict]
-        """Record a reputation event for a user.
+        """Record a reputation event for a principal (user OR agent — agents
+        are principals too, U5; both share the same reputation records).
         Returns (http_status, response_body)."""
         if not isinstance(principal_id, str) or not principal_id:
             return 422, {"error": "missing or non-string 'principal_id'"}
@@ -292,8 +380,10 @@ class RegistryService(object):
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
 
-        # Check if user exists
-        if not self.user_index.user_exists(principal_id):
+        # Check the principal exists (as a user or an agent)
+        if not self.user_index.user_exists(
+            principal_id
+        ) and not self.agent_index.agent_exists(principal_id):
             return 404, {"error": "principal not found"}
 
         # Validate required fields
@@ -474,6 +564,17 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 capability, min_reputation=min_reputation
             )
             self._send_json(status, body)
+        elif segments == ["agents"]:
+            # GET /agents?capability=<id> — agent principals by capability
+            query = parse_qs(parts.query)
+            capability = query.get("capability", [None])[0]
+            if not capability:
+                self._send_json(
+                    400, {"error": "missing 'capability' query parameter"}
+                )
+                return
+            status, body = self.service.list_agents(capability)
+            self._send_json(status, body)
         elif len(segments) == 2 and segments[0] == "agents":
             status, body = self.service.get_agent(segments[1])
             self._send_json(status, body)
@@ -512,6 +613,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             self._send_json(200, {"api_key": self.service.create_api_key()})
+        elif segments == ["agents", "register"]:
+            # POST /agents/register — agent Principal registration (U5)
+            status, response = self.service.register_agent(body)
+            self._send_json(status, response)
         elif segments == ["auth", "register"]:
             # POST /auth/register — user registration
             status, response = self.service.register_user(body)
