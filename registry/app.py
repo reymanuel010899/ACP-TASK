@@ -586,13 +586,20 @@ def main(argv=None):
         default=0,
         help="Max requests per IP per 60s window (0 = off).",
     )
+    parser.add_argument(
+        "--user-index-path",
+        default=None,
+        help="Optional JSON file for persisting user principals and reputation records.",
+    )
     args = parser.parse_args(argv)
 
     index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
+    user_index = UserIndex(path=args.user_index_path)
     service = RegistryService(
         index,
         verification_url=args.verification_url,
         admin_token=args.admin_token,
+        user_index=user_index,
     )
     rate_limiter = None
     if args.rate_limit > 0:

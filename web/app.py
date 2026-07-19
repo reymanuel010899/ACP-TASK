@@ -284,6 +284,17 @@ def _validate_task(payload):
     return None
 
 
+def _validate_principal(principal_id):
+    # type: (Optional[str]) -> Optional[str]
+    """Validate a principal_id. Returns error message or None if valid."""
+    if not isinstance(principal_id, str) or not principal_id.strip():
+        return "principal_id must be a non-empty string"
+    # Basic ed25519 key format check: base64-encoded ~44 chars or hex encoded 64 chars
+    if len(principal_id) < 20:
+        return "principal_id looks too short (ed25519 keys are ~44 chars base64 or 64 hex)"
+    return None
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AgentTrustWeb/0.1"
     protocol_version = "HTTP/1.1"
@@ -313,12 +324,26 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE_HTML, content_type="text/html; charset=utf-8")
         elif self.path == "/healthz":
             self._send(200, {"status": "ok"})
+        elif self.path == "/api/auth/session":
+            self._handle_get_session()
+            return
+        elif self.path.startswith("/api/reputation/"):
+            # GET /api/reputation/{principal_id}
+            principal_id = self.path[len("/api/reputation/"):]
+            self._handle_get_reputation(principal_id)
+            return
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         if self.path == "/api/register-provider":
             self._handle_register_provider()
+            return
+        if self.path == "/api/auth/register":
+            self._handle_auth_register()
+            return
+        if self.path == "/api/auth/login":
+            self._handle_auth_login()
             return
         if self.path != "/api/task":
             self._send(404, {"error": "not found"})
@@ -388,6 +413,114 @@ class _Handler(BaseHTTPRequestHandler):
             payload.get("url") if isinstance(payload, dict) else None
         )
         self._send(status, body)
+
+    def _handle_auth_register(self):
+        # type: () -> None
+        """POST /api/auth/register — register a new user with Principal."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+
+        if not isinstance(payload, dict):
+            self._send(400, {"error": "body must be a JSON object"})
+            return
+
+        principal_id = payload.get("principal_id")
+        error = _validate_principal(principal_id)
+        if error:
+            self._send(400, {"error": error})
+            return
+
+        # Call the registry to register the user
+        try:
+            resp = requests.post(
+                self.stack.registry_url + "/auth/register",
+                json={"principal_id": principal_id},
+                timeout=self.stack.http_timeout,
+            )
+            status_code = resp.status_code
+            body = resp.json() if resp.text else {}
+        except (requests.RequestException, ValueError) as exc:
+            self._send(502, {"error": "El registro no respondió: %s" % exc})
+            return
+
+        self._send(status_code, body)
+
+    def _handle_auth_login(self):
+        # type: () -> None
+        """POST /api/auth/login — log in a user with Principal."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+
+        if not isinstance(payload, dict):
+            self._send(400, {"error": "body must be a JSON object"})
+            return
+
+        principal_id = payload.get("principal_id")
+        error = _validate_principal(principal_id)
+        if error:
+            self._send(400, {"error": error})
+            return
+
+        # Call the registry to log in the user
+        try:
+            resp = requests.post(
+                self.stack.registry_url + "/auth/login",
+                json={"principal_id": principal_id},
+                timeout=self.stack.http_timeout,
+            )
+            status_code = resp.status_code
+            body = resp.json() if resp.text else {}
+        except (requests.RequestException, ValueError) as exc:
+            self._send(502, {"error": "El registro no respondió: %s" % exc})
+            return
+
+        self._send(status_code, body)
+
+    def _handle_get_session(self):
+        # type: () -> None
+        """GET /api/auth/session — get current session (if any from client-side storage)."""
+        # This is a simple endpoint that just returns OK for health check.
+        # Session state is managed by the frontend in localStorage.
+        self._send(200, {"status": "ok", "session_storage": "client-side"})
+
+    def _handle_get_reputation(self, principal_id):
+        # type: (str) -> None
+        """GET /api/reputation/{principal_id} — get user reputation."""
+        if not principal_id:
+            self._send(400, {"error": "principal_id required"})
+            return
+
+        # Call the registry to get the user's reputation
+        try:
+            resp = requests.get(
+                self.stack.registry_url + "/users/%s" % principal_id,
+                timeout=self.stack.http_timeout,
+            )
+            status_code = resp.status_code
+            body = resp.json() if resp.text else {}
+        except (requests.RequestException, ValueError) as exc:
+            self._send(502, {"error": "El registro no respondió: %s" % exc})
+            return
+
+        self._send(status_code, body)
 
 
 def make_server(
