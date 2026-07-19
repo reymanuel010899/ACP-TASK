@@ -43,6 +43,7 @@ import requests
 
 from agent_marketplace.hiring import HiringStore, parse_expires_at
 from libs.audit_client import make_audit_client
+from libs.request_auth import RequestAuthenticator
 
 DEFAULT_HTTP_TIMEOUT = 3.0
 
@@ -52,8 +53,9 @@ class MarketplaceService(object):
 
     def __init__(self, registry_url=None, vault_url=None,
                  http_timeout=DEFAULT_HTTP_TIMEOUT, hiring_store=None,
-                 audit_url=None):
-        # type: (Optional[str], Optional[str], float, Optional[HiringStore], Optional[str]) -> None
+                 audit_url=None, require_signatures=False,
+                 public_key_resolver=None):
+        # type: (Optional[str], Optional[str], float, Optional[HiringStore], Optional[str], bool, Optional[object]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
@@ -65,6 +67,16 @@ class MarketplaceService(object):
         # Central audit emitter (U12): best-effort, fire-and-forget; a
         # NullAuditClient (no-op) when no audit_url is configured.
         self.audit_client = make_audit_client(audit_url)
+        # Request authentication (U19): the marketplace's mutating routes
+        # (hire/revoke/rate) require a signed request that binds the acting
+        # user's identity. Off by default -> a pure no-op pass-through
+        # (today's behavior exactly). The public key authority is the same
+        # Registry; ``public_key_resolver`` is injectable for tests.
+        self.authenticator = RequestAuthenticator(
+            self.registry_url,
+            require_signatures=require_signatures,
+            public_key_resolver=public_key_resolver,
+        )
         self._vault_client = None
         if self.vault_url:
             from libs.vault_client import VaultClient
@@ -188,8 +200,8 @@ class MarketplaceService(object):
 
     # -- hiring -------------------------------------------------------------
 
-    def create_hiring_grant(self, payload):
-        # type: (dict) -> Tuple[int, dict]
+    def create_hiring_grant(self, payload, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
 
@@ -202,6 +214,15 @@ class MarketplaceService(object):
         if not isinstance(user_principal_id, str) or not user_principal_id:
             return 422, {
                 "error": "missing or non-string 'user_principal_id'"
+            }
+
+        # Identity binding (U19): when the request was signed, the verified
+        # signer must be the user the hire is created for. A no-op when
+        # signatures are off (``signer`` is None).
+        if signer is not None and signer != user_principal_id:
+            return 403, {
+                "error": "authenticated signer does not match "
+                "'user_principal_id'"
             }
 
         scoped_capabilities = payload.get("scoped_capabilities")
@@ -302,8 +323,8 @@ class MarketplaceService(object):
         )
         return 200, {"grants": grants}
 
-    def revoke_hiring_grant(self, grant_id, user_principal_id):
-        # type: (str, Optional[str]) -> Tuple[int, dict]
+    def revoke_hiring_grant(self, grant_id, user_principal_id, signer=None):
+        # type: (str, Optional[str], Optional[str]) -> Tuple[int, dict]
         if not isinstance(user_principal_id, str) or not user_principal_id:
             return 422, {
                 "error": "missing or non-string 'user_principal_id'"
@@ -311,6 +332,13 @@ class MarketplaceService(object):
         grant = self.hiring.get_grant(grant_id)
         if grant is None:
             return 404, {"error": "no hiring grant with that grant_id"}
+        # Identity binding (U19): when the request was signed, the verified
+        # signer must be the grant's own hiring user. A no-op when signatures
+        # are off (``signer`` is None).
+        if signer is not None and signer != grant["user_principal_id"]:
+            return 403, {
+                "error": "only the hiring user can revoke this grant"
+            }
         if grant["user_principal_id"] != user_principal_id:
             return 403, {
                 "error": "only the hiring user can revoke this grant"
@@ -341,8 +369,8 @@ class MarketplaceService(object):
 
     # -- ratings ------------------------------------------------------------
 
-    def rate_agent(self, payload):
-        # type: (dict) -> Tuple[int, dict]
+    def rate_agent(self, payload, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
 
@@ -355,6 +383,15 @@ class MarketplaceService(object):
         if not isinstance(user_principal_id, str) or not user_principal_id:
             return 422, {
                 "error": "missing or non-string 'user_principal_id'"
+            }
+
+        # Identity binding (U19): when the request was signed, the verified
+        # signer must be the user the rating is attributed to. Checked before
+        # the has-hiring gate. A no-op when signatures are off.
+        if signer is not None and signer != user_principal_id:
+            return 403, {
+                "error": "authenticated signer does not match "
+                "'user_principal_id'"
             }
 
         rating = payload.get("rating")
@@ -444,21 +481,38 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json_body(self):
-        # type: () -> Tuple[Optional[dict], Optional[str]]
+        # type: () -> Tuple[bytes, Optional[dict], Optional[str]]
+        """Return ``(raw_bytes, parsed_body, error)``.
+
+        The RAW bytes are the ones the client signed (U19); they MUST be
+        passed to the authenticator verbatim, so we surface them alongside
+        the parsed JSON.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return None, "invalid Content-Length"
+            return b"", None, "invalid Content-Length"
         raw = self.rfile.read(length) if length else b""
         if not raw:
-            return {}, None
+            return b"", {}, None
         try:
             body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return None, "request body is not valid JSON"
+            return raw, None, "request body is not valid JSON"
         if not isinstance(body, dict):
-            return None, "request body must be a JSON object"
-        return body, None
+            return raw, None, "request body must be a JSON object"
+        return raw, body, None
+
+    def _authenticate(self, raw_body):
+        # type: (bytes) -> Tuple[Optional[str], Optional[object]]
+        """Verify the request signature (U19); no-op when the flag is off.
+
+        Returns ``(signer_principal_id, None)`` on success (``signer`` is None
+        when signatures are not required), or ``(None, AuthError)`` on failure.
+        """
+        return self.service.authenticator.authenticate(
+            self.command, self.path, raw_body, self.headers
+        )
 
     def do_OPTIONS(self):
         # type: () -> None
@@ -510,16 +564,26 @@ class _RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
-        body, error = self._read_json_body()
+        raw, body, error = self._read_json_body()
         if error:
             self._send_json(400, {"error": error})
             return
 
         if segments == ["marketplace", "hiring-grants"]:
-            status, response = self.service.create_hiring_grant(body)
+            signer, auth_error = self._authenticate(raw)
+            if auth_error is not None:
+                self._send_json(auth_error.status, {"error": auth_error.message})
+                return
+            status, response = self.service.create_hiring_grant(
+                body, signer=signer
+            )
             self._send_json(status, response)
         elif segments == ["marketplace", "ratings"]:
-            status, response = self.service.rate_agent(body)
+            signer, auth_error = self._authenticate(raw)
+            if auth_error is not None:
+                self._send_json(auth_error.status, {"error": auth_error.message})
+                return
+            status, response = self.service.rate_agent(body, signer=signer)
             self._send_json(status, response)
         else:
             self._send_json(404, {"error": "not found"})
@@ -528,7 +592,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         query = parse_qs(parts.query)
-        body, error = self._read_json_body()
+        raw, body, error = self._read_json_body()
         if error:
             self._send_json(400, {"error": error})
             return
@@ -536,12 +600,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[:2] == [
             "marketplace", "hiring-grants",
         ]:
+            signer, auth_error = self._authenticate(raw)
+            if auth_error is not None:
+                self._send_json(auth_error.status, {"error": auth_error.message})
+                return
             # user_principal_id may come in the body or the query string.
             user_principal_id = body.get("user_principal_id") or query.get(
                 "user_principal_id", [None]
             )[0]
             status, response = self.service.revoke_hiring_grant(
-                segments[2], user_principal_id
+                segments[2], user_principal_id, signer=signer
             )
             self._send_json(status, response)
         else:
@@ -549,11 +617,14 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(port=8004, host="127.0.0.1", registry_url=None,
-                vault_url=None, audit_url=None):
-    # type: (int, str, Optional[str], Optional[str], Optional[str]) -> AgentMarketplaceHTTPServer
+                vault_url=None, audit_url=None, require_signatures=False,
+                public_key_resolver=None):
+    # type: (int, str, Optional[str], Optional[str], Optional[str], bool, Optional[object]) -> AgentMarketplaceHTTPServer
     """Build the agent-marketplace server; ``port=0`` picks a free port."""
     service = MarketplaceService(
-        registry_url=registry_url, vault_url=vault_url, audit_url=audit_url
+        registry_url=registry_url, vault_url=vault_url, audit_url=audit_url,
+        require_signatures=require_signatures,
+        public_key_resolver=public_key_resolver,
     )
     return AgentMarketplaceHTTPServer((host, port), service)
 
@@ -582,6 +653,14 @@ def main(argv=None):
         help="Base URL of the central Audit service (U12). Emission is "
         "best-effort: a down audit service is never fatal.",
     )
+    parser.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Require signed requests on mutating routes (hire/revoke/rate), "
+        "binding the acting user's identity (U19). Off by default: today's "
+        "unauthenticated behavior. Principal public keys are resolved from "
+        "the Registry.",
+    )
     args = parser.parse_args(argv)
 
     server = make_server(
@@ -590,6 +669,7 @@ def main(argv=None):
         registry_url=args.registry_url,
         vault_url=args.vault_url,
         audit_url=args.audit_url,
+        require_signatures=args.require_signatures,
     )
     host, port = server.server_address[:2]
     print(
