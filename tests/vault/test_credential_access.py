@@ -77,6 +77,26 @@ def test_grant_then_agent_access_granted_and_audited(client, owned_credential):
     )
 
 
+# Regression: base64 principal_ids with "/" in the revoke path (B.5 URL fix) --
+
+
+def test_revoke_agent_whose_principal_id_contains_slash(client, owned_credential):
+    """A principal_id is a base64 ed25519 key that can contain '/'. The revoke
+    path segment must be URL-encoded client-side or the slash splits the route
+    and revoke 404s. Grant, then revoke an agent whose id has a literal '/'."""
+    user, credential_id, _dek, _plaintext = owned_credential
+    agent = "ab/cd+ef/gh"  # forced slashes, the shape base64 keys produce
+    client.grant_access(credential_id, agent, scope="read", granted_by=user)
+    # access works before revoke
+    assert client.request_access(credential_id, agent)["access_granted"] is True
+    # revoke must reach the right route despite the slashes (no 404)
+    revoked = client.revoke_access(credential_id, agent)
+    assert revoked["revoked"] is True
+    # access denied after revoke
+    denied = client.request_access(credential_id, agent)
+    assert denied["access_granted"] is False
+
+
 # Scenario 10: no grant -> denied 403, audited -------------------------------
 
 

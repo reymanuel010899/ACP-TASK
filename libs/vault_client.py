@@ -7,6 +7,7 @@ ciphertexts ever travel over the wire.
 
 import json
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 import requests
 
@@ -155,11 +156,18 @@ class VaultClient:
 
     def revoke_access(self, credential_id, agent_principal_id):
         # type: (str, str) -> dict
-        """DELETE /credentials/{id}/grants/{agent} — revoke a grant."""
+        """DELETE /credentials/{id}/grants/{agent} — revoke a grant.
+
+        ``agent_principal_id`` is URL-encoded because in this MVP a principal_id
+        is a base64 ed25519 public key, which can contain ``/`` — an unencoded
+        slash would split the path into the wrong route segments. The Vault
+        ``unquote``s path segments, and the signed path matches the sent path
+        (both use the encoded form), so verification stays consistent.
+        """
         return self._request(
             "DELETE",
             "/credentials/%s/grants/%s"
-            % (credential_id, agent_principal_id),
+            % (quote(credential_id, safe=""), quote(agent_principal_id, safe="")),
         )
 
     def get_audit(self, principal_id):
