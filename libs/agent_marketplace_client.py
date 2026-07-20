@@ -5,30 +5,58 @@ search, agent detail, hiring via scoped grants, listing hires (from the
 agent's or the user's side), rating hired agents, and revoking hires.
 """
 
+import json
 from typing import List, Optional
 
 import requests
 
 
 class AgentMarketplaceClient:
-    """HTTP client for the Agent Marketplace service."""
+    """HTTP client for the Agent Marketplace service.
 
-    def __init__(self, base_url, timeout=5.0):
-        # type: (str, float) -> None
+    When constructed with a ``session`` (a :class:`libs.session.SessionContext`)
+    the mutating routes (hire/revoke/rate) are signed automatically with the
+    ``X-AT-*`` headers the marketplace verifies under ``require_signatures``.
+    Without a session the client behaves EXACTLY as before (no headers), so it
+    keeps working against unsigned marketplaces during a gradual migration.
+    """
+
+    def __init__(self, base_url, timeout=5.0, session=None):
+        # type: (str, float, Optional[object]) -> None
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.session = session
 
     # -- raw HTTP helper ---------------------------------------------------
 
     def _request(self, method, path, json_body=None, params=None):
         # type: (str, str, Optional[dict], Optional[dict]) -> dict
-        resp = requests.request(
-            method,
-            self.base_url + path,
-            json=json_body,
-            params=params,
-            timeout=self.timeout,
-        )
+        if self.session is None:
+            resp = requests.request(
+                method,
+                self.base_url + path,
+                json=json_body,
+                params=params,
+                timeout=self.timeout,
+            )
+        else:
+            # Sign the EXACT bytes we place on the wire so the server
+            # reconstructs identical canonical bytes; gated routes carry no
+            # query string, so the signature covers the path alone.
+            body_bytes = (
+                json.dumps(json_body).encode("utf-8")
+                if json_body is not None else b""
+            )
+            headers = self.session.auth_headers(method, path, body_bytes)
+            headers["Content-Type"] = "application/json"
+            resp = requests.request(
+                method,
+                self.base_url + path,
+                data=body_bytes,
+                params=params,
+                headers=headers,
+                timeout=self.timeout,
+            )
         resp.raise_for_status()
         return resp.json()
 

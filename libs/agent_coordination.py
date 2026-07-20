@@ -43,12 +43,17 @@ class AgentCoordinator(object):
     """High-level work coordination for one agent Principal."""
 
     def __init__(self, registry_url, agent_principal_id,
-                 timeout=DEFAULT_TIMEOUT):
-        # type: (str, str, float) -> None
+                 timeout=DEFAULT_TIMEOUT, session=None):
+        # type: (str, str, float, object) -> None
         if not agent_principal_id:
             raise ValueError("agent_principal_id is required")
         self.agent_principal_id = agent_principal_id
-        self.client = P2PClient(registry_url, timeout=timeout)
+        # When a session (libs.session.SessionContext) is supplied the
+        # underlying P2P client signs every work request, so apps enforcing
+        # ``require_signatures`` (U18) accept the agent's bids/results. The
+        # session's principal_id MUST equal ``agent_principal_id`` or the app
+        # rejects the identity mismatch (403).
+        self.client = P2PClient(registry_url, timeout=timeout, session=session)
         # app_id -> default work capability (first non-ping capability).
         self._capability_cache = {}  # type: dict
 

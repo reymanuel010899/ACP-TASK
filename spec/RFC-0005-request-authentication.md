@@ -141,3 +141,79 @@ not).
 Wiring `require_signatures` on and enforcing it inside the Registry, Vault, P2P
 apps, and agent-marketplace endpoints — plus the client-side signing rollout —
 is the work of units U16–U20.
+
+## 8. Client flow (U20)
+
+Verification (§4) is only half the contract; a request has to be *produced*.
+U20 closes the loop with a client-side session abstraction and automatic
+signing in the service client libraries, so an application signs as a principal
+without hand-assembling headers.
+
+### 8.1 SessionContext
+
+`libs/session.py` provides `SessionContext`, bundling the three things a client
+needs to sign as a principal:
+
+- `principal_id` — the identity anchor (a base64 ed25519 public key);
+- an **ephemeral session `KeyPair`**, generated locally, never persisted; and
+- the stateless `session_assertion` (§3) the *principal* key signs once.
+
+Two constructors:
+
+- `SessionContext.create(principal_id, principal_signing_key, ttl, now_ts)` —
+  generates the ephemeral session keypair and has the principal key sign the
+  assertion binding it. The principal key is used **once** and may be discarded
+  by the caller immediately; every later request is signed by the session key
+  alone.
+- `SessionContext.from_keyring_unlock(vault_client, password, principal_id)` —
+  ties the U7 keyring-unlock flow to session issuance: it fetches the wrapped
+  keyring, unlocks it locally (recovering the principal's private-key bytes),
+  reconstructs the principal signing key, mints the session, and drops the
+  principal key on return. The recovered bytes are the 32-byte ed25519 seed the
+  keyring stored, so the derived public key equals `principal_id` in this MVP.
+  This lets a *second device* — knowing only the password and principal_id —
+  obtain a fresh, independently-keyed session.
+
+`SessionContext.auth_headers(method, path, body_bytes, now_ts, nonce)` returns
+the `X-AT-*` header set for one request by delegating to
+`build_auth_headers` (§2). It signs the **exact** `body_bytes` that go on the
+wire; `now_ts`/`nonce` default to the current time and a random value but are
+overridable (tests craft replay/expiry cases through them).
+
+### 8.2 Signing service clients
+
+Each service client library accepts an optional `session=`:
+
+- `libs/vault_client.py` `VaultClient`
+- `libs/p2p_client.py` `P2PClient` (and `libs/agent_coordination.py`
+  `AgentCoordinator`, which threads a session through to its P2P client)
+- `libs/agent_marketplace_client.py` `AgentMarketplaceClient`
+- `libs/federation_client.py` `FederationClient`
+
+**Absent a session the client behaves byte-for-byte as before** — no headers,
+`requests(json=...)` unchanged — so existing unsigned callers (and unsigned
+services mid-migration) keep working. **With a session**, before each request
+the client serializes the body to fixed bytes, signs them via
+`session.auth_headers(method, path, body_bytes)`, and sends those **exact**
+bytes (`data=`) with the merged headers and `Content-Type: application/json`.
+Signing the serialized-once bytes (rather than letting `requests` re-serialize)
+guarantees the signed bytes equal the sent bytes, so the server's reconstructed
+canonical string matches. Signatures cover the path without a query string; the
+gated mutating routes carry no query. GET/discovery routes are open (§4) and
+are not gated even when a session is attached.
+
+### 8.3 End-to-end secure mode
+
+`tests/integration/test_secure_mode_end_to_end.py` runs the full stack with
+`require_signatures=True` on every client-facing service (Vault, Agent
+Marketplace, Marketplace, Gig Board) and proves the happy path — a signed
+autonomous marketplace lifecycle with reputation updating — plus rejection of
+impersonation (401), tampering (401), replay (401), expiry (401), and
+non-owner revoke (403), and that an unsigned service still accepts an unsigned
+client (gradual migration).
+
+The **Registry stays the unsigned public-key authority** in that stack: apps
+record reputation and create vault grants server-to-server against it unsigned,
+so gating its mutating routes would break those inter-service calls. Signing
+outbound *server-to-server* calls is beyond U20, whose rollout targets the
+client libraries.

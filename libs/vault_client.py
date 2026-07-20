@@ -5,6 +5,7 @@ happens here on the client (via vault/crypto.py). Only wrapped blobs and
 ciphertexts ever travel over the wire.
 """
 
+import json
 from typing import Optional, Tuple
 
 import requests
@@ -13,26 +14,60 @@ from vault import crypto
 
 
 class VaultClient:
-    """HTTP client for the Vault service, plus client-side envelope helpers."""
+    """HTTP client for the Vault service, plus client-side envelope helpers.
 
-    def __init__(self, base_url, timeout=5.0):
-        # type: (str, float) -> None
+    When constructed with a ``session`` (a :class:`libs.session.SessionContext`)
+    every request is signed automatically with the ``X-AT-*`` headers the Vault
+    verifies under ``require_signatures``. Without a session the client behaves
+    EXACTLY as before — no headers, byte-for-byte the pre-U20 requests — so it
+    keeps working against unsigned Vaults during a gradual migration.
+    """
+
+    def __init__(self, base_url, timeout=5.0, session=None):
+        # type: (str, float, Optional[object]) -> None
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.session = session
 
     # -- raw HTTP helpers --------------------------------------------------
 
     def _request(self, method, path, json_body=None, params=None):
         # type: (str, str, Optional[dict], Optional[dict]) -> dict
-        resp = requests.request(
-            method,
-            self.base_url + path,
-            json=json_body,
-            params=params,
-            timeout=self.timeout,
-        )
+        resp = self._send(method, path, json_body=json_body, params=params)
         resp.raise_for_status()
         return resp.json()
+
+    def _send(self, method, path, json_body=None, params=None):
+        # type: (str, str, Optional[dict], Optional[dict]) -> requests.Response
+        """Issue one HTTP request, signing it when a session is configured.
+
+        The signed body bytes are the EXACT bytes placed on the wire (``data=``
+        of the serialized JSON), so the Vault reconstructs identical canonical
+        bytes. Signatures cover the path only; the gated (mutating) routes carry
+        no query string.
+        """
+        if self.session is None:
+            return requests.request(
+                method,
+                self.base_url + path,
+                json=json_body,
+                params=params,
+                timeout=self.timeout,
+            )
+        body_bytes = (
+            json.dumps(json_body).encode("utf-8")
+            if json_body is not None else b""
+        )
+        headers = self.session.auth_headers(method, path, body_bytes)
+        headers["Content-Type"] = "application/json"
+        return requests.request(
+            method,
+            self.base_url + path,
+            data=body_bytes,
+            params=params,
+            headers=headers,
+            timeout=self.timeout,
+        )
 
     # -- keyring endpoints -------------------------------------------------
 
@@ -107,10 +142,10 @@ class VaultClient:
         (access_granted: False) augmented with 'status_code' so callers can
         branch on the outcome.
         """
-        resp = requests.post(
-            self.base_url + "/credentials/%s/access" % credential_id,
-            json={"agent_principal_id": agent_principal_id},
-            timeout=self.timeout,
+        resp = self._send(
+            "POST",
+            "/credentials/%s/access" % credential_id,
+            json_body={"agent_principal_id": agent_principal_id},
         )
         if resp.status_code not in (200, 403):
             resp.raise_for_status()

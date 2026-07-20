@@ -22,6 +22,7 @@ raise :class:`FederationError` — callers that must tolerate a down
 registry (app startup) catch it and continue.
 """
 
+import json as _json
 from typing import List, Optional
 
 import requests
@@ -45,12 +46,17 @@ class FederationError(Exception):
 class FederationClient(object):
     """Register with and discover the ecosystem through one Registry."""
 
-    def __init__(self, registry_url, timeout=DEFAULT_TIMEOUT):
-        # type: (str, float) -> None
+    def __init__(self, registry_url, timeout=DEFAULT_TIMEOUT, session=None):
+        # type: (str, float, Optional[object]) -> None
         if not registry_url:
             raise ValueError("registry_url is required")
         self.registry_url = registry_url.rstrip("/")
         self.timeout = timeout
+        # Optional libs.session.SessionContext: when set, mutating registry
+        # calls (POST /apps/register) are signed so a Registry enforcing
+        # ``require_signatures`` (U16) accepts them. GET discovery stays
+        # unsigned (those routes are open regardless of the flag).
+        self.session = session
 
     # -- registration ---------------------------------------------------------
 
@@ -148,9 +154,21 @@ class FederationClient(object):
         :class:`FederationError` (never a raw requests exception)."""
         url = self.registry_url + path
         try:
-            resp = requests.request(
-                method, url, json=json, params=params, timeout=self.timeout
-            )
+            if self.session is None or json is None:
+                resp = requests.request(
+                    method, url, json=json, params=params,
+                    timeout=self.timeout,
+                )
+            else:
+                # Sign the EXACT bytes sent so the Registry reconstructs
+                # identical canonical bytes; signed routes carry no query.
+                body_bytes = _json.dumps(json).encode("utf-8")
+                headers = self.session.auth_headers(method, path, body_bytes)
+                headers["Content-Type"] = "application/json"
+                resp = requests.request(
+                    method, url, data=body_bytes, params=params,
+                    headers=headers, timeout=self.timeout,
+                )
         except requests.RequestException as exc:
             raise FederationError(
                 "registry unreachable for %s (%s): %s" % (context, url, exc)

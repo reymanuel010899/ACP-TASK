@@ -24,6 +24,7 @@ when the target app is not registered, :class:`P2PPermissionDenied`
 (carrying the Registry's ``reason``) when the target app returns 403.
 """
 
+import json
 from typing import Optional
 
 import requests
@@ -51,12 +52,17 @@ class P2PPermissionDenied(P2PError):
 class P2PClient(object):
     """Discover apps via the Registry, then talk to them directly."""
 
-    def __init__(self, registry_url, timeout=DEFAULT_TIMEOUT):
-        # type: (str, float) -> None
+    def __init__(self, registry_url, timeout=DEFAULT_TIMEOUT, session=None):
+        # type: (str, float, Optional[object]) -> None
         if not registry_url:
             raise ValueError("registry_url is required")
         self.registry_url = registry_url.rstrip("/")
         self.timeout = timeout
+        # Optional libs.session.SessionContext: when set, the direct
+        # ``/p2p/request`` POST is signed so target apps enforcing
+        # ``require_signatures`` (U18) accept it. Discovery/permission calls to
+        # the Registry stay unsigned (those routes are open).
+        self.session = session
 
     # -- discovery ------------------------------------------------------------
 
@@ -152,11 +158,26 @@ class P2PClient(object):
             payload["session_id"] = session_id
 
         try:
-            resp = requests.post(
-                "%s/p2p/request" % endpoint.rstrip("/"),
-                json=payload,
-                timeout=self.timeout,
-            )
+            if self.session is None:
+                resp = requests.post(
+                    "%s/p2p/request" % endpoint.rstrip("/"),
+                    json=payload,
+                    timeout=self.timeout,
+                )
+            else:
+                # Sign the EXACT bytes sent so the app reconstructs identical
+                # canonical bytes; the P2P route path is always "/p2p/request".
+                body_bytes = json.dumps(payload).encode("utf-8")
+                headers = self.session.auth_headers(
+                    "POST", "/p2p/request", body_bytes
+                )
+                headers["Content-Type"] = "application/json"
+                resp = requests.post(
+                    "%s/p2p/request" % endpoint.rstrip("/"),
+                    data=body_bytes,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
         except requests.RequestException as exc:
             raise P2PError(
                 "target app '%s' unreachable at %s: %s"
