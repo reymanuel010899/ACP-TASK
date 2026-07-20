@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  registry:
+    build:
+      context: ..
+      dockerfile: registry/Dockerfile
+    container_name: agenttrust-registry
+    ports:
+      - "8090:8090"
+    environment:
+      REGISTRY_HOST: 0.0.0.0
+      REGISTRY_PORT: 8090
+    volumes:
+      # Optional: persist registrations to JSON file
+      - registry_data:/data
+    # Restart policy for production
+    restart: unless-stopped
+    # Health check status visible to Docker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  registry_data:
+    driver: local

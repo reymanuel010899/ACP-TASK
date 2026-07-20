@@ -10,3 +10,12 @@ web/keys/
 
 # Settings locales de Claude Code (por usuario)
 .claude/settings.local.json
+
+# Node
+node_modules/
+
+# Coverage
+.coverage
+
+# Claude Code temp agent worktrees (nunca versionar)
+.claude/worktrees/

@@ -1,0 +1,46 @@
+name: Lint - Agent Isolation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-agent-isolation:
+    runs-on: ubuntu-latest
+    name: Verify agents don't share code
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run agent isolation tests
+        run: pytest tests/agents/ -v --tb=short
+
+      - name: Verify no cross-imports between agents
+        run: |
+          echo "Checking for agent cross-imports..."
+          ! grep -r "from agents.provider" agents/requester/ 2>/dev/null || (echo "ERROR: requester imports from provider"; exit 1)
+          ! grep -r "from agents.requester" agents/provider/ 2>/dev/null || (echo "ERROR: provider imports from requester"; exit 1)
+          ! grep -r "from services" agents/ 2>/dev/null || (echo "ERROR: agents import from services"; exit 1)
+          ! grep -r "from registry" agents/ 2>/dev/null || (echo "ERROR: agents import from registry"; exit 1)
+          echo "✅ No cross-imports detected"

@@ -72,6 +72,16 @@ PAGE_HTML = """<!doctype html>
   .pmsg { margin-top:14px; font-size:.92rem; }
   .pmsg.ok { color:var(--ok); }
   .pmsg.bad { color:var(--bad); }
+  .auth-panel { display: flex; gap: 10px; margin-bottom: 20px; }
+  .auth-panel button { margin: 0; width: auto; padding: 10px 16px; }
+  .auth-form { display: none; }
+  .auth-form.show { display: block; }
+  .reputation-card { background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px; margin-bottom: 20px; }
+  .reputation-item { margin: 8px 0; }
+  .reputation-label { color: var(--muted); font-size: 0.9rem; }
+  .reputation-value { font-weight: 600; color: var(--ok); }
+  .user-info { color: var(--muted); margin-bottom: 16px; }
 </style>
 </head>
 <body>
@@ -81,6 +91,37 @@ PAGE_HTML = """<!doctype html>
   <h1>AgentTrust</h1>
   <p class="sub">Decí qué necesitás. Tu agente busca un proveedor, negocia el
   precio y trae el trabajo — verificado por un tercero independiente.</p>
+
+  <div class="auth-panel">
+    <button id="login-btn" onclick="showAuthForm('login')">Acceder</button>
+    <button id="register-btn" onclick="showAuthForm('register')">Registrarse</button>
+    <button id="logout-btn" class="hidden secondary" onclick="logout()">Salir</button>
+  </div>
+
+  <div id="reputation-display" class="reputation-card hidden">
+    <h2>Tu Reputación</h2>
+    <div id="reputation-content"></div>
+  </div>
+
+  <div id="auth-login" class="auth-form card">
+    <h2>Acceder a AgentTrust</h2>
+    <label for="login-principal">Tu Principal (clave ed25519)</label>
+    <textarea id="login-principal" placeholder="Pega tu principal aquí (base64 o hex de tu clave ed25519)"
+      style="min-height: 100px; font-family: monospace; font-size: 0.85rem;"></textarea>
+    <button onclick="performLogin()">Acceder</button>
+    <div id="login-msg" class="hidden"></div>
+  </div>
+
+  <div id="auth-register" class="auth-form card">
+    <h2>Registrarse en AgentTrust</h2>
+    <p class="sub2">Para comenzar, pega tu principal (clave ed25519).
+    Si no tenés uno, podés generar uno externo con ferramentas como tweetnacl.js.</p>
+    <label for="register-principal">Tu Principal (clave ed25519)</label>
+    <textarea id="register-principal" placeholder="Pega tu principal aquí (base64 o hex de tu clave ed25519)"
+      style="min-height: 100px; font-family: monospace; font-size: 0.85rem;"></textarea>
+    <button onclick="performRegister()">Registrarse</button>
+    <div id="register-msg" class="hidden"></div>
+  </div>
 
   <div class="card">
     <label for="text">¿Qué necesitás?</label>
@@ -111,6 +152,219 @@ PAGE_HTML = """<!doctype html>
 </div>
 
 <script>
+// Session management
+const SESSION_STORAGE_KEY = 'agentTrust_session';
+
+function getSession() {
+  try {
+    var saved = localStorage.getItem(SESSION_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function setSession(session) {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch (e) {}
+  updateUIForSession();
+}
+
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch (e) {}
+  updateUIForSession();
+}
+
+function updateUIForSession() {
+  var session = getSession();
+  var loginBtn = document.getElementById('login-btn');
+  var registerBtn = document.getElementById('register-btn');
+  var logoutBtn = document.getElementById('logout-btn');
+  var authForms = document.querySelectorAll('.auth-form');
+  var repDisplay = document.getElementById('reputation-display');
+
+  if (session && session.principal_id) {
+    // User is logged in
+    loginBtn.classList.add('hidden');
+    registerBtn.classList.add('hidden');
+    logoutBtn.classList.remove('hidden');
+    authForms.forEach(f => f.classList.remove('show'));
+    loadAndDisplayReputation(session.principal_id);
+  } else {
+    // User is not logged in
+    loginBtn.classList.remove('hidden');
+    registerBtn.classList.remove('hidden');
+    logoutBtn.classList.add('hidden');
+    repDisplay.classList.add('hidden');
+  }
+}
+
+async function loadAndDisplayReputation(principal_id) {
+  try {
+    var resp = await fetch('/api/reputation/' + encodeURIComponent(principal_id));
+    if (!resp.ok) {
+      console.error('Could not load reputation:', resp.status);
+      return;
+    }
+    var data = await resp.json();
+    displayReputation(data, principal_id);
+  } catch (e) {
+    console.error('Error loading reputation:', e);
+  }
+}
+
+function displayReputation(data, principal_id) {
+  var repDisplay = document.getElementById('reputation-display');
+  var repContent = document.getElementById('reputation-content');
+
+  var html = '<p class="user-info">Principal: <code style="font-size: 0.85rem; color: var(--fg);">' +
+    esc(principal_id.substring(0, 20)) + '...</code></p>';
+
+  var rep = data.reputation_records || [];
+  if (rep.length === 0) {
+    html += '<p class="reputation-item">Aún sin historial de tareas.</p>';
+  } else {
+    var totalVerified = 0, totalRejected = 0;
+    rep.forEach(function(r) {
+      totalVerified += r.tasks_verified || 0;
+      totalRejected += r.tasks_rejected || 0;
+    });
+
+    html += '<div class="reputation-item">' +
+      '<div class="reputation-label">Tareas verificadas</div>' +
+      '<div class="reputation-value">' + totalVerified + '</div></div>';
+    html += '<div class="reputation-item">' +
+      '<div class="reputation-label">Tareas rechazadas</div>' +
+      '<div class="reputation-value">' + totalRejected + '</div></div>';
+
+    if (totalVerified + totalRejected > 0) {
+      var rate = totalVerified / (totalVerified + totalRejected);
+      html += '<div class="reputation-item">' +
+        '<div class="reputation-label">Tasa de verificación</div>' +
+        '<div class="reputation-value">' + (rate * 100).toFixed(1) + '%</div></div>';
+    }
+  }
+
+  repContent.innerHTML = html;
+  repDisplay.classList.remove('hidden');
+}
+
+function showAuthForm(form) {
+  var login = document.getElementById('auth-login');
+  var register = document.getElementById('auth-register');
+
+  if (form === 'login') {
+    login.classList.add('show');
+    register.classList.remove('show');
+  } else {
+    login.classList.remove('show');
+    register.classList.add('show');
+  }
+}
+
+async function performRegister() {
+  var principal = document.getElementById('register-principal').value.trim();
+  var msg = document.getElementById('register-msg');
+
+  if (!principal) {
+    msg.className = 'pmsg bad';
+    msg.textContent = 'Pegá tu principal.';
+    msg.classList.remove('hidden');
+    return;
+  }
+
+  msg.classList.add('hidden');
+  var btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Registrando…';
+
+  try {
+    var resp = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({principal_id: principal})
+    });
+    var data = await resp.json();
+
+    if (resp.ok) {
+      setSession({principal_id: data.principal_id});
+      msg.className = 'pmsg ok';
+      msg.innerHTML = '✓ Registrado. Accediendo...';
+      msg.classList.remove('hidden');
+      setTimeout(function() {
+        document.getElementById('register-principal').value = '';
+      }, 1500);
+    } else {
+      msg.className = 'pmsg bad';
+      msg.textContent = data.error || 'No se pudo registrar.';
+      msg.classList.remove('hidden');
+    }
+  } catch (e) {
+    msg.className = 'pmsg bad';
+    msg.textContent = 'Error: ' + e;
+    msg.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Registrarse';
+  }
+}
+
+async function performLogin() {
+  var principal = document.getElementById('login-principal').value.trim();
+  var msg = document.getElementById('login-msg');
+
+  if (!principal) {
+    msg.className = 'pmsg bad';
+    msg.textContent = 'Pegá tu principal.';
+    msg.classList.remove('hidden');
+    return;
+  }
+
+  msg.classList.add('hidden');
+  var btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Accediendo…';
+
+  try {
+    var resp = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({principal_id: principal})
+    });
+    var data = await resp.json();
+
+    if (resp.ok) {
+      setSession({principal_id: data.principal_id});
+      msg.className = 'pmsg ok';
+      msg.innerHTML = '✓ Acceso concedido.';
+      msg.classList.remove('hidden');
+      setTimeout(function() {
+        document.getElementById('login-principal').value = '';
+      }, 1500);
+    } else {
+      msg.className = 'pmsg bad';
+      msg.textContent = data.error || 'No se pudo acceder.';
+      msg.classList.remove('hidden');
+    }
+  } catch (e) {
+    msg.className = 'pmsg bad';
+    msg.textContent = 'Error: ' + e;
+    msg.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Acceder';
+  }
+}
+
+function logout() {
+  clearSession();
+  document.getElementById('login-principal').value = '';
+  document.getElementById('register-principal').value = '';
+}
+
 async function run() {
   var btn = document.getElementById('go');
   var res = document.getElementById('result');
@@ -213,6 +467,8 @@ function toggleTheme() {
   var saved = null;
   try { saved = localStorage.getItem('theme'); } catch (e) {}
   applyTheme(saved === 'dark' || saved === 'light' ? saved : currentTheme());
+  // Initialize session UI
+  updateUIForSession();
 })();
 </script>
 </body>

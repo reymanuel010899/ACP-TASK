@@ -501,6 +501,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if opted_in:
             self.send_header("A2A-Extensions", TRUST_EXTENSION_URI)
+        if self.close_connection:
+            # Advertise the close: without this header the client keeps the
+            # socket pooled and races our server-side close on its next write.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -554,6 +558,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send_response(401)
             self.send_header("WWW-Authenticate", "Bearer")
+            self.send_header("Connection", "close")
             body = json.dumps(
                 {
                     "jsonrpc": "2.0",

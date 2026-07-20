@@ -1,0 +1,633 @@
+"""Encrypted Credential Vault service (unit U7, Decision 8).
+
+Zero-knowledge vault: stores only wrapped blobs. Users store encrypted
+credentials AND their wrapped principal private key (so multi-device login
+works); agents get scoped, revocable, audited access. All KEK derivation and
+encryption happens client-side (see vault/crypto.py, libs/vault_client.py) —
+this service never sees passwords, KEKs, plaintext DEKs, or plaintext data.
+
+API endpoints:
+- POST   /keyring                                     - store wrapped keyring
+- GET    /keyring/{user_principal_id}                 - fetch wrapped keyring
+- PUT    /keyring/{user_principal_id}                 - re-wrap DEK (rotation)
+- POST   /credentials                                 - store encrypted credential
+- GET    /credentials?user_principal_id=<id>          - list metadata (no ciphertext)
+- POST   /credentials/{credential_id}/grants          - grant agent access
+- POST   /credentials/{credential_id}/access          - agent access request
+- DELETE /credentials/{credential_id}/grants/{agent}  - revoke grant
+- GET    /audit?principal_id=<id>                     - audit entries
+- GET    /healthz                                     - health check
+
+Run: python -m vault.app [--port 8003]
+"""
+
+import argparse
+import json
+import threading
+import uuid
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from libs.audit_client import make_audit_client
+from libs.request_auth import RequestAuthenticator
+from vault.audit_log import AuditLog
+from vault.crypto import UnsupportedKDFError, validate_kdf
+
+_KEYRING_FIELDS = (
+    "encrypted_dek", "salt", "nonce", "kdf", "kdf_params",
+    "encrypted_private_key",
+)
+_ROTATION_FIELDS = (
+    "encrypted_dek", "salt", "nonce", "kdf", "kdf_params",
+)
+_CREDENTIAL_FIELDS = (
+    "name", "credential_type", "encrypted_data", "nonce",
+    "user_principal_id",
+)
+
+
+class VaultService:
+    """Core vault logic; in-memory storage of wrapped blobs only."""
+
+    def __init__(self, audit_url=None, registry_url=None,
+                 require_signatures=False, public_key_resolver=None):
+        # type: (Optional[str], Optional[str], bool, Optional[object]) -> None
+        self.keyrings = {}  # type: Dict[str, dict]
+        self.credentials = {}  # type: Dict[str, dict]
+        # Local audit log is part of the U7 contract and stays; the central
+        # audit client (U12) ADDITIONALLY mirrors significant events to the
+        # ecosystem-wide audit service, best-effort (no-op without a URL).
+        self.audit = AuditLog()
+        self.audit_client = make_audit_client(audit_url)
+        # Shared request-authentication middleware (U15). A pure no-op
+        # pass-through while ``require_signatures`` is off, so the default
+        # deployment keeps today's behavior byte-for-byte. When on, every
+        # mutating route authenticates and the verified signer is bound to the
+        # credential owner/agent by the handlers below. Tests inject
+        # ``public_key_resolver`` so no live Registry is needed.
+        self.require_signatures = require_signatures
+        self.authenticator = RequestAuthenticator(
+            registry_url,
+            require_signatures=require_signatures,
+            public_key_resolver=public_key_resolver,
+        )
+        self.lock = threading.Lock()
+
+    # -- keyring -----------------------------------------------------------
+
+    def store_keyring(self, body, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
+        user_principal_id = body.get("user_principal_id")
+        if not isinstance(user_principal_id, str) or not user_principal_id:
+            return 422, {"error": "missing or invalid 'user_principal_id'"}
+        # Identity binding (only when authenticated, i.e. flag on): the signer
+        # may only store a keyring under its OWN principal id.
+        if signer is not None and signer != user_principal_id:
+            return 403, {"error": "signer does not match keyring owner"}
+        for field in _KEYRING_FIELDS:
+            if field not in body:
+                return 422, {"error": "missing '%s'" % field}
+        try:
+            validate_kdf(body["kdf"], body["kdf_params"])
+        except UnsupportedKDFError as exc:
+            return 422, {"error": str(exc)}
+
+        created_at = datetime.utcnow().isoformat()
+        record = {field: body[field] for field in _KEYRING_FIELDS}
+        record["user_principal_id"] = user_principal_id
+        record["created_at"] = created_at
+        record["updated_at"] = created_at
+
+        with self.lock:
+            self.keyrings[user_principal_id] = record
+
+        return 200, {
+            "user_principal_id": user_principal_id,
+            "created_at": created_at,
+        }
+
+    def get_keyring(self, user_principal_id):
+        # type: (str) -> Tuple[int, dict]
+        with self.lock:
+            record = self.keyrings.get(user_principal_id)
+        if record is None:
+            return 404, {"error": "keyring not found"}
+        return 200, dict(record)
+
+    def rotate_keyring(self, user_principal_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
+        """Re-wrap the DEK (password change / event-based rotation).
+
+        Only the wrapping changes — stored credential ciphertexts are never
+        re-encrypted because the DEK itself is unchanged.
+        """
+        # Identity binding (flag on): only the keyring owner may rotate it.
+        if signer is not None and signer != user_principal_id:
+            return 403, {"error": "signer does not match keyring owner"}
+        for field in _ROTATION_FIELDS:
+            if field not in body:
+                return 422, {"error": "missing '%s'" % field}
+        rotation_reason = body.get("rotation_reason")
+        if not isinstance(rotation_reason, str) or not rotation_reason.strip():
+            return 422, {"error": "missing or invalid 'rotation_reason'"}
+        try:
+            validate_kdf(body["kdf"], body["kdf_params"])
+        except UnsupportedKDFError as exc:
+            return 422, {"error": str(exc)}
+
+        with self.lock:
+            record = self.keyrings.get(user_principal_id)
+            if record is None:
+                return 404, {"error": "keyring not found"}
+            for field in _ROTATION_FIELDS:
+                record[field] = body[field]
+            if "encrypted_private_key" in body:
+                record["encrypted_private_key"] = body[
+                    "encrypted_private_key"
+                ]
+            record["updated_at"] = datetime.utcnow().isoformat()
+
+        self.audit.append(
+            principal_id=user_principal_id,
+            action="keyring_rotated",
+            status="ok",
+            reason=rotation_reason.strip(),
+        )
+        self.audit_client.log(
+            user_principal_id, "keyring.rotate",
+            details={"reason": rotation_reason.strip()},
+        )
+        return 200, {
+            "user_principal_id": user_principal_id,
+            "updated_at": record["updated_at"],
+        }
+
+    # -- credentials -------------------------------------------------------
+
+    def store_credential(self, body, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
+        for field in _CREDENTIAL_FIELDS:
+            value = body.get(field)
+            if not isinstance(value, str) or not value:
+                return 422, {"error": "missing or invalid '%s'" % field}
+
+        # Identity binding (flag on): the signer may only store credentials
+        # under its OWN principal id.
+        if signer is not None and signer != body["user_principal_id"]:
+            return 403, {"error": "signer does not match credential owner"}
+
+        credential_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat()
+        record = {
+            "credential_id": credential_id,
+            "name": body["name"],
+            "credential_type": body["credential_type"],
+            "encrypted_data": body["encrypted_data"],
+            "nonce": body["nonce"],
+            "user_principal_id": body["user_principal_id"],
+            "created_at": created_at,
+            "grants": {},  # agent_principal_id -> grant record
+        }
+        with self.lock:
+            self.credentials[credential_id] = record
+
+        return 200, {
+            "credential_id": credential_id,
+            "created_at": created_at,
+        }
+
+    def list_credentials(self, user_principal_id):
+        # type: (Optional[str]) -> Tuple[int, dict]
+        if not user_principal_id:
+            return 422, {"error": "missing 'user_principal_id' query param"}
+        with self.lock:
+            records = [
+                c for c in self.credentials.values()
+                if c["user_principal_id"] == user_principal_id
+            ]
+        records.sort(key=lambda c: c["created_at"])
+        # Metadata only — never leak ciphertext or nonces in listings.
+        credentials = [
+            {
+                "credential_id": c["credential_id"],
+                "name": c["name"],
+                "credential_type": c["credential_type"],
+                "user_principal_id": c["user_principal_id"],
+                "created_at": c["created_at"],
+            }
+            for c in records
+        ]
+        return 200, {"credentials": credentials}
+
+    # -- grants + access ---------------------------------------------------
+
+    def grant_access(self, credential_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
+        agent_principal_id = body.get("agent_principal_id")
+        scope = body.get("scope")
+        granted_by = body.get("granted_by")
+        if not isinstance(agent_principal_id, str) or not agent_principal_id:
+            return 422, {"error": "missing or invalid 'agent_principal_id'"}
+        if not isinstance(scope, str) or not scope:
+            return 422, {"error": "missing or invalid 'scope'"}
+        if not isinstance(granted_by, str) or not granted_by:
+            return 422, {"error": "missing or invalid 'granted_by'"}
+
+        # Identity binding (flag on): the signer must be the party it claims to
+        # grant as; combined with the owner check below this means only the
+        # owner, acting as themselves, can grant.
+        if signer is not None and signer != granted_by:
+            return 403, {"error": "signer does not match 'granted_by'"}
+
+        with self.lock:
+            credential = self.credentials.get(credential_id)
+            if credential is None:
+                return 404, {"error": "credential not found"}
+            if credential["user_principal_id"] != granted_by:
+                return 403, {
+                    "error": "only the credential owner can grant access"
+                }
+            grant_id = str(uuid.uuid4())
+            credential["grants"][agent_principal_id] = {
+                "grant_id": grant_id,
+                "agent_principal_id": agent_principal_id,
+                "scope": scope,
+                "granted_by": granted_by,
+                "granted_at": datetime.utcnow().isoformat(),
+            }
+
+        self.audit_client.log(
+            granted_by, "credential.grant",
+            resource_id=credential_id,
+            details={"agent_principal_id": agent_principal_id,
+                     "scope": scope},
+        )
+        return 200, {"grant_id": grant_id}
+
+    def request_access(self, credential_id, body, signer=None):
+        # type: (str, dict, Optional[str]) -> Tuple[int, dict]
+        agent_principal_id = body.get("agent_principal_id")
+        if not isinstance(agent_principal_id, str) or not agent_principal_id:
+            return 422, {"error": "missing or invalid 'agent_principal_id'"}
+
+        # Identity binding (flag on): an agent may only request access AS
+        # itself — it cannot fetch a credential granted to a different agent.
+        if signer is not None and signer != agent_principal_id:
+            return 403, {
+                "access_granted": False,
+                "error": "signer does not match 'agent_principal_id'",
+            }
+
+        with self.lock:
+            credential = self.credentials.get(credential_id)
+            if credential is None:
+                return 404, {"error": "credential not found"}
+            grant = credential["grants"].get(agent_principal_id)
+            encrypted_data = credential["encrypted_data"]
+            nonce = credential["nonce"]
+
+        if grant is None:
+            self.audit.append(
+                principal_id=agent_principal_id,
+                credential_id=credential_id,
+                action="access",
+                status="denied",
+            )
+            self.audit_client.log(
+                agent_principal_id, "credential.access",
+                resource_id=credential_id, status="denied",
+            )
+            return 403, {"access_granted": False}
+
+        self.audit.append(
+            principal_id=agent_principal_id,
+            credential_id=credential_id,
+            action="access",
+            status="granted",
+        )
+        self.audit_client.log(
+            agent_principal_id, "credential.access",
+            resource_id=credential_id, status="granted",
+            details={"scope": grant["scope"]},
+        )
+        return 200, {
+            "access_granted": True,
+            "encrypted_data": encrypted_data,
+            "nonce": nonce,
+            "scope": grant["scope"],
+        }
+
+    def revoke_access(self, credential_id, agent_principal_id, signer=None):
+        # type: (str, str, Optional[str]) -> Tuple[int, dict]
+        with self.lock:
+            credential = self.credentials.get(credential_id)
+            if credential is None:
+                return 404, {"error": "credential not found"}
+            # Identity binding (flag on): ONLY the credential owner may revoke.
+            # This closes the historical asymmetry with grant_access — flag OFF
+            # (signer is None) preserves the original permissive revoke.
+            if signer is not None and signer != credential["user_principal_id"]:
+                return 403, {
+                    "error": "only the credential owner can revoke access"
+                }
+            grant = credential["grants"].pop(agent_principal_id, None)
+        if grant is None:
+            return 404, {"error": "grant not found"}
+        self.audit_client.log(
+            agent_principal_id, "credential.revoke",
+            resource_id=credential_id,
+            details={"granted_by": grant.get("granted_by")},
+        )
+        return 200, {
+            "revoked": True,
+            "credential_id": credential_id,
+            "agent_principal_id": agent_principal_id,
+        }
+
+    # -- audit -------------------------------------------------------------
+
+    def query_audit(self, principal_id):
+        # type: (Optional[str]) -> Tuple[int, dict]
+        if not principal_id:
+            return 422, {"error": "missing 'principal_id' query param"}
+        return 200, {"entries": self.audit.query(principal_id)}
+
+
+class VaultHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, service):
+        # type: (tuple, VaultService) -> None
+        self.service = service
+        ThreadingHTTPServer.__init__(self, address, _RequestHandler)
+
+
+class _RequestHandler(BaseHTTPRequestHandler):
+    server_version = "AgentTrustVault/0.1"
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def service(self):
+        # type: () -> VaultService
+        return self.server.service
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass  # Keep test output quiet
+
+    def _send_json(self, status, body):
+        # type: (int, dict) -> None
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json_body(self):
+        # type: () -> Tuple[bytes, Optional[dict], Optional[str]]
+        """Read the request body ONCE, returning ``(raw, parsed, error)``.
+
+        The raw bytes are returned alongside the parsed JSON because the
+        request signature (U15) is computed over the exact body bytes, and
+        ``rfile`` can only be consumed a single time.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return b"", None, "invalid Content-Length"
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return raw, {}, None
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return raw, None, "request body is not valid JSON"
+        if not isinstance(body, dict):
+            return raw, None, "request body must be a JSON object"
+        return raw, body, None
+
+    def _authenticate(self, raw_body):
+        # type: (bytes) -> Tuple[Optional[str], bool]
+        """Authenticate the current request via the shared middleware (U15).
+
+        Returns ``(principal_id, handled)``. When signatures are off this is a
+        no-op returning ``(None, False)`` — every downstream identity-binding
+        check is skipped, so behavior is byte-for-byte the pre-U17 vault. On an
+        AuthError the 401 response is sent here and ``handled`` is True.
+        """
+        principal_id, error = self.service.authenticator.authenticate(
+            self.command, self.path, raw_body, self.headers
+        )
+        if error is not None:
+            self._send_json(error.status, {"error": error.message})
+            return None, True
+        return principal_id, False
+
+    def do_OPTIONS(self):
+        # type: () -> None
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parts = urlsplit(self.path)
+        segments = [unquote(s) for s in parts.path.split("/") if s]
+        query = parse_qs(parts.query)
+
+        if segments == ["healthz"]:
+            self._send_json(200, {"status": "ok"})
+        elif len(segments) == 2 and segments[0] == "keyring":
+            # GET /keyring/{user_principal_id}
+            status, body = self.service.get_keyring(segments[1])
+            self._send_json(status, body)
+        elif segments == ["credentials"]:
+            # GET /credentials?user_principal_id=<id>
+            user_principal_id = query.get("user_principal_id", [None])[0]
+            status, body = self.service.list_credentials(user_principal_id)
+            self._send_json(status, body)
+        elif segments == ["audit"]:
+            # GET /audit?principal_id=<id>
+            principal_id = query.get("principal_id", [None])[0]
+            status, body = self.service.query_audit(principal_id)
+            self._send_json(status, body)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        parts = urlsplit(self.path)
+        segments = [unquote(s) for s in parts.path.split("/") if s]
+        raw, body, error = self._read_json_body()
+        if error:
+            self._send_json(400, {"error": error})
+            return
+        signer, handled = self._authenticate(raw)
+        if handled:
+            return
+
+        if segments == ["keyring"]:
+            # POST /keyring
+            status, response = self.service.store_keyring(body, signer=signer)
+            self._send_json(status, response)
+        elif segments == ["credentials"]:
+            # POST /credentials
+            status, response = self.service.store_credential(
+                body, signer=signer
+            )
+            self._send_json(status, response)
+        elif (
+            len(segments) == 3
+            and segments[0] == "credentials"
+            and segments[2] == "grants"
+        ):
+            # POST /credentials/{credential_id}/grants
+            status, response = self.service.grant_access(
+                segments[1], body, signer=signer
+            )
+            self._send_json(status, response)
+        elif (
+            len(segments) == 3
+            and segments[0] == "credentials"
+            and segments[2] == "access"
+        ):
+            # POST /credentials/{credential_id}/access
+            status, response = self.service.request_access(
+                segments[1], body, signer=signer
+            )
+            self._send_json(status, response)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        parts = urlsplit(self.path)
+        segments = [unquote(s) for s in parts.path.split("/") if s]
+        raw, body, error = self._read_json_body()
+        if error:
+            self._send_json(400, {"error": error})
+            return
+        signer, handled = self._authenticate(raw)
+        if handled:
+            return
+
+        if len(segments) == 2 and segments[0] == "keyring":
+            # PUT /keyring/{user_principal_id}
+            status, response = self.service.rotate_keyring(
+                segments[1], body, signer=signer
+            )
+            self._send_json(status, response)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        parts = urlsplit(self.path)
+        segments = [unquote(s) for s in parts.path.split("/") if s]
+        signer, handled = self._authenticate(b"")
+        if handled:
+            return
+
+        if (
+            len(segments) == 4
+            and segments[0] == "credentials"
+            and segments[2] == "grants"
+        ):
+            # DELETE /credentials/{credential_id}/grants/{agent_principal_id}
+            status, response = self.service.revoke_access(
+                segments[1], segments[3], signer=signer
+            )
+            self._send_json(status, response)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+
+def make_server(port=8003, host="127.0.0.1", audit_url=None,
+                registry_url=None, require_signatures=False,
+                public_key_resolver=None):
+    # type: (int, str, Optional[str], Optional[str], bool, Optional[object]) -> VaultHTTPServer
+    """Build the vault server.
+
+    ``require_signatures`` opts the vault into signed-request enforcement
+    (U15/U17); when off (default) the vault behaves exactly as before. The
+    optional ``public_key_resolver`` lets tests supply principal public keys
+    without a live Registry.
+    """
+    service = VaultService(
+        audit_url=audit_url,
+        registry_url=registry_url,
+        require_signatures=require_signatures,
+        public_key_resolver=public_key_resolver,
+    )
+    return VaultHTTPServer((host, port), service)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="AgentTrust Encrypted Credential Vault"
+    )
+    parser.add_argument("--port", type=int, default=8003)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--registry-url",
+        default=None,
+        help="Registry URL; if set, the vault registers itself as a "
+        "credential_vault service at startup (U9, RFC-0004). Non-fatal "
+        "if the registry is down.",
+    )
+    parser.add_argument(
+        "--audit-url",
+        default=None,
+        help="Base URL of the central Audit service (U12). Emission is "
+        "best-effort: a down audit service is never fatal.",
+    )
+    parser.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Enforce signed requests (U15/U17): every mutating endpoint "
+        "authenticates against the Registry and the verified signer is bound "
+        "to the credential owner/agent. Off by default (backward-compatible). "
+        "Requires --registry-url to resolve principal public keys.",
+    )
+    args = parser.parse_args(argv)
+
+    server = make_server(
+        port=args.port, host=args.host, audit_url=args.audit_url,
+        registry_url=args.registry_url,
+        require_signatures=args.require_signatures,
+    )
+    host, port = server.server_address[:2]
+    print("AgentTrust Vault listening on http://%s:%d" % (host, port))
+    if args.registry_url:
+        # Service registration (U9): the vault is a shared service, not an
+        # app with capabilities — it registers with capabilities=[] and the
+        # credential_vault flag so apps can find it via GET /services.
+        from libs.federation_client import FederationClient, FederationError
+
+        vault_endpoint = "http://%s:%d" % (host, port)
+        try:
+            FederationClient(args.registry_url).register_app(
+                "vault", vault_endpoint, vault_endpoint, [],
+                credential_vault=True,
+            )
+            print("(registered as credential_vault service with registry)")
+        except FederationError:
+            print("(warning: could not register vault with registry)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
