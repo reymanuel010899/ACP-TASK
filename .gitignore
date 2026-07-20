@@ -16,3 +16,6 @@ node_modules/
 
 # Coverage
 .coverage
+
+# Claude Code temp agent worktrees (nunca versionar)
+.claude/worktrees/
