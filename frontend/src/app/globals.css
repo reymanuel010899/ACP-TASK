@@ -1,0 +1,124 @@
+@import "tailwindcss";
+
+:root {
+  /* Agentio design tokens — dark theme (the design's native theme) */
+  color-scheme: dark;
+  --ag-bg: #0b0a1a;
+  --ag-sidebar: #080718;
+  --ag-card: #13112a;
+  --ag-card-border: #1f1c3a;
+  --ag-divider: #1f1b35;
+  --ag-right-bg: #0e0d20;
+  --ag-input-bg: #141230;
+  --ag-chip: #1a1838;
+  --ag-status-bg: #0a0920;
+  --ag-purple: #6d3ce0;
+  --ag-purple-light: #8b5cf6;
+  --ag-active-bg: #6d3ce01a;
+  --ag-blue: #3b82f6;
+  --ag-cyan: #06b6d4;
+  --ag-green: #22c55e;
+  --ag-orange: #f59e0b;
+  --ag-red: #ef4444;
+  --ag-star: #fbbf24;
+  --ag-text: #ffffff;
+  --ag-text-secondary: #9ca3af;
+  --ag-text-muted: #6b7280;
+  /* Ecosystem Network canvas */
+  --ag-net-bg-inner: #1a1640;
+  --ag-net-bg-outer: #0d0b1e;
+  --ag-net-line: rgba(109, 60, 224, 0.2);
+  --ag-net-glow: rgba(109, 60, 224, 0.28);
+  --ag-net-chip: rgba(19, 17, 42, 0.72);
+  --ag-net-chip-border: rgba(139, 92, 246, 0.2);
+  /* Agents / Marketplace screens (Pencil "Sidebar 2" design language) */
+  --ag2-panel: #121527;
+  --ag2-input: #101124;
+  --ag2-input-deep: #111326;
+  --ag2-surface: #15172b;
+  --ag2-chip: #18203a;
+  --ag2-tile: #1e2140;
+  --ag2-border: #24233b;
+  --ag2-text: #f4f2ff;
+  --ag2-strong: #dddbe9;
+  --ag2-body: #b2b0c3;
+  --ag2-nav: #d0cfdd;
+  --ag2-nav-icon: #b7b5ca;
+  --ag2-dim: #a7a6bb;
+  --ag2-muted: #77768f;
+  /* Sidebar active nav item */
+  --ag2-nav-active-bg: #32166c;
+  --ag2-nav-active-icon: #c68bff;
+  --ag2-nav-active-text: #f4f2ff;
+  /* Marketplace hero banner */
+  --ag2-hero-grad-1: #171036;
+  --ag2-hero-grad-2: #100e24;
+  --ag2-hero-grad-3: #28114a;
+  --ag2-hero-search-bg: #12162b;
+  --ag2-hero-search-border: #30304b;
+  --ag2-hero-search-text: #c4c3d1;
+  --ag2-hero-search-icon: #d2d0e2;
+  --ag2-hero-tag-bg: #17162f;
+  --ag2-hero-tag-text: #d2d0e1;
+  --ag2-hero-label: #c0bed0;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --ag-bg: #f4f4f9;
+  --ag-sidebar: #ffffff;
+  --ag-card: #ffffff;
+  --ag-card-border: #e5e3f0;
+  --ag-divider: #eae8f4;
+  --ag-right-bg: #fafafd;
+  --ag-input-bg: #efeef7;
+  --ag-chip: #e2e0ef;
+  --ag-status-bg: #efeef7;
+  --ag-active-bg: #6d3ce014;
+  --ag-text: #14121f;
+  --ag-text-secondary: #4b5563;
+  --ag-text-muted: #8a8fa3;
+  /* Ecosystem Network canvas */
+  --ag-net-bg-inner: #edebfa;
+  --ag-net-bg-outer: #f7f6fc;
+  --ag-net-line: rgba(109, 60, 224, 0.22);
+  --ag-net-glow: rgba(109, 60, 224, 0.14);
+  --ag-net-chip: rgba(255, 255, 255, 0.88);
+  --ag-net-chip-border: #e5e3f0;
+  /* Agents / Marketplace screens */
+  --ag2-panel: #ffffff;
+  --ag2-input: #efeef7;
+  --ag2-input-deep: #f3f2fa;
+  --ag2-surface: #efeef7;
+  --ag2-chip: #eae8f4;
+  --ag2-tile: #efeef7;
+  --ag2-border: #e5e3f0;
+  --ag2-text: #14121f;
+  --ag2-strong: #374151;
+  --ag2-body: #4b5563;
+  --ag2-nav: #4b5563;
+  --ag2-nav-icon: #8a8fa3;
+  --ag2-dim: #6b7280;
+  --ag2-muted: #8a8fa3;
+  /* Sidebar active nav item — light lavender instead of the dark-theme purple */
+  --ag2-nav-active-bg: #ece5fb;
+  --ag2-nav-active-icon: #6d28d9;
+  --ag2-nav-active-text: #4c1d95;
+  /* Marketplace hero banner — light lavender wash instead of the dark-theme navy/purple */
+  --ag2-hero-grad-1: #ece5fb;
+  --ag2-hero-grad-2: #f5f3fc;
+  --ag2-hero-grad-3: #ead9f7;
+  --ag2-hero-search-bg: #ffffff;
+  --ag2-hero-search-border: #ded9f2;
+  --ag2-hero-search-text: #6b7280;
+  --ag2-hero-search-icon: #6b7280;
+  --ag2-hero-tag-bg: #e7e1f6;
+  --ag2-hero-tag-text: #4c4a63;
+  --ag2-hero-label: #6b7280;
+}
+
+body {
+  background: var(--ag-bg);
+  color: var(--ag-text);
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+}
