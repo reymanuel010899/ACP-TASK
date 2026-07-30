@@ -10,6 +10,9 @@ jobs:
   test-and-coverage:
     runs-on: ubuntu-latest
     name: Run full test suite with coverage
+    permissions:
+      contents: read
+      id-token: write
 
     # Postgres 16 + Redis 7 (unit U1, R11): the same versions as
     # infra/docker-compose.yml, so CI exercises the full suite against real
@@ -95,12 +98,13 @@ jobs:
             -v
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v5
         with:
-          file: ./coverage.xml
+          files: ./coverage.xml
           flags: unittests
           name: codecov-umbrella
-          fail_ci_if_error: true
+          use_oidc: true
+          fail_ci_if_error: false
           verbose: true
 
       - name: Archive coverage reports
