@@ -288,6 +288,22 @@ def test_rulebrain_compose_reply_handles_empty_state():
     assert reply.strip()
 
 
+def test_both_brains_expose_same_authority_free_slack_turn_contract():
+    rule = RuleBrain().understand_slack(
+        "What did María write in #canal-espanol?", {}
+    )
+    claude = ClaudeBrain(client=None).understand_slack(
+        "What did María write in #canal-espanol?", {}
+    )
+    assert rule == claude
+    assert rule.operation == "read"
+    assert rule.locale == "en"
+    assert rule.channel_name == "canal-espanol"
+    assert not {"channel_id", "user_id", "connection_id"}.intersection(
+        rule.model_dump()
+    )
+
+
 # -- make_brain factory ----------------------------------------------------
 
 

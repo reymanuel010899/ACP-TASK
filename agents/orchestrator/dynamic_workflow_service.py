@@ -5,6 +5,7 @@ import json
 import time
 
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler
+from agents.orchestrator.slack_conversation import SlackConversationCoordinator
 from libs.integrations.catalog import ConnectionCapabilitySnapshot
 
 
@@ -14,7 +15,8 @@ def _hash(value):
 
 class DynamicWorkflowService:
     def __init__(self, brain, definitions, connection_repository, workflow_repository,
-                 rollout_version="production-v1", shadow_mode=True, clock=None):
+                 rollout_version="production-v1", shadow_mode=True, clock=None,
+                 conversation_store=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -22,6 +24,67 @@ class DynamicWorkflowService:
         self.rollout_version = rollout_version
         self.shadow_mode = bool(shadow_mode)
         self.clock = clock or time.time
+        self.conversation_store = conversation_store
+        self.slack_coordinator = SlackConversationCoordinator()
+
+    def coordinate_slack_turn(
+        self, tenant_id, principal_id, text, conversation_id=None,
+        channels=None, users=None,
+    ):
+        """Interpret and ground one turn without compiling unresolved authority."""
+        active = None
+        if conversation_id and self.conversation_store is not None:
+            active = self.conversation_store.get(
+                conversation_id, tenant_id, principal_id
+            )
+        installations = self._tenant_installations(tenant_id, principal_id)
+        result = self.slack_coordinator.coordinate(
+            text, active_state=active, installations=installations,
+            channels=channels, users=users,
+        )
+        if conversation_id and active is None and result.turn.refers_to_active_target:
+            return {
+                "state": "expired", "conversation_id": conversation_id,
+                "need": result.need,
+                "message": (
+                    "Esta conversación expiró; vuelve a indicar el destino."
+                    if result.turn.locale == "es"
+                    else "This conversation expired; please name the target again."
+                ),
+            }
+        payload = result.model_dump()
+        if self.conversation_store is not None:
+            if active is None:
+                active = self.conversation_store.create(
+                    tenant_id, principal_id, conversation_id,
+                    locale=result.turn.locale,
+                )
+                conversation_id = active["conversation_id"]
+            updates = {
+                key: value for key, value in result.resolved.items()
+                if key in {
+                    "active_connection", "active_channel", "active_person",
+                    "active_thread", "read_period", "pending_draft",
+                }
+            }
+            updates.update(status=result.state, locale=result.turn.locale,
+                           operation=result.turn.operation)
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id, **updates
+            )
+            if result.need:
+                self.conversation_store.record_need(
+                    conversation_id, tenant_id, principal_id, result.need
+                )
+            payload["conversation_id"] = conversation_id
+        return payload
+
+    def _tenant_installations(self, tenant_id, principal_id):
+        if hasattr(self.connections, "list_tenant_installations"):
+            return self.connections.list_tenant_installations(tenant_id, "slack")
+        if hasattr(self.connections, "list_for_tenant"):
+            return self.connections.list_for_tenant(tenant_id, "slack")
+        return self.connections.list_installations(tenant_id, principal_id)
 
     def plan(self, tenant_id, principal_id, goal, context=None):
         installations = self.connections.list_installations(tenant_id, principal_id)

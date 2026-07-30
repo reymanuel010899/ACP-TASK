@@ -9,6 +9,7 @@ import jsonschema
 from pydantic import ValidationError
 
 from agents.orchestrator.workflow_models import WorkflowPlanDraft
+from agents.orchestrator.slack_conversation import interpret_slack_turn
 from libs.integrations.catalog import (
     ConnectionCapabilitySnapshot,
     TrustedCapabilityDefinition,
@@ -301,6 +302,7 @@ class DynamicPlanner(object):
             raw_plan = generate_plan(goal, capabilities, context)
         else:
             raw_plan = _offline_public_slack_plan(goal, capabilities, context)
+        _ground_slack_entity_ids(raw_plan, context)
         compiled = self.compiler.compile(raw_plan)
         compiled["shadow_mode"] = self.shadow_mode
         return compiled
@@ -308,27 +310,57 @@ class DynamicPlanner(object):
 
 def _offline_public_slack_plan(goal, capabilities, context):
     normalized = unicodedata.normalize("NFKD", str(goal).lower())
-    normalized = "".join(
-        character for character in normalized
-        if not unicodedata.combining(character)
-    )
+    normalized = "".join(character for character in normalized
+                         if not unicodedata.combining(character))
+    resolution = dict(context.get("slack_resolution") or {})
+    turn = interpret_slack_turn(goal, resolution)
     is_public_channel_list = (
-        "slack" in normalized
-        and ("canal" in normalized or "channel" in normalized)
-        and ("public" in normalized)
+        "slack" in normalized and ("canal" in normalized or "channel" in normalized)
+        and "public" in normalized
         and any(word in normalized for word in ("lista", "listar", "muestra", "show", "list"))
     )
-    capability = next(
-        (
-            item for item in capabilities
-            if item["capability_id"] == "slack.channels.list"
-            and item.get("connections")
-        ),
-        None,
-    )
+    operation = "channels" if is_public_channel_list else turn.operation
+    capability_ids = {
+        "channels": "slack.channels.list",
+        "read": "slack.conversation.read",
+        "summarize": "slack.conversation.read",
+        "post": "slack.message.send",
+        "reply": "slack.thread.reply",
+        "dm": "slack.direct_message.send",
+    }
+    wanted = capability_ids.get(operation)
+    candidates = [item for item in capabilities
+                  if item["capability_id"] == wanted and item.get("connections")]
     tenant_id = context.get("tenant_id")
-    if not is_public_channel_list or capability is None or not tenant_id:
+    connection = (resolution.get("active_connection") or {}).get("id")
+    capability = next((item for item in candidates
+                       if connection in item["connections"]), None) if connection else None
+    if capability is None and len(candidates) == 1 and len(candidates[0]["connections"]) == 1:
+        capability = candidates[0]
+        connection = capability["connections"][0]
+    if capability is None or not tenant_id:
         raise PlanRejected("planning model cannot generate this workflow")
+    payload = {}
+    channel = (resolution.get("active_channel") or {}).get("id")
+    person = (resolution.get("active_person") or {}).get("id")
+    thread = resolution.get("active_thread") or {}
+    message = resolution.get("message_text") or turn.message_text
+    if operation in ("read", "summarize", "post", "reply"):
+        if not channel:
+            raise PlanRejected("Slack channel must be resolved before planning")
+        payload["channel_id"] = channel
+    if operation == "reply":
+        if not thread.get("thread_ts"):
+            raise PlanRejected("Slack thread must be resolved before planning")
+        payload["thread_ts"] = thread["thread_ts"]
+    if operation == "dm":
+        if not person:
+            raise PlanRejected("Slack person must be resolved before planning")
+        payload["user_id"] = person
+    if operation in ("post", "reply", "dm"):
+        if not message:
+            raise PlanRejected("Slack message text is required before planning")
+        payload["text"] = message
     return {
         "tenant_id": tenant_id,
         "goal": goal,
@@ -336,12 +368,33 @@ def _offline_public_slack_plan(goal, capabilities, context):
             "step_id": "slack-public-channels",
             "capability_id": capability["capability_id"],
             "capability_version": capability["version"],
-            "connection_id": capability["connections"][0],
+            "connection_id": connection,
             "descriptor_snapshot_hash": capability["descriptor_snapshot_hash"],
-            "input": {},
+            "input": payload,
             "depends_on": [],
         }],
     }
+
+
+def _ground_slack_entity_ids(raw_plan, context):
+    """A model can name an operation, never mint provider entity authority."""
+    if hasattr(raw_plan, "model_dump"):
+        material = raw_plan.model_dump()
+    else:
+        material = raw_plan
+    resolution = dict((context or {}).get("slack_resolution") or {})
+    trusted = {
+        "channel_id": (resolution.get("active_channel") or {}).get("id"),
+        "user_id": (resolution.get("active_person") or {}).get("id"),
+        "thread_ts": (resolution.get("active_thread") or {}).get("thread_ts"),
+    }
+    for step in material.get("steps", []) if isinstance(material, dict) else []:
+        if not str(step.get("capability_id", "")).startswith("slack."):
+            continue
+        payload = step.get("input") if isinstance(step.get("input"), dict) else {}
+        for field, expected in trusted.items():
+            if field in payload and (expected is None or payload[field] != expected):
+                raise PlanRejected("Slack entity is not deterministically resolved")
 
 
 def _references(value):

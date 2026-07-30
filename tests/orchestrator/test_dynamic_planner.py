@@ -1,5 +1,8 @@
-from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
+import pytest
+
+from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, PlanRejected, descriptor_hash
 from libs.integrations.catalog import ConnectionCapabilitySnapshot, TrustedCapabilityDefinition
+from libs.integrations.catalog import slack_definitions
 
 
 def _definition(capability_id, provider, effect="read"):
@@ -95,3 +98,59 @@ def test_offline_planner_can_list_public_slack_channels():
         "agent_offer_id": None,
     }]
     assert result["shadow_mode"] is False
+
+
+def test_model_cannot_invent_slack_entity_id_outside_resolver_projection():
+    definition = _definition("slack.conversation.read", "slack")
+    compiler = PlanCompiler([definition], [ConnectionCapabilitySnapshot(
+        connection_id="conn:s", tenant_id="org:acme",
+        capability_id=definition.capability_id,
+        capability_version=definition.version, credential_version=1,
+        effective_scopes=definition.required_scopes, health="healthy",
+        rollout_version="rollout-1",
+    )], "rollout-1")
+
+    class InventingModel:
+        def generate_plan(self, goal, capabilities, context):
+            return {"tenant_id": "org:acme", "goal": goal, "steps": [{
+                "step_id": "read", "capability_id": definition.capability_id,
+                "capability_version": definition.version,
+                "connection_id": "conn:s",
+                "descriptor_snapshot_hash": descriptor_hash(definition),
+                "input": {"channel_id": "C-INVENTED"}, "depends_on": [],
+            }]}
+
+    with pytest.raises(PlanRejected, match="deterministically resolved"):
+        DynamicPlanner(InventingModel(), compiler).plan("read", {
+            "slack_resolution": {"active_channel": {"id": "C-TRUSTED"}}
+        })
+
+
+@pytest.mark.parametrize(("goal", "capability_id", "resolution", "expected"), [
+    ("Read #general", "slack.conversation.read",
+     {"active_channel": {"id": "C1"}}, {"channel_id": "C1"}),
+    ("Post in #general: hello", "slack.message.send",
+     {"active_channel": {"id": "C1"}}, {"channel_id": "C1", "text": "hello"}),
+    ("Reply there that I agree", "slack.thread.reply",
+     {"active_channel": {"id": "C1"}, "active_thread": {"thread_ts": "1.0"}},
+     {"channel_id": "C1", "thread_ts": "1.0", "text": "I agree"}),
+    ("Send a direct message to Maria saying hello", "slack.direct_message.send",
+     {"active_person": {"id": "U1"}}, {"user_id": "U1", "text": "hello"}),
+])
+def test_offline_slack_subset_compiles_only_resolved_exact_inputs(
+    goal, capability_id, resolution, expected
+):
+    definition = next(item for item in slack_definitions()
+                      if item.capability_id == capability_id)
+    compiler = PlanCompiler([definition], [ConnectionCapabilitySnapshot(
+        connection_id="conn:s", tenant_id="org:acme",
+        capability_id=definition.capability_id,
+        capability_version=definition.version, credential_version=1,
+        effective_scopes=definition.required_scopes, health="healthy",
+        rollout_version="rollout-1",
+    )], "rollout-1")
+    resolution = {**resolution, "active_connection": {"id": "conn:s"}}
+    result = DynamicPlanner(object(), compiler).plan(goal, {
+        "tenant_id": "org:acme", "slack_resolution": resolution,
+    })
+    assert result["steps"][0]["input"] == expected

@@ -28,6 +28,7 @@ import requests
 
 from pydantic import BaseModel, Field
 from agents.orchestrator.workflow_models import WorkflowPlanDraft
+from agents.orchestrator.slack_conversation import interpret_slack_turn
 
 #: Exact Claude model ID used by :class:`ClaudeBrain`. No date suffix.
 MODEL_ID = "claude-opus-4-8"
@@ -385,6 +386,13 @@ class ClaudeBrain:
         )
         return response.parsed_output.model_dump()
 
+    def understand_slack(self, nl_request, context=None):
+        # Entity IDs are intentionally absent from this contract. A provider
+        # projection is resolved later by deterministic application code.
+        return interpret_slack_turn(
+            nl_request, (context or {}).get("active_conversation")
+        )
+
     def run_tool_loop(self, prompt, tools, system, max_iterations):
         # type: (str, list, str, int) -> tuple
         """Drive the Anthropic Tool Runner over ``tools`` for ``prompt``.
@@ -680,6 +688,11 @@ class RuleBrain:
             user_message="Con gusto le ayudo con su solicitud.",
         )
         return _ground_intent(intent, context)
+
+    def understand_slack(self, nl_request, context=None):
+        return interpret_slack_turn(
+            nl_request, (context or {}).get("active_conversation")
+        )
 
     def compose_reply(self, state: dict) -> str:
         state = state or {}
