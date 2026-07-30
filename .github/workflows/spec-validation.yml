@@ -10,6 +10,8 @@ jobs:
   spec-validation:
     runs-on: ubuntu-latest
     name: Validate JSON schemas and examples
+    env:
+      PYTEST_SKIP_SHARED_DB_CLEANUP: "1"
 
     steps:
       - name: Checkout code

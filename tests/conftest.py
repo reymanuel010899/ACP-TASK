@@ -30,6 +30,8 @@ replaced per-process in-memory dicts across the backend:
    ``tests/audit/``) keep their own narrower fixtures for those schemas.
 """
 
+import os
+
 import pytest
 
 from libs.db import Database
@@ -48,6 +50,12 @@ Database.__init__ = _tracked_init
 
 @pytest.fixture(autouse=True)
 def _clean_shared_identity_tables():
+    # Schema/spec-only CI jobs do not start Postgres because these tests never
+    # exercise persistence. Keep their collection independent from a database.
+    if os.environ.get("PYTEST_SKIP_SHARED_DB_CLEANUP") == "1":
+        yield
+        return
+
     db = Database()
     with db.connection() as conn:
         with conn.cursor() as cur:
