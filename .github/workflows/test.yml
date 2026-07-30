@@ -11,6 +11,37 @@ jobs:
     runs-on: ubuntu-latest
     name: Run full test suite with coverage
 
+    # Postgres 16 + Redis 7 (unit U1, R11): the same versions as
+    # infra/docker-compose.yml, so CI exercises the full suite against real
+    # infrastructure instead of only locally.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agenttrust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agenttrust"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agenttrust
+      REDIS_URL: redis://localhost:6379/0
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,6 +65,14 @@ jobs:
           pip install -r requirements.txt
           pip install pytest-cov coverage
 
+      - name: Apply least-privilege DB roles
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          psql "$DATABASE_URL" -f infra/roles.sql
+
+      - name: Run pending migrations
+        run: python -m tools.migrate
+
       - name: Run full test suite with coverage
         run: |
           pytest \
@@ -41,6 +80,12 @@ jobs:
             --cov=registry \
             --cov=services \
             --cov=web \
+            --cov=libs \
+            --cov=vault \
+            --cov=audit \
+            --cov=apps \
+            --cov=agent_marketplace \
+            --cov=tools \
             --cov-report=xml \
             --cov-report=term-missing \
             --cov-report=html \

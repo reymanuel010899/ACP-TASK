@@ -340,6 +340,88 @@ class TestExpiry:
         assert listed[0]["grant_id"] == grant["grant_id"]
         assert listed[0]["status"] == "expired"
 
+    def test_expired_status_is_a_read_time_predicate_no_write_occurs(
+        self, seeded, agent_marketplace
+    ):
+        """Unit U8 (database architecture): 'expired' is computed by a
+        query predicate every time a grant is read
+        (``status = 'active' and (expires_at is null or expires_at >
+        now())``) -- it is NEVER written back to the row. Proves that by
+        reading the grant twice (through the HTTP API, which reports
+        "expired" both times) and then inspecting the raw
+        ``marketplace.hiring_grants`` row directly: ``status`` is still the
+        literal ``'active'`` it was created with and ``revoked_at`` is still
+        NULL -- no UPDATE was ever issued for the expiry transition."""
+        from libs.db import Database
+
+        past = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=1)
+        ).isoformat().replace("+00:00", "Z")
+        client = AgentMarketplaceClient(agent_marketplace)
+        grant = client.hire_agent(
+            agent_principal_id="agent:helper",
+            user_principal_id="user:alice",
+            scoped_capabilities=["translation"],
+            expires_at=past,
+        )
+
+        # Read it twice via the HTTP API -- both times report "expired".
+        for _ in range(2):
+            listed = client.list_hirings(user_principal_id="user:alice")
+            assert listed[0]["status"] == "expired"
+
+        # The underlying row was never mutated to reflect that: the raw
+        # ``status`` column is still 'active' and ``revoked_at`` is NULL.
+        db = Database()
+        try:
+            with db.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status, revoked_at "
+                        "FROM marketplace.hiring_grants WHERE grant_id = %s",
+                        (grant["grant_id"],),
+                    )
+                    raw_status, revoked_at = cur.fetchone()
+        finally:
+            db.close()
+        assert raw_status == "active"
+        assert revoked_at is None
+
+
+# ---------------------------------------------------------------------------
+# 9. Hiring grant scoped to capabilities + credential scopes is queryable
+#    as active (happy path, unit U8)
+# ---------------------------------------------------------------------------
+
+
+class TestGrantScoping:
+    def test_grant_scoped_to_capabilities_and_credentials_is_active(
+        self, seeded, vault, agent_marketplace_with_vault
+    ):
+        credential_id = _store_credential(vault, "user:alice")
+        client = AgentMarketplaceClient(agent_marketplace_with_vault)
+        grant = client.hire_agent(
+            agent_principal_id="agent:helper",
+            user_principal_id="user:alice",
+            scoped_capabilities=["translation"],
+            credential_scopes=[
+                {"credential_id": credential_id, "scope": "read"},
+            ],
+        )
+        assert grant["status"] == "active"
+        assert grant["scoped_capabilities"] == ["translation"]
+        assert grant["credential_scopes"] == [
+            {"credential_id": credential_id, "scope": "read"},
+        ]
+
+        fetched = client.list_hirings(user_principal_id="user:alice")[0]
+        assert fetched["status"] == "active"
+        assert fetched["scoped_capabilities"] == ["translation"]
+        assert fetched["credential_scopes"] == [
+            {"credential_id": credential_id, "scope": "read"},
+        ]
+
 
 # ---------------------------------------------------------------------------
 # 7-8. Ratings
@@ -391,7 +473,18 @@ class TestRatings:
             )
             assert resp.status_code == 422, (bad, resp.text)
 
-    def test_rerating_replaces_previous(self, seeded, agent_marketplace):
+    def test_rerating_appends_history_and_updates_running_average(
+        self, seeded, agent_marketplace
+    ):
+        """KTD8 (unit U8, database architecture): ratings are append-only
+        history plus a materialized running-average summary, replacing
+        today's "re-rating silently replaces the prior rating" behavior --
+        a deliberate, plan-sanctioned change (R10's named exception list
+        explicitly calls out "ratings history"). Re-rating the same agent
+        now INSERTS a second ``marketplace.ratings`` row rather than
+        overwriting the first; BOTH ratings count toward
+        ``rating_summary``'s average forever, not just the latest.
+        """
         client = AgentMarketplaceClient(agent_marketplace)
         client.hire_agent(
             agent_principal_id="agent:helper",
@@ -403,8 +496,9 @@ class TestRatings:
         assert first["rating_count"] == 1
 
         second = client.rate_agent("agent:helper", "user:alice", 3)
-        assert second["avg_rating"] == 3.0
-        assert second["rating_count"] == 1  # replaced, not duplicated
+        # Appended, not replaced: both the original 5 and the new 3 count.
+        assert second["avg_rating"] == pytest.approx(4.0)
+        assert second["rating_count"] == 2
 
     def test_two_users_average_over_both(self, seeded, agent_marketplace):
         _register_user(seeded, "user:bob")

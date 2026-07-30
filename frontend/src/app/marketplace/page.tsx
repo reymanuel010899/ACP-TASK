@@ -5,7 +5,7 @@ import MarketplaceContent from "@/components/marketplace/MarketplaceContent";
 import MarketplaceFilters from "@/components/marketplace/MarketplaceFilters";
 
 export const metadata: Metadata = {
-  title: "Marketplace — Agentio",
+  title: "Marketplace — Console",
 };
 
 export default function MarketplacePage() {

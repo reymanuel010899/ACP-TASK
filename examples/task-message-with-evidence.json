@@ -10,9 +10,9 @@
       "text": "Terraform module generated: main.tf, variables.tf and outputs.tf produced; terraform validate and the acceptance tests passed."
     }
   ],
-  "extensions": ["https://agenttrust.example/extensions/trust/v1"],
+  "extensions": ["https://treessera.com/extensions/trust/v1"],
   "metadata": {
-    "https://agenttrust.example/extensions/trust/v1": {
+    "https://treessera.com/extensions/trust/v1": {
       "evidence": {
         "evidence_id": "ev-01a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
         "session_id": "sess-9e8d7c6b-5a49-4382-b716-05f4e3d2c1b0",
@@ -30,7 +30,7 @@
       "verification_result": {
         "result_id": "vr-5566d7e8-f901-4a2b-83c4-d5e6f7a8b9c0",
         "evidence_id": "ev-01a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
-        "principal_id": "atp:principal:verify.agenttrust.example:verifier-01",
+        "principal_id": "atp:principal:verify.treessera.com:verifier-01",
         "verdict": "verified",
         "reasoning": "Recomputed sha256 of all three artifacts matched artifact_hashes; output re-validated against terraform.generate output_schema; acceptance tests re-executed and passed 12/12.",
         "verified_at": "2026-07-14T10:05:37Z"

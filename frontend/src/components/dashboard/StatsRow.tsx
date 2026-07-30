@@ -1,4 +1,35 @@
+"use client";
+
+import { useAgentStats } from "@/lib/agentQueries";
+
+/** Build an SVG polyline path from a real series, fitted to a 60×20 viewBox
+ * (y inverted; a flat series draws a flat low line). */
+function sparkPath(counts: number[], w = 60, h = 20, pad = 2): string {
+  if (counts.length === 0) return "";
+  const min = Math.min(...counts);
+  const max = Math.max(...counts);
+  const span = max - min || 1;
+  const stepX = counts.length > 1 ? w / (counts.length - 1) : 0;
+  return counts
+    .map((c, i) => {
+      const x = i * stepX;
+      const y = h - pad - ((c - min) / span) * (h - pad * 2);
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
 export default function StatsRow() {
+  const { data: stats } = useAgentStats();
+  const totalDisplay = stats ? String(stats.total) : "—";
+  const trendPath = stats
+    ? sparkPath(stats.trend.map((p) => p.count))
+    : "M0 18 L60 18";
+  const changePct = stats?.change_pct ?? 0;
+  const up = changePct >= 0;
+  const changeStr = `${up ? "+" : ""}${changePct}%`;
+  const changeColor = up ? "#22C55E" : "#EF4444";
+
   return (
     <div
       className="box-border w-full h-fit shrink-0 flex flex-row gap-[16px] justify-start items-start"
@@ -49,7 +80,7 @@ export default function StatsRow() {
         <div
           className="text-[26px]/[normal] box-border text-[var(--ag-text)] font-[Inter,system-ui,sans-serif] font-bold text-left [white-space:nowrap] relative [z-index:1]"
         >
-          128
+          {totalDisplay}
         </div>
         <svg
           viewBox="0 0 60 20"
@@ -58,10 +89,12 @@ export default function StatsRow() {
           className="box-border w-[60px] h-[20px] shrink-0 overflow-visible [z-index:3]"
         >
           <path
-            d="M0 20c5-2 10-5 15-4 5 1 10-4 15-6 5-2 10 1 15-1 5-2 10-6 15-9"
+            d={trendPath}
             fill="none"
-            stroke="#22C55E"
+            stroke={changeColor}
             strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           ></path>
         </svg>
@@ -70,9 +103,10 @@ export default function StatsRow() {
           className="box-border w-full h-fit shrink-0 flex flex-row gap-[8px] justify-start items-center relative [z-index:2]"
         >
           <div
-            className="text-[12px]/[normal] box-border text-[#22C55E] font-[Inter,system-ui,sans-serif] font-medium text-left [white-space:nowrap]"
+            className="text-[12px]/[normal] box-border font-[Inter,system-ui,sans-serif] font-medium text-left [white-space:nowrap]"
+            style={{ color: changeColor }}
           >
-            +14.6%
+            {changeStr}
           </div>
           <div
             className="text-[11px]/[normal] box-border text-[var(--ag-text-muted)] font-[Inter,system-ui,sans-serif] font-normal text-left [white-space:nowrap]"

@@ -32,13 +32,15 @@ const ENTITIES: Entity[] = [
   { title: "Audit Service", sub: "All systems secure", accent: "#9CA3AF", icon: "shield", side: "right", fy: 0.86, bend: -16 },
 ];
 
-// Central agent nodes: offsets from cluster center + base radius (design-derived)
-const CLUSTER = [
-  { dx: -44, dy: -16, r: 18, color: "#3B82F6" },
-  { dx: 4, dy: -3, r: 16, color: "#F59E0B" },
-  { dx: -28, dy: 25, r: 14, color: "#22C55E" },
-  { dx: 23, dy: -29, r: 15, color: "#EF4444" },
-  { dx: 45, dy: 23, r: 17, color: "#6D3CE0" },
+// The trust core sits where every connection converges: a hexagon (the
+// protocol-node motif) carrying the verification check, wrapped in orbital
+// rings. The travelling dots echo the connected entities' accents — agents and
+// tasks moving through the trust layer rather than around it.
+const ORBIT_DOTS = [
+  { r: 62, speed: 0.34, phase: 0.0, color: "#8B5CF6" },
+  { r: 62, speed: 0.34, phase: 2.4, color: "#F59E0B" },
+  { r: 46, speed: -0.52, phase: 1.1, color: "#22C55E" },
+  { r: 46, speed: -0.52, phase: 3.6, color: "#06B6D4" },
 ];
 
 // Ambient particle dots (fractions of canvas size)
@@ -50,6 +52,19 @@ const AMBIENT = [
   { fx: 0.71, fy: 0.59, r: 2, color: "#F59E0B" },
   { fx: 0.67, fy: 0.8, r: 2.5, color: "#9CA3AF" },
 ];
+
+/** Regular hexagon path, flat-top rotated so a vertex points up. */
+function hexPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (Math.PI / 3) * i - Math.PI / 2;
+    const x = cx + Math.cos(a) * r;
+    const y = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
 
 function drawIcon(ctx: CanvasRenderingContext2D, icon: IconName, cx: number, cy: number, s: number) {
   ctx.save();
@@ -288,26 +303,68 @@ export default function EcosystemNetworkCanvas() {
         ctx.globalAlpha = 1;
       });
 
-      // central agent nodes with soft pulsing glows
-      CLUSTER.forEach((n, i) => {
-        const nx = cx + n.dx * scale;
-        const ny = cy + n.dy * scale;
-        const pulse = 1 + 0.05 * Math.sin(t * 1.4 + i * 1.3);
-        const r = n.r * scale * pulse;
-        const halo = ctx.createRadialGradient(nx, ny, r * 0.4, nx, ny, r * 2.2);
-        halo.addColorStop(0, n.color + "55");
-        halo.addColorStop(1, n.color + "00");
-        ctx.fillStyle = halo;
+      // ---- trust core: everything routes through the verification layer ----
+      const coreR = 30 * scale;
+      const breathe = 1 + 0.035 * Math.sin(t * 1.1);
+
+      // orbital rings
+      ctx.lineWidth = 1;
+      [62, 46].forEach((rr, i) => {
+        ctx.strokeStyle = i === 0 ? "rgba(139,92,246,0.20)" : "rgba(139,92,246,0.34)";
         ctx.beginPath();
-        ctx.arc(nx, ny, r * 2.2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 0.85;
-        ctx.fillStyle = n.color;
-        ctx.beginPath();
-        ctx.arc(nx, ny, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
+        ctx.arc(cx, cy, rr * scale, 0, Math.PI * 2);
+        ctx.stroke();
       });
+
+      // dots travelling the orbits (work moving through the layer)
+      ORBIT_DOTS.forEach((d) => {
+        const a = t * d.speed + d.phase;
+        const x = cx + Math.cos(a) * d.r * scale;
+        const y = cy + Math.sin(a) * d.r * scale;
+        const trail = ctx.createRadialGradient(x, y, 0, x, y, 7 * scale);
+        trail.addColorStop(0, d.color + "AA");
+        trail.addColorStop(1, d.color + "00");
+        ctx.fillStyle = trail;
+        ctx.beginPath();
+        ctx.arc(x, y, 7 * scale, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = d.color;
+        ctx.beginPath();
+        ctx.arc(x, y, 2.4 * scale, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      // halo behind the core
+      const coreHalo = ctx.createRadialGradient(cx, cy, coreR * 0.2, cx, cy, coreR * 2.6);
+      coreHalo.addColorStop(0, "rgba(139,92,246,0.38)");
+      coreHalo.addColorStop(1, "rgba(139,92,246,0)");
+      ctx.fillStyle = coreHalo;
+      ctx.beginPath();
+      ctx.arc(cx, cy, coreR * 2.6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // hexagon body
+      const body = ctx.createLinearGradient(cx, cy - coreR, cx, cy + coreR);
+      body.addColorStop(0, "#A855F7");
+      body.addColorStop(1, "#3B1178");
+      hexPath(ctx, cx, cy, coreR * breathe);
+      ctx.fillStyle = body;
+      ctx.fill();
+      ctx.strokeStyle = "rgba(214,196,255,0.9)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // verification check — what the whole layer is for
+      ctx.strokeStyle = "#F4F2FF";
+      ctx.lineWidth = 2.8 * scale;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(cx - 9 * scale, cy + 0.5 * scale);
+      ctx.lineTo(cx - 3 * scale, cy + 6.5 * scale);
+      ctx.lineTo(cx + 9.5 * scale, cy - 6.5 * scale);
+      ctx.stroke();
+      ctx.lineWidth = 1;
 
       // entity chips
       chips.forEach((chip) => {

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/reputation-record.schema.json",
+  "$id": "https://treessera.com/schemas/reputation-record.schema.json",
   "title": "ReputationRecord",
   "description": "Aggregated verification history for one (Principal, Capability) pair. A principal with zero completed tasks is NEUTRAL: counts are 0 and verification_rate is null (unknown), never 0.0 (failed-by-default).",
   "type": "object",

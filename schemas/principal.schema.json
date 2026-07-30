@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/principal.schema.json",
+  "$id": "https://treessera.com/schemas/principal.schema.json",
   "title": "Principal",
   "description": "A long-lived cryptographic identity (an agent, an operator, or a verifier) identified by a stable id and an ed25519 public key.",
   "type": "object",

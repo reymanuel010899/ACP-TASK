@@ -14,8 +14,6 @@ Scenarios covered:
 - Isolation: apps cannot corrupt each other's data
 """
 
-import json
-import os
 import subprocess
 import sys
 import threading
@@ -36,28 +34,10 @@ from registry.user_index import UserIndex
 
 
 @pytest.fixture
-def temp_dir(tmp_path):
-    """Create temporary directory for test data."""
-    return tmp_path
-
-
-@pytest.fixture
-def registry_data_file(temp_dir):
-    """Path to registry data file (agent registrations)."""
-    return temp_dir / "registry_data.json"
-
-
-@pytest.fixture
-def user_index_file(temp_dir):
-    """Path to user index file (users and reputation)."""
-    return temp_dir / "user_index.json"
-
-
-@pytest.fixture
-def registry_service(registry_data_file, user_index_file):
-    """Create a RegistryService with optional persistence."""
-    index = IndexStore(path=str(registry_data_file))
-    user_index = UserIndex(path=str(user_index_file))
+def registry_service():
+    """Create a RegistryService (Postgres-backed, unit U5)."""
+    index = IndexStore()
+    user_index = UserIndex()
     return RegistryService(index, user_index=user_index)
 
 
@@ -177,7 +157,7 @@ class AppSimulator:
             "capabilities": {
                 "extensions": [
                     {
-                        "uri": "https://agenttrust.example/extensions/trust/v1"
+                        "uri": "https://treessera.com/extensions/trust/v1"
                     }
                 ]
             },
@@ -425,14 +405,12 @@ class TestMultipleAppsWithRegistry:
 class TestPersistence:
     """Verify reputation persists across restarts."""
 
-    def test_data_persists_after_registry_restart(
-        self, registry_data_file, user_index_file
-    ):
+    def test_data_persists_after_registry_restart(self):
         """Data written to registry survives restart."""
         # First: start registry, register user, record reputation
         service1 = RegistryService(
-            IndexStore(path=str(registry_data_file)),
-            user_index=UserIndex(path=str(user_index_file)),
+            IndexStore(),
+            user_index=UserIndex(),
         )
         server1 = make_server(
             port=0,
@@ -472,10 +450,11 @@ class TestPersistence:
         server1.server_close()
         time.sleep(0.5)
 
-        # Second: create new registry instance with same data files
+        # Second: create a fresh registry instance (Postgres backs the data,
+        # not a file, so no data file needs to be shared/re-passed here).
         service2 = RegistryService(
-            IndexStore(path=str(registry_data_file)),
-            user_index=UserIndex(path=str(user_index_file)),
+            IndexStore(),
+            user_index=UserIndex(),
         )
         server2 = make_server(
             port=0,

@@ -1,16 +1,15 @@
 import type { Metadata } from "next";
 import AppShell from "@/components/shell/AppShell";
-import AgentContent from "@/components/agents/AgentContent";
-import AgentRightPanel from "@/components/agents/AgentRightPanel";
+import AgentListContent from "@/components/agents/AgentListContent";
 
 export const metadata: Metadata = {
-  title: "Agents — Agentio",
+  title: "Agents — Console",
 };
 
 export default function AgentsPage() {
   return (
-    <AppShell active="agents" rightPanel={<AgentRightPanel />}>
-      <AgentContent />
+    <AppShell active="agents">
+      <AgentListContent />
     </AppShell>
   );
 }

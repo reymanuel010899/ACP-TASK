@@ -46,8 +46,7 @@ from urllib.parse import quote
 import requests
 
 from agents.requester.config import RequesterConfig
-
-TRUST_EXTENSION_URI = "https://agenttrust.example/extensions/trust/v1"
+from libs.config import TRUST_EXTENSION_URI
 
 
 class RequesterAgent(object):
@@ -192,7 +191,11 @@ class RequesterAgent(object):
         # task.request -> task.offer
         try:
             offer_env = self._send(
-                provider_url, {"type": "task.request", "input": task_input}
+                provider_url, {
+                    "type": "task.request",
+                    "capability_id": capability,
+                    "input": task_input,
+                }
             )
         except requests.RequestException as exc:
             return _outcome(
@@ -359,7 +362,10 @@ class RequesterAgent(object):
             if meta["requires_auth"] and not meta["token"]:
                 continue
             offer = self._request_offer(
-                meta["provider_url"], task_input, meta["token"]
+                meta["provider_url"],
+                task_input,
+                meta["token"],
+                capability=capability,
             )
             if offer is None:
                 continue  # unreachable / refused / 401 -> drop this candidate
@@ -490,12 +496,16 @@ class RequesterAgent(object):
             return []
         return entries if isinstance(entries, list) else []
 
-    def _request_offer(self, provider_url, task_input, token=None):
-        # type: (str, dict, Optional[str]) -> Optional[dict]
+    def _request_offer(self, provider_url, task_input, token=None,
+                       capability=None):
+        # type: (str, dict, Optional[str], Optional[str]) -> Optional[dict]
         try:
+            payload = {"type": "task.request", "input": task_input}
+            if capability:
+                payload["capability_id"] = capability
             env = self._send(
                 provider_url,
-                {"type": "task.request", "input": task_input},
+                payload,
                 token=token,
             )
         except requests.RequestException:

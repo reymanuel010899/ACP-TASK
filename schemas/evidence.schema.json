@@ -1,11 +1,19 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/evidence.schema.json",
+  "$id": "https://treessera.com/schemas/evidence.schema.json",
   "title": "Evidence",
-  "description": "A machine-checkable claim bundle produced when a capability is exercised inside a Session: schema validity, test outcome, and sha256 hashes of the produced artifacts.",
+  "description": "A machine-checkable artifact claim, broker-signed provider execution attestation, or both.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["evidence_id", "session_id", "capability_id", "schema_valid", "tests_passed", "artifact_hashes"],
+  "required": ["evidence_id", "capability_id"],
+  "anyOf": [
+    {
+      "required": ["session_id", "schema_valid", "tests_passed", "artifact_hashes"]
+    },
+    {
+      "required": ["execution_attestation"]
+    }
+  ],
   "properties": {
     "evidence_id": {
       "type": "string",
@@ -38,6 +46,110 @@
         "^.+$": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "execution_attestation": {
+      "type": "object",
+      "description": "Opaque authoritative evidence signed by the credential broker after a provider action.",
+      "additionalProperties": false,
+      "required": [
+        "attestation_id",
+        "task_id",
+        "user_principal_id",
+        "agent_principal_id",
+        "credential_id",
+        "capability_id",
+        "approved_payload_hash",
+        "provider_receipt",
+        "idempotency_key",
+        "executed_at",
+        "outcome",
+        "broker_key_id",
+        "material_hashes",
+        "signature"
+      ],
+      "properties": {
+        "attestation_id": {
+          "type": "string",
+          "pattern": "^attestation-[a-f0-9]{64}$"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "user_principal_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "agent_principal_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "credential_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capability_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approved_payload_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "provider_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "capability_id", "provider_id"],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "minLength": 1
+            },
+            "capability_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider_account_hash": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "provider_timestamp": {
+              "type": ["integer", "string"]
+            }
+          }
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executed_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["succeeded", "failed"]
+        },
+        "broker_key_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "material_hashes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },

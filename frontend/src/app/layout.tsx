@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import SessionProvider from "@/lib/SessionProvider";
+import QueryProvider from "@/lib/QueryProvider";
 import "./globals.css";
 
 const inter = Inter({
@@ -8,9 +10,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Agentio",
+  title: "Console",
   description:
-    "Agentio dashboard — manage your agents, tasks, and ecosystem network.",
+    "Console dashboard — manage your agents, tasks, and ecosystem network.",
 };
 
 // Applies the persisted theme before first paint to avoid a theme flash.
@@ -27,7 +29,11 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
-      <body className={inter.className}>{children}</body>
+      <body className={inter.className}>
+        <QueryProvider>
+          <SessionProvider>{children}</SessionProvider>
+        </QueryProvider>
+      </body>
     </html>
   );
 }

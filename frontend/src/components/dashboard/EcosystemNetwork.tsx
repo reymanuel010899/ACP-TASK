@@ -19,7 +19,7 @@ export default function EcosystemNetwork() {
           <div
             className="text-[13px]/[normal] box-border text-[var(--ag-text-secondary)] font-[Inter,system-ui,sans-serif] font-normal text-left [white-space:nowrap]"
           >
-            Real-time connections and interactions across the Agentio network
+            Real-time connections and interactions across the Console network
           </div>
         </div>
         <div

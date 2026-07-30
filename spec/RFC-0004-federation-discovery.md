@@ -6,7 +6,7 @@
 - **Implements:** Phase B unit U9 (ecosystem discovery + shared-service lookup)
 
 > The project name **AgentTrust** is a provisional placeholder, as is the
-> `agenttrust.example` domain. Both will be replaced before any non-draft
+> `treessera.com` domain. Both will be replaced before any non-draft
 > release; the *structure* of this protocol is what is specified.
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be

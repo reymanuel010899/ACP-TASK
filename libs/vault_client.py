@@ -111,6 +111,27 @@ class VaultClient:
             },
         )
 
+    def store_managed_oauth(
+        self, user_principal_id, provider, granted_scopes, envelope
+    ):
+        # type: (str, str, list, dict) -> dict
+        """Store a KMS-wrapped managed OAuth envelope.
+
+        ``envelope`` is already ciphertext produced by
+        ``vault.managed_oauth_crypto`` under the OAuth-ingestion AWS identity;
+        this client never accepts plaintext token material.
+        """
+        return self._request(
+            "POST",
+            "/credentials/managed-oauth",
+            json_body={
+                "user_principal_id": user_principal_id,
+                "provider": provider,
+                "granted_scopes": list(granted_scopes),
+                "envelope": envelope,
+            },
+        )
+
     def list_credentials(self, user_principal_id):
         # type: (str) -> list
         """GET /credentials — metadata-only listing for a user."""
@@ -172,7 +193,14 @@ class VaultClient:
 
     def get_audit(self, principal_id):
         # type: (str) -> list
-        """GET /audit — audit entries for a principal, oldest first."""
+        """GET /audit — audit entries for a principal.
+
+        Since unit U4, the vault's ``GET /audit`` proxies to the central
+        Audit & Compliance service instead of a local list: entries come
+        back NEWEST FIRST, in that service's shape (``activity_type``,
+        ``resource_type``/``resource_id``) rather than the old vault-local
+        ``action``/``credential_id`` fields.
+        """
         body = self._request(
             "GET", "/audit", params={"principal_id": principal_id}
         )

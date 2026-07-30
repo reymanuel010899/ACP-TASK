@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/capability.schema.json",
+  "$id": "https://treessera.com/schemas/capability.schema.json",
   "title": "Capability",
   "description": "A named, versioned skill an agent claims to be able to perform (e.g. 'terraform.generate'). Capabilities are the unit against which evidence is produced and reputation is accrued.",
   "type": "object",

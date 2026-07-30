@@ -345,6 +345,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/auth/login":
             self._handle_auth_login()
             return
+        if self.path == "/api/orchestrate":
+            self._handle_orchestrate()
+            return
         if self.path != "/api/task":
             self._send(404, {"error": "not found"})
             return
@@ -394,6 +397,52 @@ class _Handler(BaseHTTPRequestHandler):
             outcome.get("provider_principal_id")
         )
         outcome["interpretation"] = interpretation
+        self._send(200, outcome)
+
+    def _handle_orchestrate(self):
+        # type: () -> None
+        """POST /api/orchestrate — the GENERIC requester entry point.
+
+        Runs the exact same professional flow as ``/api/task`` — discovery,
+        competitive negotiation across providers, and the independent
+        verification gate (``RequesterAgent.run_competitive``) — but for ANY
+        capability, not just terraform. Body: ``{"capability": "<id>",
+        "input": {...}}``. This is what the marketplace's client console calls.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON"})
+            return
+        if not isinstance(payload, dict):
+            self._send(400, {"error": "body must be a JSON object"})
+            return
+        capability = (payload.get("capability") or "").strip()
+        if not capability:
+            self._send(400, {"error": "a 'capability' is required"})
+            return
+        task_input = payload.get("input")
+        if not isinstance(task_input, dict):
+            task_input = {}
+
+        config = RequesterConfig(
+            registry_url=self.stack.registry_url,
+            capability=capability,
+            task_input=task_input,
+            verification_url=self.stack.verification_url,
+            provider_tokens=self.server.provider_tokens,
+        )
+        outcome = RequesterAgent(config).run_competitive()
+        outcome["provider_name"] = self.stack.name_for(
+            outcome.get("provider_principal_id")
+        )
+        outcome["capability"] = capability
         self._send(200, outcome)
 
     def _handle_register_provider(self):

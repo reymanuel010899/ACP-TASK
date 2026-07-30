@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json",
+  "$id": "https://treessera.com/schemas/a2a-extension-descriptor.schema.json",
   "title": "A2AExtensionDescriptor",
-  "description": "Validates the two JSON shapes the AgentTrust A2A binding (RFC-0002) introduces: (a) the AgentExtension entry a provider declares under AgentCard.capabilities.extensions[], and (b) the trust metadata payload carried under Message.metadata['https://agenttrust.example/extensions/trust/v1']. The root schema accepts either shape; validate against #/definitions/agentExtension or #/definitions/trustMetadata to target one.",
+  "description": "Validates the two JSON shapes the AgentTrust A2A binding (RFC-0002) introduces: (a) the AgentExtension entry a provider declares under AgentCard.capabilities.extensions[], and (b) the trust metadata payload carried under Message.metadata['https://treessera.com/extensions/trust/v1']. The root schema accepts either shape; validate against #/definitions/agentExtension or #/definitions/trustMetadata to target one.",
   "oneOf": [
     { "$ref": "#/definitions/agentExtension" },
     { "$ref": "#/definitions/trustMetadata" }
@@ -16,7 +16,7 @@
       "required": ["uri"],
       "properties": {
         "uri": {
-          "const": "https://agenttrust.example/extensions/trust/v1",
+          "const": "https://treessera.com/extensions/trust/v1",
           "description": "The AgentTrust extension URI. This exact value identifies the extension in AgentCard.capabilities.extensions[], the A2A-Extensions HTTP header, Message.extensions[], and the Message.metadata namespace key."
         },
         "description": {
@@ -47,7 +47,7 @@
     },
     "trustMetadata": {
       "title": "AgentTrust message metadata payload",
-      "description": "The namespaced object carried under Message.metadata['https://agenttrust.example/extensions/trust/v1'] on task result messages.",
+      "description": "The namespaced object carried under Message.metadata['https://treessera.com/extensions/trust/v1'] on task result messages.",
       "type": "object",
       "additionalProperties": false,
       "required": ["evidence", "evidence_status"],

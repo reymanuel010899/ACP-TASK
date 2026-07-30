@@ -247,7 +247,16 @@ class TestUserReputationUpdate:
         assert code_review_record is not None
         assert code_review_record["tasks_verified"] == 2
         assert code_review_record["tasks_rejected"] == 1
-        assert code_review_record["verification_rate"] == pytest.approx(2.0 / 3)
+        # Unit U5 (database architecture): verification_rate is now a
+        # Postgres GENERATED column, `round(verified / total, 4)` (verbatim
+        # design-doc DDL, migrations/0006_trust.sql) rather than an
+        # unrounded Python float division -- 2/3 stores as 0.6667, not
+        # 0.6666666666666666. The default pytest.approx tolerance (relative
+        # 1e-6) is tighter than that intentional 4-decimal rounding, so this
+        # needs an explicit absolute tolerance wide enough to accept it.
+        assert code_review_record["verification_rate"] == pytest.approx(
+            2.0 / 3, abs=1e-4
+        )
 
     def test_update_reputation_for_nonexistent_user_is_404(self, service):
         """Updating reputation for non-existent user returns 404."""

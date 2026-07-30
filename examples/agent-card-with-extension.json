@@ -10,12 +10,12 @@
     "pushNotifications": false,
     "extensions": [
       {
-        "uri": "https://agenttrust.example/extensions/trust/v1",
+        "uri": "https://treessera.com/extensions/trust/v1",
         "description": "AgentTrust trust layer: signed sessions, machine-checkable Evidence on task results, independent verification, per-capability reputation.",
         "required": false,
         "params": {
           "principal_id": "atp:principal:agents.example.com:terraformsmith",
-          "verification_service_url": "https://verify.agenttrust.example/v1"
+          "verification_service_url": "https://verify.treessera.com/v1"
         }
       }
     ]

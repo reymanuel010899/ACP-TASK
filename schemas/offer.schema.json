@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/offer.schema.json",
+  "$id": "https://treessera.com/schemas/offer.schema.json",
   "title": "Offer",
   "description": "A provider's public offer to perform a task at a stated price (the 'task.offer' message body, RFC-0002). The provider's private minimum/reservation price is NEVER part of this object: 'additionalProperties' is false, so only the public 'price' can cross the wire. A leaked reservation field is a schema-validation error by construction.",
   "type": "object",

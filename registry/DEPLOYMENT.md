@@ -8,6 +8,22 @@ This document describes how to deploy and run the AgentTrust Reference Registry 
 
 - Docker and Docker Compose installed (or Python 3.11+)
 - Port 8090 available on your system
+- **A running Postgres 16 + Redis 7** — the registry persists through
+  `registry/repository.py`/`libs/identity_repository.py`/
+  `libs/reputation_repository.py` against real Postgres tables (`registry`,
+  `identity`, `trust` schemas); there is no in-memory or JSON-file fallback
+  left. From the repo root:
+
+  ```bash
+  docker compose -f ../infra/docker-compose.yml up -d   # Postgres 16 + Redis 7
+  psql "$DATABASE_URL" -f ../infra/roles.sql             # least-privilege roles (idempotent)
+  python -m tools.migrate                                # apply pending migrations (idempotent)
+  ```
+
+  `libs/db.py` reads the connection string from `DATABASE_URL`
+  (`REDIS_URL` for Redis); see `infra/docker-compose.yml`'s header comment
+  for the local default DSN. Without this, `python -m registry.app` fails to
+  start.
 
 ### Option 1: Docker Compose (Recommended)
 
@@ -81,11 +97,17 @@ When running with `python -m registry.app`:
 --port <int>              Listening port (default: 8090)
 --host <str>              Bind address (default: 127.0.0.1)
 --verification-url <url>  Base URL of verification service for lazy reputation fetches
---api-keys-file <path>    JSON file with initial valid API keys (array of strings)
---index-path <path>       JSON file for persisting agent registrations
+--api-keys-file <path>    JSON file with initial valid API keys (array of strings) -- seeded
+                          once at startup, hashed the same way a minted key is
 --admin-token <token>     Bearer token required for POST /admin/api-keys (if set)
 --rate-limit <int>        Max requests per IP per 60s (0 = off, default: 0)
+--audit-url <url>         Base URL of the central Audit service; emission is best-effort
+--require-signatures      Enforce request signatures on mutating endpoints (RFC-0005)
 ```
+
+There is no `--index-path`/`--user-index-path` flag: registrations, users,
+and reputation persist unconditionally through Postgres (see Prerequisites
+above), not an optional JSON file.
 
 ### Example: With Verification Service
 
@@ -95,39 +117,22 @@ python -m registry.app \
   --host 0.0.0.0 \
   --verification-url http://verification-service:8091 \
   --api-keys-file ./api_keys.json \
-  --index-path ./data/registrations.json \
   --admin-token secret_admin_token_here
 ```
 
 ## Data Persistence
 
-### Docker Compose (Recommended)
+Persistence is Postgres, unconditionally — the registry connects to
+`DATABASE_URL` (see Prerequisites above) and every registration, user, and
+reputation record lands in the `registry`/`identity`/`trust` schemas.
+Restarting `python -m registry.app`, the container, or the process does not
+lose data; only a database wipe does. There is no volume-mounted JSON file
+to manage and no `--index-path`-style flag to pass.
 
-The `registry_data` volume persists files in `/data` inside the container:
-
-```yaml
-volumes:
-  - registry_data:/data
-```
-
-To use file-based persistence when running the registry, pass these flags:
-
-```bash
-# In docker-compose.yml, modify the service command:
-python -m registry.app \
-  --index-path /data/registrations.json \
-  --api-keys-file /data/api_keys.json
-```
-
-### Local Development
-
-For local testing, you can pass `--index-path` to persist registrations:
-
-```bash
-python -m registry.app \
-  --index-path ./registry_data.json \
-  --api-keys-file ./api_keys.json
-```
+When running via Docker Compose, point the container at the same Postgres
+instance (e.g. a `DATABASE_URL` environment variable resolving to the
+`infra/docker-compose.yml` Postgres service, or a managed instance in a
+real deployment) rather than mounting a data volume.
 
 ## API Endpoints
 
@@ -154,7 +159,7 @@ curl -X POST http://localhost:8090/register \
     "agent_card": {
       "capabilities": {
         "extensions": [{
-          "uri": "https://agenttrust.example/extensions/trust/v1"
+          "uri": "https://treessera.com/extensions/trust/v1"
         }]
       },
       "skills": [{"id": "code_review"}]
@@ -291,14 +296,10 @@ docker-compose up --build
 
 ### Data Not Persisting
 
-Ensure `--index-path` is passed to the registry and volume is mounted:
-
-```yaml
-volumes:
-  - registry_data:/data
-
-# Then in command: --index-path /data/registrations.json
-```
+Persistence is Postgres now (see Prerequisites above) — there is no
+`--index-path`/volume to configure. Confirm `DATABASE_URL` actually points
+at the Postgres instance you expect (`psql "$DATABASE_URL" -c 'select 1;'`)
+and that `python -m tools.migrate` has been run against it.
 
 ### Verification Service Integration
 

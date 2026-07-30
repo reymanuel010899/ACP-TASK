@@ -19,3 +19,12 @@ node_modules/
 
 # Claude Code temp agent worktrees (nunca versionar)
 .claude/worktrees/
+.venv_test/
+dump.rdb
+.env
+.env.*
+
+# Local runtime databases and SQLite sidecars
+tessera-*.db
+tessera-*.db-shm
+tessera-*.db-wal

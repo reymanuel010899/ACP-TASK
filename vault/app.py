@@ -15,25 +15,45 @@ API endpoints:
 - POST   /credentials/{credential_id}/grants          - grant agent access
 - POST   /credentials/{credential_id}/access          - agent access request
 - DELETE /credentials/{credential_id}/grants/{agent}  - revoke grant
-- GET    /audit?principal_id=<id>                     - audit entries
+- GET    /audit?principal_id=<id>                     - audit entries (proxied
+                                                         to the central audit
+                                                         service, see below)
 - GET    /healthz                                     - health check
+
+Audit (unit U4): the Vault's own local, in-memory audit log
+(``vault/audit_log.py``) has been removed. Every audit-worthy action already
+went through ``self.audit_client`` to the central Audit & Compliance service
+(``audit/app.py``) as of U12/U3 -- that central emission is now the ONLY
+audit trail (KTD3: two unsynchronized logs served no one). ``GET /audit``
+therefore proxies to the central service instead of reading a local list,
+and returns THAT service's entry shape directly: ``activity_type`` instead
+of ``action``, ``resource_type``/``resource_id`` instead of
+``credential_id``, and newest-first ordering instead of oldest-first. This
+is a deliberate, documented R10 exception (see this unit's report) -- Vault
+callers reading ``GET /audit`` must adapt to the new shape; this handler
+does NOT transform the central response back into the old shape, since
+doing so would silently keep the two-shapes problem this unit exists to
+close.
 
 Run: python -m vault.app [--port 8003]
 """
 
 import argparse
 import json
-import threading
-import uuid
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from libs.audit_client import make_audit_client
+from libs.db import Database, bind_organization_id
 from libs.request_auth import RequestAuthenticator
-from vault.audit_log import AuditLog
 from vault.crypto import UnsupportedKDFError, validate_kdf
+from vault.managed_oauth_crypto import (
+    ManagedOAuthAccessDenied,
+    ManagedOAuthAuthError,
+    validate_managed_oauth_envelope,
+)
+from vault.repository import VaultRepository
 
 _KEYRING_FIELDS = (
     "encrypted_dek", "salt", "nonce", "kdf", "kdf_params",
@@ -49,17 +69,26 @@ _CREDENTIAL_FIELDS = (
 
 
 class VaultService:
-    """Core vault logic; in-memory storage of wrapped blobs only."""
+    """Core vault logic; persists wrapped blobs to Postgres (unit U3, the
+    ``vault`` schema -- see ``vault/repository.py``). Storage is pure
+    ciphertext-in/ciphertext-out; this service never decrypts anything and
+    survives a process restart with every keyring, credential, and grant
+    intact."""
 
     def __init__(self, audit_url=None, registry_url=None,
-                 require_signatures=False, public_key_resolver=None):
-        # type: (Optional[str], Optional[str], bool, Optional[object]) -> None
-        self.keyrings = {}  # type: Dict[str, dict]
-        self.credentials = {}  # type: Dict[str, dict]
-        # Local audit log is part of the U7 contract and stays; the central
-        # audit client (U12) ADDITIONALLY mirrors significant events to the
-        # ecosystem-wide audit service, best-effort (no-op without a URL).
-        self.audit = AuditLog()
+                 require_signatures=False, public_key_resolver=None,
+                 db=None, repository=None, managed_oauth_crypto=None):
+        # type: (Optional[str], Optional[str], bool, Optional[object], Optional[Database], Optional[VaultRepository], Optional[object]) -> None
+        self.repository = repository or VaultRepository(db or Database())
+        self.managed_oauth_crypto = managed_oauth_crypto
+        # Central audit client (U12): best-effort, fire-and-forget emission
+        # to the ecosystem-wide Audit & Compliance service. As of U4 this is
+        # the vault's ONLY audit trail -- the local in-memory
+        # ``vault/audit_log.py`` has been removed (KTD3): it was an
+        # unsynchronized, incomplete duplicate of exactly this stream, not
+        # an intentional fast-path/durable-path split. A NullAuditClient
+        # (no-op) is used when no audit_url is configured, matching every
+        # other rewired service.
         self.audit_client = make_audit_client(audit_url)
         # Shared request-authentication middleware (U15). A pure no-op
         # pass-through while ``require_signatures`` is off, so the default
@@ -73,7 +102,6 @@ class VaultService:
             require_signatures=require_signatures,
             public_key_resolver=public_key_resolver,
         )
-        self.lock = threading.Lock()
 
     # -- keyring -----------------------------------------------------------
 
@@ -94,24 +122,17 @@ class VaultService:
         except UnsupportedKDFError as exc:
             return 422, {"error": str(exc)}
 
-        created_at = datetime.utcnow().isoformat()
-        record = {field: body[field] for field in _KEYRING_FIELDS}
-        record["user_principal_id"] = user_principal_id
-        record["created_at"] = created_at
-        record["updated_at"] = created_at
-
-        with self.lock:
-            self.keyrings[user_principal_id] = record
+        fields = {field: body[field] for field in _KEYRING_FIELDS}
+        record = self.repository.store_keyring(user_principal_id, fields)
 
         return 200, {
-            "user_principal_id": user_principal_id,
-            "created_at": created_at,
+            "user_principal_id": record["user_principal_id"],
+            "created_at": record["created_at"],
         }
 
     def get_keyring(self, user_principal_id):
         # type: (str) -> Tuple[int, dict]
-        with self.lock:
-            record = self.keyrings.get(user_principal_id)
+        record = self.repository.get_keyring(user_principal_id)
         if record is None:
             return 404, {"error": "keyring not found"}
         return 200, dict(record)
@@ -137,24 +158,13 @@ class VaultService:
         except UnsupportedKDFError as exc:
             return 422, {"error": str(exc)}
 
-        with self.lock:
-            record = self.keyrings.get(user_principal_id)
-            if record is None:
-                return 404, {"error": "keyring not found"}
-            for field in _ROTATION_FIELDS:
-                record[field] = body[field]
-            if "encrypted_private_key" in body:
-                record["encrypted_private_key"] = body[
-                    "encrypted_private_key"
-                ]
-            record["updated_at"] = datetime.utcnow().isoformat()
+        fields = {field: body[field] for field in _ROTATION_FIELDS}
+        if "encrypted_private_key" in body:
+            fields["encrypted_private_key"] = body["encrypted_private_key"]
+        record = self.repository.rotate_keyring(user_principal_id, fields)
+        if record is None:
+            return 404, {"error": "keyring not found"}
 
-        self.audit.append(
-            principal_id=user_principal_id,
-            action="keyring_rotated",
-            status="ok",
-            reason=rotation_reason.strip(),
-        )
         self.audit_client.log(
             user_principal_id, "keyring.rotate",
             details={"reason": rotation_reason.strip()},
@@ -178,48 +188,281 @@ class VaultService:
         if signer is not None and signer != body["user_principal_id"]:
             return 403, {"error": "signer does not match credential owner"}
 
-        credential_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().isoformat()
-        record = {
-            "credential_id": credential_id,
-            "name": body["name"],
-            "credential_type": body["credential_type"],
-            "encrypted_data": body["encrypted_data"],
-            "nonce": body["nonce"],
-            "user_principal_id": body["user_principal_id"],
-            "created_at": created_at,
-            "grants": {},  # agent_principal_id -> grant record
-        }
-        with self.lock:
-            self.credentials[credential_id] = record
+        record = self.repository.store_credential(
+            body["user_principal_id"], body["name"], body["credential_type"],
+            body["encrypted_data"], body["nonce"],
+        )
 
         return 200, {
+            "credential_id": record["credential_id"],
+            "created_at": record["created_at"],
+        }
+
+    def store_managed_oauth(self, body, signer=None):
+        # type: (dict, Optional[str]) -> Tuple[int, dict]
+        """Store an already-sealed managed OAuth envelope.
+
+        OAuth ingestion performs KMS ``GenerateDataKey`` + token encryption
+        before this boundary.  Consequently neither this method nor its HTTP
+        response receives or returns plaintext token material.
+        """
+        user_principal_id = body.get("user_principal_id")
+        provider = body.get("provider")
+        granted_scopes = body.get("granted_scopes")
+        envelope = body.get("envelope")
+        if not isinstance(user_principal_id, str) or not user_principal_id:
+            return 422, {"error": "missing or invalid 'user_principal_id'"}
+        if signer is None:
+            return 401, {
+                "error": "authenticated OAuth ingestion identity is required"
+            }
+        if signer != user_principal_id:
+            return 403, {"error": "signer does not match credential owner"}
+        if not isinstance(provider, str) or not provider:
+            return 422, {"error": "missing or invalid 'provider'"}
+        if (
+            not isinstance(granted_scopes, list)
+            or any(not isinstance(scope, str) for scope in granted_scopes)
+        ):
+            return 422, {"error": "invalid 'granted_scopes'"}
+        if not isinstance(envelope, dict):
+            return 422, {"error": "missing or invalid 'envelope'"}
+        try:
+            validate_managed_oauth_envelope(envelope)
+        except ManagedOAuthAuthError:
+            return 422, {"error": "invalid managed OAuth envelope"}
+
+        record = self.repository.store_managed_oauth_credential(
+            user_principal_id, provider, granted_scopes, envelope
+        )
+        self.audit_client.log(
+            user_principal_id,
+            "credential.managed_oauth.store",
+            resource_id=record["credential_id"],
+            details={"provider": provider},
+        )
+        return 200, {
+            "credential_id": record["credential_id"],
+            "custody_mode": "managed_oauth",
+            "provider": provider,
+            "granted_scopes": sorted(set(granted_scopes)),
+            "created_at": record["created_at"],
+        }
+
+    def use_managed_oauth(
+        self, credential_id, service_identity, operation
+    ):
+        """Run ``operation(token_bytes)`` inside the broker boundary.
+
+        There is intentionally no HTTP handler that returns the token.  The
+        only usable API accepts a callback and returns that callback's filtered
+        data/receipt.
+        """
+        if self.managed_oauth_crypto is None:
+            raise ManagedOAuthAccessDenied(
+                "managed OAuth decryption is not configured"
+            )
+        record = self.repository.get_managed_oauth_credential(credential_id)
+        if record is None:
+            raise KeyError("managed OAuth credential not found")
+        if record.get("status", "active") != "active":
+            raise PermissionError("managed OAuth credential is blocked")
+        envelope = record["envelope"]
+        token = self.managed_oauth_crypto.open(
+            envelope,
+            envelope["encryption_context"],
+            caller_identity=service_identity,
+        )
+        try:
+            result = operation(token)
+        finally:
+            del token
+        self.audit_client.log(
+            service_identity,
+            "credential.managed_oauth.use",
+            resource_id=credential_id,
+            details={"provider": record["provider"]},
+        )
+        return result
+
+    def read_rotation_document(self, credential_id, service_identity):
+        if self.managed_oauth_crypto is None:
+            raise ManagedOAuthAccessDenied("managed OAuth decryption is not configured")
+        record = self.repository.get_managed_oauth_credential(credential_id)
+        if record is None:
+            raise KeyError("managed OAuth credential not found")
+        envelope = record["envelope"]
+        plaintext = self.managed_oauth_crypto.open(
+            envelope,
+            envelope["encryption_context"],
+            caller_identity=service_identity,
+        )
+        try:
+            document = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ManagedOAuthAuthError("rotation document is invalid") from exc
+        finally:
+            del plaintext
+        if not isinstance(document, dict):
+            raise ManagedOAuthAuthError("rotation document is invalid")
+        return (
+            int(record.get("credential_version", 1)),
+            record.get("status", "active"),
+            document,
+        )
+
+    def compare_and_swap_rotation_document(
+        self,
+        credential_id,
+        expected_version,
+        document,
+        service_identity,
+    ):
+        if self.managed_oauth_crypto is None:
+            raise ManagedOAuthAccessDenied("managed OAuth encryption is not configured")
+        current = self.repository.get_managed_oauth_credential(credential_id)
+        if current is None or current.get("status") != "active":
+            return False
+        context = dict(current["envelope"]["encryption_context"])
+        context["credential_version"] = str(int(expected_version) + 1)
+        envelope = self.managed_oauth_crypto.seal_rotation_document(
+            document, context, caller_identity=service_identity
+        )
+        updated = self.repository.compare_and_swap_managed_oauth_envelope(
+            credential_id,
+            expected_version,
+            envelope,
+            document.get("granted_scopes", current.get("granted_scopes", [])),
+        )
+        return updated is not None
+
+    def begin_managed_oauth_revocation(
+        self, credential_id, user_principal_id
+    ):
+        record = self.repository.get_managed_oauth_credential(credential_id)
+        if record is None:
+            return 404, {"error": "managed OAuth credential not found"}
+        if record["user_principal_id"] != user_principal_id:
+            return 403, {"error": "only the credential owner can disconnect"}
+        pending = self.repository.mark_managed_oauth_pending_revocation(
+            credential_id, user_principal_id
+        )
+        if pending is None:
+            return 409, {"error": "could not block credential"}
+        self.audit_client.log(
+            user_principal_id,
+            "credential.managed_oauth.pending_revocation",
+            resource_id=credential_id,
+            details={"provider": pending["provider"]},
+        )
+        return 200, {
             "credential_id": credential_id,
-            "created_at": created_at,
+            "status": "pending_revocation",
+        }
+
+    def revoke_managed_oauth(
+        self, credential_id, service_identity, operation
+    ):
+        if self.managed_oauth_crypto is None:
+            raise ManagedOAuthAccessDenied(
+                "managed OAuth decryption is not configured"
+            )
+        record = self.repository.get_managed_oauth_credential(credential_id)
+        if record is None:
+            raise KeyError("managed OAuth credential not found")
+        if record.get("status") != "pending_revocation":
+            raise PermissionError("credential is not pending revocation")
+        envelope = record["envelope"]
+        token = self.managed_oauth_crypto.open(
+            envelope,
+            envelope["encryption_context"],
+            caller_identity=service_identity,
+        )
+        try:
+            return operation(token)
+        finally:
+            del token
+
+    def delete_managed_oauth_credential(
+        self, credential_id, user_principal_id
+    ):
+        deleted = self.repository.delete_managed_oauth_credential(
+            credential_id, user_principal_id
+        )
+        if not deleted:
+            return 403
+        self.audit_client.log(
+            user_principal_id,
+            "credential.managed_oauth.delete",
+            resource_id=credential_id,
+        )
+        return 200
+
+    def rewrap_managed_oauth(
+        self, credential_id, destination_key_id, service_identity
+    ):
+        if self.managed_oauth_crypto is None:
+            raise ManagedOAuthAccessDenied(
+                "managed OAuth decryption is not configured"
+            )
+        record = self.repository.get_managed_oauth_credential(credential_id)
+        if record is None:
+            raise KeyError("managed OAuth credential not found")
+        envelope = record["envelope"]
+        updated = self.managed_oauth_crypto.rewrap(
+            envelope,
+            destination_key_id,
+            envelope["encryption_context"],
+            caller_identity=service_identity,
+        )
+        self.repository.update_managed_oauth_envelope(credential_id, updated)
+        self.audit_client.log(
+            service_identity,
+            "credential.managed_oauth.rewrap",
+            resource_id=credential_id,
+            details={"provider": record["provider"],
+                     "kms_key_id": updated["kms_key_id"]},
+        )
+        return {
+            "credential_id": credential_id,
+            "kms_key_id": updated["kms_key_id"],
+            "kms_key_version": updated["kms_key_version"],
         }
 
     def list_credentials(self, user_principal_id):
         # type: (Optional[str]) -> Tuple[int, dict]
         if not user_principal_id:
             return 422, {"error": "missing 'user_principal_id' query param"}
-        with self.lock:
-            records = [
-                c for c in self.credentials.values()
-                if c["user_principal_id"] == user_principal_id
-            ]
-        records.sort(key=lambda c: c["created_at"])
+        records = self.repository.list_credentials(user_principal_id)
         # Metadata only — never leak ciphertext or nonces in listings.
         credentials = [
-            {
-                "credential_id": c["credential_id"],
-                "name": c["name"],
-                "credential_type": c["credential_type"],
-                "user_principal_id": c["user_principal_id"],
-                "created_at": c["created_at"],
-            }
+            self._credential_metadata(c)
             for c in records
         ]
         return 200, {"credentials": credentials}
+
+    @staticmethod
+    def _credential_metadata(record):
+        metadata = {
+            "credential_id": record["credential_id"],
+            "name": record["name"],
+            "credential_type": record["credential_type"],
+            "user_principal_id": record["user_principal_id"],
+            "created_at": record["created_at"],
+        }
+        if record.get("credential_type") == "managed_oauth":
+            try:
+                payload = json.loads(record["encrypted_data"])
+            except (TypeError, ValueError):
+                payload = {}
+            metadata.update(
+                {
+                    "custody_mode": "managed_oauth",
+                    "provider": payload.get("provider"),
+                    "granted_scopes": payload.get("granted_scopes", []),
+                }
+            )
+        return metadata
 
     # -- grants + access ---------------------------------------------------
 
@@ -241,22 +484,23 @@ class VaultService:
         if signer is not None and signer != granted_by:
             return 403, {"error": "signer does not match 'granted_by'"}
 
-        with self.lock:
-            credential = self.credentials.get(credential_id)
-            if credential is None:
-                return 404, {"error": "credential not found"}
-            if credential["user_principal_id"] != granted_by:
-                return 403, {
-                    "error": "only the credential owner can grant access"
-                }
-            grant_id = str(uuid.uuid4())
-            credential["grants"][agent_principal_id] = {
-                "grant_id": grant_id,
-                "agent_principal_id": agent_principal_id,
-                "scope": scope,
-                "granted_by": granted_by,
-                "granted_at": datetime.utcnow().isoformat(),
+        credential = self.repository.get_credential(credential_id)
+        if credential is None:
+            return 404, {"error": "credential not found"}
+        # Ownership check enforced at the repository layer (SQL WHERE
+        # clause, not a Python dict-field comparison): get_owned_credential
+        # returns None if credential_id belongs to anyone other than
+        # granted_by, so a slip here can't leak a grant onto someone else's
+        # credential even if this comparison were ever removed by mistake.
+        if self.repository.get_owned_credential(
+            credential_id, granted_by
+        ) is None:
+            return 403, {
+                "error": "only the credential owner can grant access"
             }
+        grant = self.repository.add_grant(
+            credential_id, agent_principal_id, scope, granted_by
+        )
 
         self.audit_client.log(
             granted_by, "credential.grant",
@@ -264,7 +508,7 @@ class VaultService:
             details={"agent_principal_id": agent_principal_id,
                      "scope": scope},
         )
-        return 200, {"grant_id": grant_id}
+        return 200, {"grant_id": grant["grant_id"]}
 
     def request_access(self, credential_id, body, signer=None):
         # type: (str, dict, Optional[str]) -> Tuple[int, dict]
@@ -280,33 +524,31 @@ class VaultService:
                 "error": "signer does not match 'agent_principal_id'",
             }
 
-        with self.lock:
-            credential = self.credentials.get(credential_id)
-            if credential is None:
-                return 404, {"error": "credential not found"}
-            grant = credential["grants"].get(agent_principal_id)
-            encrypted_data = credential["encrypted_data"]
-            nonce = credential["nonce"]
+        credential = self.repository.get_credential(credential_id)
+        if credential is None:
+            return 404, {"error": "credential not found"}
+        if credential.get("credential_type") == "managed_oauth":
+            self.audit_client.log(
+                agent_principal_id,
+                "credential.access",
+                resource_id=credential_id,
+                status="denied",
+                details={"custody_mode": "managed_oauth"},
+            )
+            return 403, {"access_granted": False}
+        grant = self.repository.get_active_grant(
+            credential_id, agent_principal_id
+        )
+        encrypted_data = credential["encrypted_data"]
+        nonce = credential["nonce"]
 
         if grant is None:
-            self.audit.append(
-                principal_id=agent_principal_id,
-                credential_id=credential_id,
-                action="access",
-                status="denied",
-            )
             self.audit_client.log(
                 agent_principal_id, "credential.access",
                 resource_id=credential_id, status="denied",
             )
             return 403, {"access_granted": False}
 
-        self.audit.append(
-            principal_id=agent_principal_id,
-            credential_id=credential_id,
-            action="access",
-            status="granted",
-        )
         self.audit_client.log(
             agent_principal_id, "credential.access",
             resource_id=credential_id, status="granted",
@@ -321,18 +563,17 @@ class VaultService:
 
     def revoke_access(self, credential_id, agent_principal_id, signer=None):
         # type: (str, str, Optional[str]) -> Tuple[int, dict]
-        with self.lock:
-            credential = self.credentials.get(credential_id)
-            if credential is None:
-                return 404, {"error": "credential not found"}
-            # Identity binding (flag on): ONLY the credential owner may revoke.
-            # This closes the historical asymmetry with grant_access — flag OFF
-            # (signer is None) preserves the original permissive revoke.
-            if signer is not None and signer != credential["user_principal_id"]:
-                return 403, {
-                    "error": "only the credential owner can revoke access"
-                }
-            grant = credential["grants"].pop(agent_principal_id, None)
+        credential = self.repository.get_credential(credential_id)
+        if credential is None:
+            return 404, {"error": "credential not found"}
+        # Identity binding (flag on): ONLY the credential owner may revoke.
+        # This closes the historical asymmetry with grant_access — flag OFF
+        # (signer is None) preserves the original permissive revoke.
+        if signer is not None and signer != credential["user_principal_id"]:
+            return 403, {
+                "error": "only the credential owner can revoke access"
+            }
+        grant = self.repository.revoke_grant(credential_id, agent_principal_id)
         if grant is None:
             return 404, {"error": "grant not found"}
         self.audit_client.log(
@@ -350,9 +591,28 @@ class VaultService:
 
     def query_audit(self, principal_id):
         # type: (Optional[str]) -> Tuple[int, dict]
+        """Proxy to the central Audit & Compliance service (unit U4) --
+        there is no local audit list anymore (KTD3). Returns the CENTRAL
+        store's entry shape directly (``activity_type``,
+        ``resource_type``/``resource_id``, newest first) -- see the module
+        docstring for why this handler deliberately does not translate that
+        back into the old local shape.
+
+        Without an ``audit_url`` configured, ``self.audit_client`` is a
+        ``NullAuditClient`` and this always returns an empty result --
+        there is nowhere to read from, matching that client's contract
+        everywhere else in the codebase.
+        """
         if not principal_id:
             return 422, {"error": "missing 'principal_id' query param"}
-        return 200, {"entries": self.audit.query(principal_id)}
+        try:
+            body = self.audit_client.query(principal_id=principal_id)
+        except Exception:
+            # The central service is a real dependency for reads (unlike the
+            # best-effort write path) but a caller of THIS vault endpoint
+            # should still get a clean error, not a crashed connection.
+            return 502, {"error": "central audit service unavailable"}
+        return 200, body
 
 
 class VaultHTTPServer(ThreadingHTTPServer):
@@ -431,6 +691,25 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return None, True
         return principal_id, False
 
+    def _bind_org_context(self):
+        # type: () -> None
+        """Bind this request's RLS org-context (U9) before any repository
+        call runs, via an optional ``X-Organization-Id`` header (vault
+        requests carry no organization concept in their existing body/query
+        shape, R10). Unconditional -- even when the header is absent -- so a
+        keep-alive connection reusing this thread never inherits a prior
+        request's value.
+
+        NOTE: ``vault.keyrings``/``vault.credentials``/``vault.
+        credential_grants`` themselves have NO RLS policy as of this unit
+        (see migrations/0009_rls_policies.sql's header -- no
+        organization_id column exists, an open decision carried forward
+        unchanged from U3's own report). This call is still made, for
+        consistency with every other service and so the plumbing is already
+        in place the day vault tables DO grow tenant scoping.
+        """
+        bind_organization_id(self.headers.get("X-Organization-Id"))
+
     def do_OPTIONS(self):
         # type: () -> None
         """Handle CORS preflight requests."""
@@ -444,6 +723,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         query = parse_qs(parts.query)
@@ -468,6 +748,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         raw, body, error = self._read_json_body()
@@ -481,6 +762,13 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if segments == ["keyring"]:
             # POST /keyring
             status, response = self.service.store_keyring(body, signer=signer)
+            self._send_json(status, response)
+        elif segments == ["credentials", "managed-oauth"]:
+            # Ciphertext envelope ingestion only; plaintext tokens are never
+            # accepted by or returned from this handler.
+            status, response = self.service.store_managed_oauth(
+                body, signer=signer
+            )
             self._send_json(status, response)
         elif segments == ["credentials"]:
             # POST /credentials
@@ -512,6 +800,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_PUT(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         raw, body, error = self._read_json_body()
@@ -532,6 +821,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         signer, handled = self._authenticate(b"")
@@ -554,20 +844,30 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 def make_server(port=8003, host="127.0.0.1", audit_url=None,
                 registry_url=None, require_signatures=False,
-                public_key_resolver=None):
-    # type: (int, str, Optional[str], Optional[str], bool, Optional[object]) -> VaultHTTPServer
+                public_key_resolver=None, db=None, repository=None,
+                managed_oauth_crypto=None):
+    # type: (int, str, Optional[str], Optional[str], bool, Optional[object], Optional[Database], Optional[VaultRepository], Optional[object]) -> VaultHTTPServer
     """Build the vault server.
 
     ``require_signatures`` opts the vault into signed-request enforcement
     (U15/U17); when off (default) the vault behaves exactly as before. The
     optional ``public_key_resolver`` lets tests supply principal public keys
-    without a live Registry.
+    without a live Registry. ``db``/``repository`` (unit U3) let a caller
+    point the vault's Postgres-backed storage at a specific
+    ``libs.db.Database``/``vault.repository.VaultRepository`` -- e.g. tests
+    simulating a process restart by building two independent servers against
+    the same underlying database. Both default to ``None``, which reads
+    ``DATABASE_URL`` exactly like every other service (no change for
+    existing callers).
     """
     service = VaultService(
         audit_url=audit_url,
         registry_url=registry_url,
         require_signatures=require_signatures,
         public_key_resolver=public_key_resolver,
+        db=db,
+        repository=repository,
+        managed_oauth_crypto=managed_oauth_crypto,
     )
     return VaultHTTPServer((host, port), service)
 

@@ -16,7 +16,7 @@ any registry (or several) that speaks this contract.
   "api_key": ...}``. Requires a valid invite/API key issued by *this*
   registry (anti-Sybil friction, KTD8): 403 without one. The Agent Card must
   declare the AgentTrust extension (uri
-  ``https://agenttrust.example/extensions/trust/v1`` in
+  ``https://treessera.com/extensions/trust/v1`` in
   ``capabilities.extensions[]``): 422 otherwise. Each ``skills[].id`` on the
   card is indexed as a capability id.
 - ``POST /admin/api-keys`` — mints and returns ``{"api_key": ...}``. This is
@@ -46,7 +46,10 @@ any registry (or several) that speaks this contract.
   reputation flows through the SAME mechanism as users:
   ``POST /users/{principal_id}/reputation`` accepts agent principals.
 - ``GET /agents?capability=<id>`` — agent Principals declaring that
-  capability, ``{"agents": [...]}`` (empty list if none).
+  capability, ``{"agents": [...]}`` (empty list if none). Without a
+  ``capability`` param it returns the FULL agent directory as
+  ``{"agents": [{agent, reputation}]}`` (U5), for a console listing view
+  rather than a capability search.
 - ``POST /apps/register`` — body ``{app_id, app_endpoint, p2p_endpoint,
   capabilities}`` → ``{"app": ..., "ecosystem_apps": [...]}`` (U6,
   RFC-0003; U9, RFC-0004). Duplicate ``app_id`` re-registers (apps restart
@@ -97,7 +100,7 @@ Two mutually exclusive read paths, both implemented:
 With neither configured, all reputation is neutral.
 
 Run: ``python -m registry.app --port 8090 [--verification-url URL]
-[--api-keys-file PATH] [--index-path PATH]``
+[--api-keys-file PATH]``
 """
 
 import argparse
@@ -109,13 +112,13 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from libs.audit_client import make_audit_client
+from libs.config import TRUST_EXTENSION_URI
+from libs.db import bind_organization_id
 from libs.request_auth import RequestAuthenticator
 from registry.agent_index import AgentIndex
 from registry.app_registry import SERVICE_TYPES, AppRegistry
 from registry.index_store import IndexStore, card_capability_ids
 from registry.user_index import UserIndex
-
-TRUST_EXTENSION_URI = "https://agenttrust.example/extensions/trust/v1"
 
 DEFAULT_HTTP_TIMEOUT = 3.0
 
@@ -364,6 +367,32 @@ class RegistryService(object):
             return 400, {"error": "missing 'capability' parameter"}
         agents = self.agent_index.find_by_capability(capability_id)
         return 200, {"capability": capability_id, "agents": agents}
+
+    def list_all_agents(self):
+        # type: () -> Tuple[int, dict]
+        """Every registered agent Principal, each with its aggregated
+        reputation slice ``{tasks_verified, tasks_rejected,
+        verification_rate}`` (``verification_rate`` is null with no history).
+        Backs the console's agents listing (a directory view, not a
+        capability search)."""
+        agents = []
+        for agent in self.agent_index.all_agents():
+            agents.append(
+                {
+                    "agent": agent,
+                    "reputation": self.user_index.get_aggregated_reputation(
+                        agent["principal_id"]
+                    ),
+                }
+            )
+        return 200, {"agents": agents}
+
+    def list_capabilities(self):
+        # type: () -> Tuple[int, dict]
+        """The capability catalog enriched with card-derived context — what
+        each capability IS (name/description/tags from the registering cards)
+        and who offers it. This is the orchestrator's discovery vocabulary."""
+        return 200, {"capabilities": self.index.list_capabilities()}
 
     # -- app registration & P2P permissions (U6, RFC-0003) ---------------------
 
@@ -780,6 +809,23 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return parts[1].strip()
         return None
 
+    def _bind_org_context(self):
+        # type: () -> None
+        """Bind this request's RLS org-context (U9) before any repository
+        call runs. Registry requests carry no first-class organization
+        concept in their body/query shape today (R10 -- unchanged HTTP
+        contract), so the ONLY source for it is an optional
+        ``X-Organization-Id`` header; a caller that omits it (the common
+        case today, including every existing test) is treated as having no
+        org context at all, which -- combined with migrations/
+        0009_rls_policies.sql's NULL-permissive policy -- means it sees
+        exactly what it always saw. This call is unconditional (never
+        skipped, even when the header is absent) so a keep-alive connection
+        reusing this thread can't inherit a stale value from a prior
+        request.
+        """
+        bind_organization_id(self.headers.get("X-Organization-Id"))
+
     def _rate_ok(self):
         # type: () -> bool
         limiter = getattr(self.server, "rate_limiter", None)
@@ -833,6 +879,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
+        self._bind_org_context()
         if not self._rate_ok():
             return
         parts = urlsplit(self.path)
@@ -866,12 +913,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
             # GET /agents?capability=<id> — agent principals by capability
             query = parse_qs(parts.query)
             capability = query.get("capability", [None])[0]
-            if not capability:
-                self._send_json(
-                    400, {"error": "missing 'capability' query parameter"}
-                )
-                return
-            status, body = self.service.list_agents(capability)
+            if capability:
+                status, body = self.service.list_agents(capability)
+            else:
+                # GET /agents (no capability) — full agent directory (U5)
+                status, body = self.service.list_all_agents()
+            self._send_json(status, body)
+        elif segments == ["capabilities"]:
+            # GET /capabilities — the enriched capability catalog (card-derived
+            # names/descriptions/tags + declaring agents)
+            status, body = self.service.list_capabilities()
             self._send_json(status, body)
         elif len(segments) == 2 and segments[0] == "agents":
             status, body = self.service.get_agent(segments[1])
@@ -911,6 +962,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._bind_org_context()
         if not self._rate_ok():
             return
         parts = urlsplit(self.path)
@@ -1034,11 +1086,6 @@ def main(argv=None):
         help="Optional JSON file (array of strings) seeding valid API keys.",
     )
     parser.add_argument(
-        "--index-path",
-        default=None,
-        help="Optional JSON file for persisting registrations.",
-    )
-    parser.add_argument(
         "--admin-token",
         default=None,
         help="If set, POST /admin/api-keys requires this bearer token. "
@@ -1049,11 +1096,6 @@ def main(argv=None):
         type=int,
         default=0,
         help="Max requests per IP per 60s window (0 = off).",
-    )
-    parser.add_argument(
-        "--user-index-path",
-        default=None,
-        help="Optional JSON file for persisting user principals and reputation records.",
     )
     parser.add_argument(
         "--audit-url",
@@ -1069,8 +1111,8 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    index = IndexStore(path=args.index_path, api_keys_path=args.api_keys_file)
-    user_index = UserIndex(path=args.user_index_path)
+    index = IndexStore(api_keys_path=args.api_keys_file)
+    user_index = UserIndex()
     service = RegistryService(
         index,
         verification_url=args.verification_url,

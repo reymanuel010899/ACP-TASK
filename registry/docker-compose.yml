@@ -1,5 +1,11 @@
 version: '3.8'
 
+# Unit U10: the registry persists unconditionally through Postgres now (see
+# ../infra/docker-compose.yml, ../infra/roles.sql, ../tools/migrate.py) --
+# there is no JSON-file volume to mount anymore. Bring up
+# ../infra/docker-compose.yml first (or point DATABASE_URL/REDIS_URL at any
+# reachable Postgres 16 + Redis 7), then this service.
+
 services:
   registry:
     build:
@@ -11,9 +17,10 @@ services:
     environment:
       REGISTRY_HOST: 0.0.0.0
       REGISTRY_PORT: 8090
-    volumes:
-      # Optional: persist registrations to JSON file
-      - registry_data:/data
+      # Point these at the Postgres/Redis brought up by
+      # ../infra/docker-compose.yml (adjust host/credentials for your setup).
+      DATABASE_URL: postgresql://registry_svc:registry_svc_dev_password@host.docker.internal:5432/agenttrust
+      REDIS_URL: redis://host.docker.internal:6379/0
     # Restart policy for production
     restart: unless-stopped
     # Health check status visible to Docker
@@ -23,7 +30,3 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
-
-volumes:
-  registry_data:
-    driver: local

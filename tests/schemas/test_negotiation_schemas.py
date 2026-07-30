@@ -55,10 +55,10 @@ def test_schema_is_valid_draft7(name):
 @pytest.mark.parametrize(
     "name,expected_id",
     [
-        ("offer", "https://agenttrust.example/schemas/offer.schema.json"),
+        ("offer", "https://treessera.com/schemas/offer.schema.json"),
         (
             "counter-offer",
-            "https://agenttrust.example/schemas/counter-offer.schema.json",
+            "https://treessera.com/schemas/counter-offer.schema.json",
         ),
     ],
 )
