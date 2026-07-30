@@ -57,6 +57,7 @@ class WorkflowRepository(object):
                 capability_version TEXT NOT NULL,
                 connection_id TEXT,
                 descriptor_snapshot_hash TEXT NOT NULL,
+                credential_version INTEGER NOT NULL DEFAULT 0,
                 input_hash TEXT NOT NULL,
                 input_json TEXT NOT NULL DEFAULT '{}',
                 output_json TEXT,
@@ -164,6 +165,7 @@ class WorkflowRepository(object):
         self._ensure_step_column("output_json", "TEXT")
         self._ensure_step_column("retry_at", "INTEGER")
         self._ensure_step_column("content_expires_at", "INTEGER")
+        self._ensure_step_column("credential_version", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_table_column("workflow_approvals", "expires_at", "INTEGER")
         self._ensure_table_column(
             "workflow_approvals", "authorization_mode",
@@ -318,7 +320,15 @@ class WorkflowRepository(object):
                 number = row["number"] + 1
                 self._connection.execute(
                     "UPDATE workflow_revisions SET status = 'superseded' "
-                    "WHERE workflow_run_id = ? AND status IN ('draft', 'awaiting_approval')",
+                    "WHERE workflow_run_id = ? AND status IN "
+                    "('draft', 'awaiting_approval', 'approved', 'authorized')",
+                    (workflow_run_id,),
+                )
+                self._connection.execute(
+                    "UPDATE workflow_steps SET execution_status = 'cancelled', "
+                    "terminal_reason = 'superseded by a new revision' "
+                    "WHERE workflow_run_id = ? AND execution_status IN "
+                    "('queued', 'paused_by_policy')",
                     (workflow_run_id,),
                 )
                 self._connection.execute(
@@ -335,14 +345,15 @@ class WorkflowRepository(object):
                             workflow_revision_id, step_id, workflow_run_id,
                             tenant_id, capability_id, capability_version,
                             connection_id, descriptor_snapshot_hash, input_hash,
-                            input_json, depends_on_json, effect, verification_status,
+                            credential_version, input_json, depends_on_json, effect, verification_status,
                             content_expires_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             revision_id, step["step_id"], workflow_run_id,
                             tenant_id, step["capability_id"],
                             step["capability_version"], step.get("connection_id"),
                             step["descriptor_snapshot_hash"], step["input_hash"],
+                            int(step.get("credential_version") or 0),
                             self._encode_content(
                                 step.get("input", {}), tenant_id, revision_id,
                                 step["step_id"], "input",
@@ -838,6 +849,30 @@ class WorkflowRepository(object):
             )
         return cursor.rowcount == 1
 
+    def retry_safe_write(self, revision_id, step_id, tenant_id, attempt):
+        """A write is retryable only after reconciliation moved it to queued."""
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT execution_status FROM workflow_steps
+                   WHERE workflow_revision_id = ? AND step_id = ?
+                     AND tenant_id = ? AND attempt = ? AND effect = 'write'""",
+                (revision_id, step_id, tenant_id, int(attempt)),
+            ).fetchone()
+        return bool(row is not None and row["execution_status"] == "queued")
+
+    def retry_corrected_write(self, revision_id, step_id, tenant_id):
+        """Retry only a write proven to have failed before broker dispatch."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE workflow_steps SET execution_status = 'queued',
+                          terminal_reason = NULL, claimed_by = NULL, claimed_at = NULL
+                   WHERE workflow_revision_id = ? AND step_id = ? AND tenant_id = ?
+                     AND effect = 'write' AND execution_status = 'paused_by_policy'
+                     AND terminal_reason LIKE 'missing_scope:%'""",
+                (revision_id, step_id, tenant_id),
+            )
+        return cursor.rowcount == 1
+
     @staticmethod
     def recovery_options(revision):
         steps = revision.get("steps", []) if isinstance(revision, dict) else []
@@ -855,6 +890,12 @@ class WorkflowRepository(object):
             "unknownStepIds": [
                 step["step_id"] for step in steps
                 if step.get("execution_status") == "execution_unknown"
+            ],
+            "scopeUpgradeStepIds": [
+                step["step_id"] for step in steps
+                if step.get("effect") == "write"
+                and step.get("execution_status") == "paused_by_policy"
+                and str(step.get("terminal_reason") or "").startswith("missing_scope:")
             ],
         }
 

@@ -3,7 +3,9 @@
 import time
 
 from agents.orchestrator.action_repository import canonical_payload_hash
-from agents.orchestrator.workflow_executor import AmbiguousStepError, RetryableStepError
+from agents.orchestrator.workflow_executor import (
+    AmbiguousStepError, CorrectableStepError, RetryableStepError,
+)
 
 
 def _matches_approved_template(template, resolved):
@@ -48,6 +50,16 @@ class WorkflowBrokerDispatcher:
         )
         if not connection or connection.get("status") != "connected":
             raise RetryableStepError("connection is unavailable")
+        approved_credential_version = int(step.get("credential_version") or 0)
+        if approved_credential_version and int(
+            connection.get("credential_version") or 0
+        ) != approved_credential_version:
+            raise PermissionError("credential version changed; replan required")
+        if (
+            "enabled_capabilities" in connection
+            and step["capability_id"] not in set(connection.get("enabled_capabilities") or ())
+        ):
+            raise CorrectableStepError("missing_scope:reconnect_installation")
         now = int(self.clock())
         authorized = self.workflows.is_step_authorized(
             step["workflow_run_id"], claim["workflow_revision_id"],

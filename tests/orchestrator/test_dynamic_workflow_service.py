@@ -1,3 +1,5 @@
+import pytest
+
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.planner import descriptor_hash
@@ -89,3 +91,87 @@ def test_completed_read_presentation_is_generated_once_across_polls(tmp_path):
     )
     assert first == second
     assert presenter.calls == 1
+
+
+def test_changed_slack_draft_invalidates_prior_approval(tmp_path):
+    from agents.orchestrator.conversation_state import ConciergeConversationStore
+    from libs.integrations.catalog import slack_definitions
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{
+                "connection_id": "conn:s", "team_name": "Acme", "status": "connected",
+                "credential_version": 3, "granted_scopes": ["chat:write"],
+                "enabled_capabilities": ["slack.message.send"],
+            }]
+    repository = WorkflowRepository(str(tmp_path / "w.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    store.create("org:1", "user:1", "conversation:1")
+    store.update("conversation:1", "org:1", "user:1",
+                 active_connection={"id": "conn:s", "label": "Acme"},
+                 active_channel={"id": "C1", "name": "general"})
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    first = service.materialize_slack_write(
+        "conversation:1", "org:1", "user:1", "slack.message.send", "Hola"
+    )
+    service.approve_slack_draft(
+        "conversation:1", "org:1", "user:1", first["draft_hash"]
+    )
+    second = service.materialize_slack_write(
+        "conversation:1", "org:1", "user:1", "slack.message.send", "Hola equipo"
+    )
+    with pytest.raises(ValueError, match="draft binding changed"):
+        service.approve_slack_draft(
+            "conversation:1", "org:1", "user:1", first["draft_hash"]
+        )
+    assert not repository.is_revision_approved(
+        second["workflow_run_id"], second["workflow_revision_id"],
+        "org:1", second["plan_graph_hash"], 10,
+    )
+    store.update("conversation:1", "org:1", "user:1",
+                 active_channel={"id": "C2", "name": "other"})
+    with pytest.raises(ValueError, match="draft binding changed"):
+        service.approve_slack_draft(
+            "conversation:1", "org:1", "user:1", second["draft_hash"]
+        )
+
+
+def test_thread_and_dm_drafts_materialize_exact_targets_and_localized_success(tmp_path):
+    from agents.orchestrator.conversation_state import ConciergeConversationStore
+    from libs.integrations.catalog import slack_definitions
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "team_name": "Acme", "status": "connected",
+                     "credential_version": 1, "granted_scopes": ["chat:write", "im:write"],
+                     "enabled_capabilities": ["slack.thread.reply", "slack.direct_message.send"]}]
+    repository = WorkflowRepository(str(tmp_path / "w.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    store.create("org:1", "user:1", "conversation:1")
+    store.update("conversation:1", "org:1", "user:1",
+                 active_connection={"id": "conn:s", "label": "Acme"},
+                 active_channel={"id": "C1", "name": "general"},
+                 active_thread={"channel_id": "C1", "thread_ts": "1.0"})
+    service = DynamicWorkflowService(object(), slack_definitions(), Connections(), repository,
+                                     conversation_store=store, clock=lambda: 10)
+    reply = service.materialize_slack_write(
+        "conversation:1", "org:1", "user:1", "slack.thread.reply", "De acuerdo"
+    )
+    step = repository.get_revision(reply["workflow_run_id"], reply["workflow_revision_id"], "org:1")["steps"][0]
+    assert step["input"] == {"channel_id": "C1", "thread_ts": "1.0", "text": "De acuerdo"}
+
+    store.update("conversation:1", "org:1", "user:1",
+                 active_person={"id": "U1", "display_name": "María"})
+    dm = service.materialize_slack_write(
+        "conversation:1", "org:1", "user:1", "slack.direct_message.send", "Hola"
+    )
+    step = repository.get_revision(dm["workflow_run_id"], dm["workflow_revision_id"], "org:1")["steps"][0]
+    assert step["input"] == {"user_id": "U1", "text": "Hola"}
+    assert dm["destination_label"] == "María"
+    assert service.complete_slack_write(
+        "conversation:1", "org:1", "user:1", "es"
+    )["answer"] == "Mensaje enviado"
+    state = store.get("conversation:1", "org:1", "user:1")
+    assert state.get("pending_draft") is None
+    assert state["status"] == "succeeded"

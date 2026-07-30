@@ -13,6 +13,10 @@ class AmbiguousStepError(Exception):
     pass
 
 
+class CorrectableStepError(Exception):
+    pass
+
+
 class WorkflowExecutor:
     def __init__(self, repository, dispatcher, policy=None, clock=None, lease_ttl=60):
         self.repository = repository
@@ -85,6 +89,15 @@ class WorkflowExecutor:
             self.repository.pause_by_policy(revision_id, step["step_id"], tenant_id, str(exc))
             self.repository.finish_claim_lease(claim, tenant_id, int(self.clock()), consumed=False)
             return {"status": "blocked_connection", "step_id": step["step_id"]}
+        except CorrectableStepError as exc:
+            self.repository.pause_by_policy(
+                revision_id, step["step_id"], tenant_id, str(exc)
+            )
+            self.repository.finish_claim_lease(
+                claim, tenant_id, int(self.clock()), consumed=False
+            )
+            return {"status": "retryable_failure", "step_id": step["step_id"],
+                    "recovery": str(exc)}
         except Exception as exc:
             self.repository.mark_execution_unknown(
                 revision_id, step["step_id"], tenant_id,

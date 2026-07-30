@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 
-from agents.orchestrator.planner import DynamicPlanner, PlanCompiler
+from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
 from agents.orchestrator.slack_conversation import SlackConversationCoordinator
 from libs.integrations.catalog import ConnectionCapabilitySnapshot
 
@@ -190,3 +190,148 @@ class DynamicWorkflowService:
             conversation_id, tenant_id, principal_id, presentation
         )
         return stored["presentation"]
+
+    def materialize_slack_write(
+        self, conversation_id, tenant_id, principal_id, capability_id, text,
+    ):
+        if capability_id not in {
+            "slack.message.send", "slack.thread.reply", "slack.direct_message.send"
+        }:
+            raise ValueError("unsupported Slack write capability")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("exact message text is required")
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        if conversation is None:
+            raise KeyError("conversation unavailable")
+        connection_ref = conversation.get("active_connection") or {}
+        connection = next((item for item in self._tenant_installations(
+            tenant_id, principal_id
+        ) if item.get("connection_id") == connection_ref.get("id")), None)
+        if connection is None or connection.get("status") != "connected":
+            raise ValueError("Slack connection is unavailable")
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if definition is None or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(set(
+            connection.get("granted_scopes") or ()
+        )):
+            raise PermissionError("missing_scope:%s" % (
+                sorted(definition.required_scopes)[0] if definition else "unknown"
+            ))
+        payload = {"text": text}
+        label = None
+        entity_version = None
+        if capability_id == "slack.message.send":
+            target = conversation.get("active_channel") or {}
+            payload["channel_id"] = target.get("id")
+            label = "#%s" % target.get("name") if target.get("name") else None
+            entity_version = _hash(target)
+        elif capability_id == "slack.thread.reply":
+            thread = conversation.get("active_thread") or {}
+            channel = conversation.get("active_channel") or {}
+            payload.update(channel_id=thread.get("channel_id") or channel.get("id"),
+                           thread_ts=thread.get("thread_ts"))
+            label = "#%s thread" % channel.get("name") if channel.get("name") else "Slack thread"
+            entity_version = _hash({"channel": channel, "thread": thread})
+        else:
+            target = conversation.get("active_person") or {}
+            payload["user_id"] = target.get("id")
+            label = target.get("display_name") or target.get("real_name") or target.get("handle")
+            entity_version = _hash(target)
+        if any(not isinstance(value, str) or not value for value in payload.values()):
+            raise ValueError("Slack write target is unresolved")
+        now = int(self.clock())
+        run_id = conversation.get("workflow_run_id")
+        run = self.workflows.get_run(run_id, tenant_id) if run_id else None
+        if run is None:
+            run = self.workflows.create_run(tenant_id, principal_id, _hash("slack-write"), now)
+        step = {
+            "step_id": "slack-write", "capability_id": capability_id,
+            "capability_version": definition.version,
+            "connection_id": connection["connection_id"],
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload), "depends_on": [],
+            "effect": "write",
+        }
+        binding = {
+            "connection_id": connection["connection_id"],
+            "credential_version": int(connection.get("credential_version") or 0),
+            "entity_version": entity_version, "destination_label": label,
+            "payload_hash": _hash(payload), "capability_id": capability_id,
+        }
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step], "binding": binding})
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, [step], now
+        )
+        draft = {
+            **binding, "workflow_run_id": run["workflow_run_id"],
+            "workflow_revision_id": revision["workflow_revision_id"],
+            "plan_graph_hash": graph_hash, "text": text,
+        }
+        draft["draft_hash"] = _hash(draft)
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="awaiting_approval", pending_draft=draft,
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return dict(draft)
+
+    def approve_slack_draft(
+        self, conversation_id, tenant_id, principal_id, draft_hash,
+    ):
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        draft = (conversation or {}).get("pending_draft") or {}
+        if not draft or draft.get("draft_hash") != draft_hash:
+            raise ValueError("draft binding changed")
+        capability_id = draft.get("capability_id")
+        if capability_id == "slack.message.send":
+            current_entity_version = _hash(conversation.get("active_channel") or {})
+        elif capability_id == "slack.thread.reply":
+            current_entity_version = _hash({
+                "channel": conversation.get("active_channel") or {},
+                "thread": conversation.get("active_thread") or {},
+            })
+        else:
+            current_entity_version = _hash(conversation.get("active_person") or {})
+        if current_entity_version != draft.get("entity_version"):
+            raise ValueError("draft binding changed")
+        connection = next((item for item in self._tenant_installations(
+            tenant_id, principal_id
+        ) if item.get("connection_id") == draft.get("connection_id")), None)
+        if (
+            connection is None or connection.get("status") != "connected"
+            or int(connection.get("credential_version") or 0) != draft.get("credential_version")
+        ):
+            raise ValueError("draft binding changed")
+        self.workflows.record_approval(
+            draft["workflow_run_id"], draft["workflow_revision_id"], tenant_id,
+            draft["plan_graph_hash"], principal_id, int(self.clock()),
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id, status="executing"
+        )
+        return dict(draft)
+
+    def complete_slack_write(
+        self, conversation_id, tenant_id, principal_id, locale="es"
+    ):
+        presentation = {
+            "locale": locale,
+            "answer": "Mensaje enviado" if locale == "es" else "Message sent",
+            "citations": [], "partial": False,
+        }
+        self.conversation_store.present(
+            conversation_id, tenant_id, principal_id, presentation
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="succeeded", pending_draft=None,
+        )
+        return presentation
