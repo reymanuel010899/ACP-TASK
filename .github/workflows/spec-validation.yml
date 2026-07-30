@@ -16,12 +16,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
       - name: Cache pip packages
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -34,10 +34,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Validate RFC-0001 spec
-        run: pytest tests/spec/test_rfc0001_spec.py -v
+        run: pytest tests/schemas/test_core_schemas.py -v
 
       - name: Validate RFC-0002 binding
-        run: pytest tests/spec/test_rfc0002_binding.py -v
+        run: pytest tests/spec/test_a2a_extension_binding.py -v
 
       - name: Validate JSON schemas
         run: pytest tests/schemas/test_*.py -v
