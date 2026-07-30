@@ -82,6 +82,7 @@ class WorkflowRepository(object):
                 approved_by TEXT NOT NULL,
                 approved_at INTEGER NOT NULL,
                 expires_at INTEGER,
+                authorization_mode TEXT NOT NULL DEFAULT 'explicit_write',
                 FOREIGN KEY(workflow_run_id, workflow_revision_id, tenant_id)
                     REFERENCES workflow_revisions(workflow_run_id, workflow_revision_id, tenant_id)
             );
@@ -164,6 +165,10 @@ class WorkflowRepository(object):
         self._ensure_step_column("retry_at", "INTEGER")
         self._ensure_step_column("content_expires_at", "INTEGER")
         self._ensure_table_column("workflow_approvals", "expires_at", "INTEGER")
+        self._ensure_table_column(
+            "workflow_approvals", "authorization_mode",
+            "TEXT NOT NULL DEFAULT 'explicit_write'",
+        )
 
     def _ensure_step_column(self, name, declaration):
         self._ensure_table_column("workflow_steps", name, declaration)
@@ -412,6 +417,66 @@ class WorkflowRepository(object):
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_runnable_revisions(self, limit=100):
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT r.workflow_run_id, r.workflow_revision_id, r.tenant_id,
+                          a.authorization_mode
+                   FROM workflow_revisions r
+                   JOIN workflow_approvals a
+                     ON a.workflow_revision_id = r.workflow_revision_id
+                    AND a.workflow_run_id = r.workflow_run_id
+                    AND a.tenant_id = r.tenant_id
+                   WHERE r.status IN ('approved', 'authorized')
+                     AND EXISTS (
+                       SELECT 1 FROM workflow_steps s
+                       WHERE s.workflow_revision_id = r.workflow_revision_id
+                         AND s.execution_status = 'queued'
+                     ) ORDER BY r.created_at, r.workflow_revision_id LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def authorize_requested_read(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash,
+        requested_by, now_ts, ttl_seconds=900,
+    ):
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                effects = self._connection.execute(
+                    "SELECT DISTINCT effect FROM workflow_steps "
+                    "WHERE workflow_run_id = ? AND workflow_revision_id = ? "
+                    "AND tenant_id = ?",
+                    (workflow_run_id, revision_id, tenant_id),
+                ).fetchall()
+                if not effects or any(row["effect"] != "read" for row in effects):
+                    raise ValueError("requested_read authorization requires a read-only revision")
+                cursor = self._connection.execute(
+                    """INSERT INTO workflow_approvals(
+                        workflow_revision_id, workflow_run_id, tenant_id,
+                        plan_graph_hash, approved_by, approved_at, expires_at,
+                        authorization_mode
+                    ) SELECT workflow_revision_id, workflow_run_id, tenant_id,
+                             plan_graph_hash, ?, ?, ?, 'requested_read'
+                      FROM workflow_revisions
+                      WHERE workflow_revision_id = ? AND workflow_run_id = ?
+                        AND tenant_id = ? AND plan_graph_hash = ? AND status = 'draft'""",
+                    (requested_by, int(now_ts), int(now_ts) + int(ttl_seconds),
+                     revision_id, workflow_run_id, tenant_id, graph_hash),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("revision authorization binding changed")
+                self._connection.execute(
+                    "UPDATE workflow_revisions SET status = 'authorized' "
+                    "WHERE workflow_revision_id = ?", (revision_id,),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return True
+
     def record_approval(
         self, workflow_run_id, revision_id, tenant_id, graph_hash,
         approved_by, now_ts, ttl_seconds=900
@@ -422,9 +487,10 @@ class WorkflowRepository(object):
                 cursor = self._connection.execute(
                     """INSERT INTO workflow_approvals(
                         workflow_revision_id, workflow_run_id, tenant_id,
-                        plan_graph_hash, approved_by, approved_at, expires_at
+                        plan_graph_hash, approved_by, approved_at, expires_at,
+                        authorization_mode
                     ) SELECT workflow_revision_id, workflow_run_id, tenant_id,
-                             plan_graph_hash, ?, ?, ?
+                             plan_graph_hash, ?, ?, ?, 'explicit_write'
                       FROM workflow_revisions
                       WHERE workflow_revision_id = ? AND workflow_run_id = ?
                         AND tenant_id = ? AND plan_graph_hash = ? AND status = 'draft'
@@ -451,12 +517,41 @@ class WorkflowRepository(object):
             row = self._connection.execute(
                 """SELECT expires_at FROM workflow_approvals
                    WHERE workflow_run_id = ? AND workflow_revision_id = ?
-                     AND tenant_id = ? AND plan_graph_hash = ?""",
+                     AND tenant_id = ? AND plan_graph_hash = ?
+                     AND authorization_mode = 'explicit_write'""",
                 (workflow_run_id, revision_id, tenant_id, graph_hash),
             ).fetchone()
         return bool(
             row is not None
             and (now_ts is None or row["expires_at"] is None or row["expires_at"] >= int(now_ts))
+        )
+
+    def revision_authorization_mode(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, now_ts=None
+    ):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT authorization_mode, expires_at FROM workflow_approvals
+                   WHERE workflow_run_id = ? AND workflow_revision_id = ?
+                     AND tenant_id = ? AND plan_graph_hash = ?""",
+                (workflow_run_id, revision_id, tenant_id, graph_hash),
+            ).fetchone()
+        if row is None or (
+            now_ts is not None and row["expires_at"] is not None
+            and row["expires_at"] < int(now_ts)
+        ):
+            return None
+        return row["authorization_mode"]
+
+    def is_step_authorized(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, effect,
+        now_ts=None,
+    ):
+        mode = self.revision_authorization_mode(
+            workflow_run_id, revision_id, tenant_id, graph_hash, now_ts
+        )
+        return mode == "explicit_write" or (
+            mode == "requested_read" and effect == "read"
         )
 
     def finish_claim_lease(self, claim, tenant_id, now_ts, consumed):

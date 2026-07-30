@@ -1,3 +1,5 @@
+import pytest
+
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.workflow_broker_dispatcher import (
     WorkflowBrokerDispatcher,
@@ -107,6 +109,43 @@ def test_read_binding_matches_its_workflow_capability_lease(tmp_path):
     )(step, claim)
 
     assert result["output"] == {"channels": []}
+
+
+def test_rate_limited_read_is_retryable_with_provider_delay(tmp_path):
+    workflows = WorkflowRepository(str(tmp_path / "w.db"))
+    actions = ActionRepository(str(tmp_path / "a.db"))
+    run = workflows.create_run("org:1", "user:1", "goal", 1)
+    revision = workflows.create_revision(run["workflow_run_id"], "org:1", "graph", [{
+        "step_id": "read", "capability_id": "slack.conversation.read",
+        "capability_version": "1", "connection_id": "conn:1",
+        "descriptor_snapshot_hash": "d", "input_hash": "i", "input": {},
+        "depends_on": [], "effect": "read",
+    }], 2)
+    workflows.authorize_requested_read(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:1", "graph", "user:1", 3,
+    )
+    claim = workflows.claim_ready_step(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:1", "worker", 4, 60,
+    )
+    step = workflows.get_revision(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:1"
+    )["steps"][0]
+    class Connections:
+        def get_installation(self, connection_id, tenant_id):
+            return {"connection_id": connection_id, "status": "connected",
+                    "credential_id": "cred:1", "credential_version": 1,
+                    "granted_scopes": ["channels:history"]}
+    class Broker:
+        def execute(self, lease, binding, payload):
+            return 429, {"error": "rate_limited", "retry_after": 17}
+    from agents.orchestrator.workflow_executor import RetryableStepError
+    with pytest.raises(RetryableStepError) as caught:
+        WorkflowBrokerDispatcher(
+            actions, Broker(), Connections(), workflows, clock=lambda: 5
+        )(step, claim)
+    assert caught.value.retry_after == 17
 
 
 def test_resolved_effect_may_change_only_declared_references():

@@ -28,6 +28,7 @@ def test_service_uses_connected_catalog_and_persists_approval_ready_revision(tmp
     result = service.plan("org:1", "user:1", "read it")
     assert result["revision"]["steps"][0]["capability_id"] == "synthetic.read"
     assert result["plan"]["shadow_mode"] is True
+    assert result["revision"]["status"] == "authorized"
 
 
 def test_service_persists_one_slack_need_and_rejects_expired_pronoun(tmp_path):
@@ -59,3 +60,32 @@ def test_service_persists_one_slack_need_and_rejects_expired_pronoun(tmp_path):
     )
     assert expired["state"] == "expired"
     assert "active_channel" not in expired
+
+
+def test_completed_read_presentation_is_generated_once_across_polls(tmp_path):
+    class Connections:
+        def list_installations(self, tenant, principal):
+            return []
+    repository = WorkflowRepository(str(tmp_path / "w.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 100)
+    store.create("org:1", "user:1", "conversation:1")
+    service = DynamicWorkflowService(
+        object(), [], Connections(), repository, conversation_store=store,
+    )
+    class Presenter:
+        def __init__(self): self.calls = 0
+        def present(self, question, evidence, locale):
+            self.calls += 1
+            return {"locale": locale, "answer": "grounded", "citations": [],
+                    "partial": False}
+    presenter = Presenter()
+    first = service.present_read_once(
+        "conversation:1", "org:1", "user:1", presenter,
+        "question", {"messages": []}, "en",
+    )
+    second = service.present_read_once(
+        "conversation:1", "org:1", "user:1", presenter,
+        "question", {"messages": [{"text": "changed"}]}, "en",
+    )
+    assert first == second
+    assert presenter.calls == 1

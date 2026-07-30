@@ -268,6 +268,39 @@ def test_production_workflow_repository_requires_kms_key(tmp_path, monkeypatch):
         )
 
 
+def test_authenticated_read_authorization_never_covers_a_write(tmp_path):
+    repository = _repository(tmp_path)
+    run = repository.create_run("org:acme", "user:alice", "goal", 1)
+    read = repository.create_revision(run["workflow_run_id"], "org:acme", "read-graph", [{
+        "step_id": "read", "capability_id": "slack.conversation.read",
+        "capability_version": "1", "connection_id": "conn:1",
+        "descriptor_snapshot_hash": "d", "input_hash": "i", "input": {},
+        "depends_on": [], "effect": "read",
+    }], 2)
+    assert repository.authorize_requested_read(
+        run["workflow_run_id"], read["workflow_revision_id"], "org:acme",
+        "read-graph", "user:alice", 3,
+    )
+    assert repository.revision_authorization_mode(
+        run["workflow_run_id"], read["workflow_revision_id"], "org:acme",
+        "read-graph", 3,
+    ) == "requested_read"
+
+    mixed = repository.create_revision(run["workflow_run_id"], "org:acme", "mixed", [
+        {"step_id": "read", "capability_id": "slack.conversation.read", "capability_version": "1", "connection_id": "conn:1", "descriptor_snapshot_hash": "d", "input_hash": "i", "input": {}, "depends_on": [], "effect": "read"},
+        {"step_id": "write", "capability_id": "slack.message.send", "capability_version": "1", "connection_id": "conn:1", "descriptor_snapshot_hash": "d", "input_hash": "i", "input": {}, "depends_on": ["read"], "effect": "write"},
+    ], 4)
+    with pytest.raises(ValueError, match="read-only"):
+        repository.authorize_requested_read(
+            run["workflow_run_id"], mixed["workflow_revision_id"], "org:acme",
+            "mixed", "user:alice", 5,
+        )
+    assert repository.revision_authorization_mode(
+        run["workflow_run_id"], mixed["workflow_revision_id"], "org:acme",
+        "mixed", 5,
+    ) is None
+
+
 def test_recovery_options_only_offer_safe_read_retry(tmp_path):
     repository = _repository(tmp_path)
     run = repository.create_run("org:acme", "user:alice", "goal", 1)

@@ -49,10 +49,14 @@ class WorkflowBrokerDispatcher:
         if not connection or connection.get("status") != "connected":
             raise RetryableStepError("connection is unavailable")
         now = int(self.clock())
-        if not self.workflows.is_revision_approved(
+        authorized = self.workflows.is_step_authorized(
+            step["workflow_run_id"], claim["workflow_revision_id"],
+            step["tenant_id"], revision["plan_graph_hash"], step["effect"], now,
+        ) if hasattr(self.workflows, "is_step_authorized") else self.workflows.is_revision_approved(
             step["workflow_run_id"], claim["workflow_revision_id"],
             step["tenant_id"], revision["plan_graph_hash"], now,
-        ):
+        )
+        if not authorized:
             raise PermissionError("workflow approval expired before dispatch")
         if not _matches_approved_template(step.get("approved_input", step["input"]), step["input"]):
             raise PermissionError("resolved effect no longer matches the approved graph")
@@ -115,6 +119,10 @@ class WorkflowBrokerDispatcher:
         if status >= 500:
             raise RetryableStepError(
                 "provider is temporarily unavailable", body.get("retry_after")
+            )
+        if status == 429:
+            raise RetryableStepError(
+                "provider is rate limited", body.get("retry_after")
             )
         if status != 200:
             raise PermissionError(body.get("error") or "broker rejected the live authorization")

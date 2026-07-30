@@ -128,6 +128,15 @@ class DynamicWorkflowService:
             run["workflow_run_id"], tenant_id, compiled["plan_graph_hash"],
             persisted_steps, now,
         )
+        effects = {step["effect"] for step in persisted_steps}
+        if effects == {"read"} and hasattr(self.workflows, "authorize_requested_read"):
+            self.workflows.authorize_requested_read(
+                run["workflow_run_id"], revision["workflow_revision_id"],
+                tenant_id, compiled["plan_graph_hash"], principal_id, now,
+            )
+            revision = self.workflows.get_revision(
+                run["workflow_run_id"], revision["workflow_revision_id"], tenant_id
+            )
         disclosures = {item["step_id"]: item for item in compiled["disclosures"]}
         definitions = {
             (item.capability_id, item.version): item for item in self.definitions
@@ -162,3 +171,22 @@ class DynamicWorkflowService:
                          for item in compiled["blockers"]],
         }
         return {"run": run, "revision": revision, "plan": compiled, "preview": preview}
+
+    def present_read_once(
+        self, conversation_id, tenant_id, principal_id, presenter,
+        question, evidence, locale,
+    ):
+        if self.conversation_store is None:
+            raise ValueError("conversation store is required")
+        current = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        if current is None:
+            raise KeyError("conversation unavailable")
+        if current.get("presentation") is not None:
+            return current["presentation"]
+        presentation = presenter.present(question, evidence, locale)
+        stored = self.conversation_store.present(
+            conversation_id, tenant_id, principal_id, presentation
+        )
+        return stored["presentation"]

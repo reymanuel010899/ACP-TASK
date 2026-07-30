@@ -25,10 +25,14 @@ class WorkflowExecutor:
         revision = self.repository.get_revision(workflow_run_id, revision_id, tenant_id)
         if revision is None:
             raise ValueError("workflow revision not found")
-        if not self.repository.is_revision_approved(
+        effects = {step["effect"] for step in revision["steps"]}
+        authorized = all(self.repository.is_step_authorized(
             workflow_run_id, revision_id, tenant_id, revision["plan_graph_hash"],
-            int(self.clock()),
-        ):
+            effect, int(self.clock()),
+        ) for effect in effects) if hasattr(self.repository, "is_step_authorized") else self.repository.is_revision_approved(
+            workflow_run_id, revision_id, tenant_id, revision["plan_graph_hash"], int(self.clock())
+        )
+        if not authorized:
             return {"status": "needs_approval"}
         claim = self.repository.claim_ready_step(
             workflow_run_id, revision_id, tenant_id, worker_id,

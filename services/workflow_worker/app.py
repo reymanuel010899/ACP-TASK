@@ -31,7 +31,13 @@ class WorkflowWorker:
             self.workflows.purge_expired_content(int(time.time()))
         if _enabled() and hasattr(self.workflows, "resume_policy_paused"):
             self.workflows.resume_policy_paused()
-        for revision in self.workflows.list_approved_revisions():
+        list_revisions = getattr(
+            self.workflows, "list_runnable_revisions",
+            self.workflows.list_approved_revisions if hasattr(
+                self.workflows, "list_approved_revisions"
+            ) else None,
+        )
+        for revision in list_revisions():
             try:
                 outcomes.append(self.executor.run_until_blocked(
                     revision["workflow_run_id"], revision["workflow_revision_id"],
