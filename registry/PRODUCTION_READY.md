@@ -107,19 +107,25 @@ This document outlines the requirements and considerations for moving the AgentT
 
 ### 4. Data Persistence & Backup
 
-**Current State:**
-- JSON file persistence (optional, via `--index-path`)
-- Single-node, in-memory by default
-- No backup strategy
+**Current State (database architecture plan, units U1-U10):**
+- PostgreSQL 16, unconditional — no JSON-file or in-memory fallback remains
+- Schema for registrations, users, reputation records, evidence,
+  verification results, tasks, hiring grants, ratings, and the audit trail
+  (`registry`/`identity`/`catalog`/`trust`/`marketplace`/`vault`/`audit`
+  schemas — see `docs/architecture/database-design.md`)
+- Transactional guarantees via `libs/db.py`'s `Database.transaction()`
+- Connection pooling via `psycopg_pool` (one least-privilege role per
+  service, `infra/roles.sql`)
+- Versioned, idempotent migrations (`tools/migrate.py`)
+- Row-Level Security for multi-tenancy (`registry.agents`,
+  `marketplace.tasks`, `audit.audit_log`) — see the plan's U9 for what's
+  covered and what's explicitly deferred (Vault's tables, hiring/ratings)
+- No backup strategy yet
 
-**Phase B Requirements:**
+**Phase B Requirements (remaining):**
 
-- [ ] Migrate to PostgreSQL (or similar)
-  - [ ] Schema for registrations, users, reputation records
-  - [ ] Transactional guarantees (no partial writes)
-  - [ ] Connection pooling
-  - [ ] Query optimization and indexing
-  - [ ] Prepared statements (prevent SQL injection)
+- [ ] Query optimization and indexing pass under real load (indexes exist
+      per-table today; not yet load-tested)
 - [ ] Backup strategy
   - [ ] Daily automated backups to S3 or similar
   - [ ] Point-in-time recovery capability
@@ -128,11 +134,13 @@ This document outlines the requirements and considerations for moving the AgentT
 - [ ] Data retention policy
   - [ ] Archive old reputation records (e.g., >1 year)
   - [ ] Purge deleted principals after grace period
-  - [ ] GDPR compliance (user data deletion)
-- [ ] Migration path from JSON
-  - [ ] Schema migration script
-  - [ ] Data validation during migration
-  - [ ] Rollback procedure
+  - [ ] GDPR compliance (user data deletion) — note `audit.audit_log` is
+        append-only/immutable by design; an erasure request needs an
+        explicit, documented exception path, not a plain DELETE
+- [ ] RLS coverage for Vault and hiring/ratings tables (deferred at U9 --
+      no `organization_id` column exists on those tables yet)
+- [ ] PgBouncer + read replica (documented as the scaling path in the
+      design doc, not deployed)
   - [ ] Zero-downtime migration (dual-write, then flip)
 
 **Files to Create:**

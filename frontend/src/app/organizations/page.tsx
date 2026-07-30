@@ -5,7 +5,7 @@ import OrgContent from "@/components/organizations/OrgContent";
 import OrgRightPanel from "@/components/organizations/OrgRightPanel";
 
 export const metadata: Metadata = {
-  title: "Organizations — Agentio",
+  title: "Organizations — Console",
 };
 
 export default function OrganizationsPage() {

@@ -44,8 +44,13 @@ from agents.provider.terraform_generate import (
     generate_terraform,
     validate_own_output,
 )
-
-TRUST_EXTENSION_URI = "https://agenttrust.example/extensions/trust/v1"
+from libs.config import TRUST_EXTENSION_URI
+from libs.protocol import (
+    COLLABORATION_STATUSES,
+    TASK_ACCEPT,
+    TASK_COUNTER,
+    TASK_REQUEST,
+)
 
 CAPABILITY_ID = "terraform.generate"
 
@@ -233,6 +238,7 @@ class ProviderAgent(object):
             "capabilities": {
                 "streaming": False,
                 "pushNotifications": False,
+                "collaborationStatuses": list(COLLABORATION_STATUSES),
                 "extensions": [
                     {
                         "uri": TRUST_EXTENSION_URI,
@@ -258,6 +264,23 @@ class ProviderAgent(object):
                     "deploys N containers behind an AWS Application Load "
                     "Balancer.",
                     "tags": ["terraform", "iac", "codegen"],
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["containers", "load_balancer"],
+                        "properties": {
+                            "containers": {"type": "integer", "minimum": 1},
+                            "load_balancer": {
+                                "type": "string",
+                                "enum": list(SUPPORTED_LOAD_BALANCERS),
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["main.tf"],
+                        "properties": {"main.tf": {"type": "string"}},
+                    },
                 }
             ],
         }
@@ -297,18 +320,43 @@ class ProviderAgent(object):
         if not isinstance(payload, dict):
             raise RpcError(-32602, "data part must be a JSON object")
         payload_type = payload.get("type")
-        if payload_type == "task.request":
+        if payload_type == TASK_REQUEST:
             return self._handle_request(payload)
-        if payload_type == "task.counter":
+        if payload_type == TASK_COUNTER:
             return self._handle_counter(payload)
-        if payload_type == "task.accept":
+        if payload_type == TASK_ACCEPT:
             return self._handle_accept(payload)
+        if payload_type == "trust.challenge":
+            return self._handle_trust_challenge(payload)
         raise RpcError(
             -32602, "unsupported payload type: %r" % (payload_type,)
         )
 
+    def _handle_trust_challenge(self, payload):
+        # type: (dict) -> dict
+        """Prove possession of this agent's private key: sign the verifier's
+        nonce and return the public key. The verifier checks the signature and
+        that the public key matches the ``principal_id`` declared on the card.
+        This is what makes the ``verified`` tier a proof, not a claim."""
+        nonce = payload.get("nonce")
+        if not isinstance(nonce, str) or not nonce:
+            raise RpcError(-32602, "trust.challenge requires a string 'nonce'")
+        signature = self.signing_key.sign(nonce.encode("utf-8")).signature
+        public_key = base64.b64encode(bytes(self.signing_key.verify_key)).decode("ascii")
+        return {
+            "type": "trust.proof",
+            "principal_id": self.principal_id,
+            "public_key": public_key,
+            "signature": base64.b64encode(signature).decode("ascii"),
+        }
+
     def _handle_request(self, payload):
         # type: (dict) -> dict
+        capability_id = payload.get("capability_id")
+        if capability_id is not None and capability_id != CAPABILITY_ID:
+            raise RpcError(
+                -32602, "unsupported capability: %s" % capability_id
+            )
         reason = _validate_task_input(payload)
         if reason:
             raise RpcError(-32602, "invalid task.request: %s" % reason)

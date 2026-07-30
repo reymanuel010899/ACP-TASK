@@ -1,4 +1,5 @@
-"""Service Provider Directory & Booking (unit U4).
+"""Service Provider Directory & Booking (unit U4; Postgres-backed since unit
+U7 -- see ``apps/gig_board/server/repository.py``).
 
 A federated gig board where users can register as service providers,
 browse available providers, and hire them for gigs. Reputation is recorded
@@ -23,29 +24,36 @@ Run: python -m apps.gig_board.server.app [--port 8002] [--registry-url URL]
 
 import argparse
 import json
-import threading
 import uuid
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
+from apps.gig_board.server.repository import (
+    GIG_BOARD_CAPABILITY_ID,
+    GigBoardRepository,
+)
 from libs.audit_client import make_audit_client
+from libs.db import Database
 from libs.federation_client import FederationClient, FederationError
 from libs.request_auth import RequestAuthenticator
 
 
 class GigBoardService:
-    """Core gig board logic; in-memory storage."""
+    """Core gig board logic (unit U7: Postgres-backed via
+    ``apps.gig_board.server.repository.GigBoardRepository``, replacing the
+    prior in-memory ``self.services``/``self.gigs`` dicts -- see that
+    module's docstring for the storage design)."""
 
     APP_ID = "gig-board"
     P2P_CAPABILITIES = ["gig-board.gigs", "p2p.ping"]
 
     def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None,
-                 require_signatures=False, public_key_resolver=None):
-        # type: (Optional[str], float, Optional[str], bool, object) -> None
+                 require_signatures=False, public_key_resolver=None,
+                 db=None, repository=None):
+        # type: (Optional[str], float, Optional[str], bool, object, object, Optional[GigBoardRepository]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
@@ -66,9 +74,11 @@ class GigBoardService:
             http_timeout=http_timeout,
             public_key_resolver=public_key_resolver,
         )
-        self.services = {}  # type: Dict[str, dict]
-        self.gigs = {}  # type: Dict[str, dict]
-        self.lock = threading.Lock()
+        # Unit U7: Postgres-backed storage (marketplace.tasks, shared with
+        # apps/marketplace -- unit U6). `db=`/`repository=` are injectable
+        # (mirrors apps/marketplace/server/app.py's make_server) so tests can
+        # point at a specific DSN or a fake repository.
+        self.repository = repository or GigBoardRepository(db or Database())
         self.app_id = self.APP_ID
         self.capabilities = list(self.P2P_CAPABILITIES)
         # app_ids discovered at registration time (U9, RFC-0004).
@@ -90,20 +100,9 @@ class GigBoardService:
         if not isinstance(description, str) or not description.strip():
             return 422, {"error": "missing or invalid 'description'"}
 
-        service_id = str(uuid.uuid4())
-        service = {
-            "id": service_id,
-            "provider_principal": principal_id,
-            "service_name": service_name.strip(),
-            "description": description.strip(),
-            "created_at": datetime.utcnow().isoformat(),
-            "gigs_completed": 0,
-            "rating": None,
-        }
-
-        with self.lock:
-            self.services[service_id] = service
-
+        service = self.repository.register_service(
+            principal_id, service_name.strip(), description.strip()
+        )
         return 200, {"service": service}
 
     def list_services(self, skip=0, limit=50):
@@ -114,16 +113,7 @@ class GigBoardService:
         if not isinstance(limit, int) or limit < 1 or limit > 100:
             return 400, {"error": "limit must be between 1 and 100"}
 
-        with self.lock:
-            all_services = list(self.services.values())
-
-        # Sort by created_at descending
-        all_services.sort(
-            key=lambda s: s.get("created_at", ""), reverse=True
-        )
-
-        total = len(all_services)
-        services = all_services[skip : skip + limit]
+        services, total = self.repository.list_services(skip, limit)
 
         return 200, {
             "services": services,
@@ -138,8 +128,7 @@ class GigBoardService:
         if not isinstance(service_id, str) or not service_id:
             return 422, {"error": "missing or invalid 'service_id'"}
 
-        with self.lock:
-            service = self.services.get(service_id)
+        service = self.repository.get_service(service_id)
 
         if service is None:
             return 404, {"error": "service not found"}
@@ -156,8 +145,7 @@ class GigBoardService:
         if not isinstance(description, str) or not description.strip():
             return 422, {"error": "missing or invalid 'description'"}
 
-        with self.lock:
-            service = self.services.get(service_id)
+        service = self.repository.get_service(service_id)
 
         if service is None:
             return 404, {"error": "service not found"}
@@ -166,21 +154,14 @@ class GigBoardService:
         if service["provider_principal"] == buyer_principal:
             return 400, {"error": "cannot hire yourself"}
 
-        gig_id = str(uuid.uuid4())
-        gig = {
-            "id": gig_id,
-            "service_id": service_id,
-            "provider_principal": service["provider_principal"],
-            "buyer_principal": buyer_principal,
-            "description": description.strip(),
-            "status": "active",
-            "created_at": datetime.utcnow().isoformat(),
-            "completed_at": None,
-            "outcome": None,
-        }
-
-        with self.lock:
-            self.gigs[gig_id] = gig
+        gig, error = self.repository.create_gig(
+            service_id, buyer_principal, description.strip()
+        )
+        if error is not None:
+            # Preconditions were already checked above against the same
+            # row; only a concurrent mutation between the checks and this
+            # call could land here. Map defensively rather than 500.
+            return 404, {"error": "service not found"}
 
         return 200, {"gig": gig}
 
@@ -194,19 +175,7 @@ class GigBoardService:
         if not isinstance(limit, int) or limit < 1 or limit > 100:
             return 400, {"error": "limit must be between 1 and 100"}
 
-        with self.lock:
-            all_gigs = [
-                g
-                for g in self.gigs.values()
-                if g["provider_principal"] == principal_id
-                or g["buyer_principal"] == principal_id
-            ]
-
-        # Sort by created_at descending
-        all_gigs.sort(key=lambda g: g.get("created_at", ""), reverse=True)
-
-        total = len(all_gigs)
-        gigs = all_gigs[skip : skip + limit]
+        gigs, total = self.repository.list_gigs(principal_id, skip, limit)
 
         return 200, {
             "gigs": gigs,
@@ -225,8 +194,7 @@ class GigBoardService:
         if not isinstance(outcome, str) or not outcome.strip():
             return 422, {"error": "missing or invalid 'outcome'"}
 
-        with self.lock:
-            gig = self.gigs.get(gig_id)
+        gig = self.repository.get_gig(gig_id)
 
         if gig is None:
             return 404, {"error": "gig not found"}
@@ -238,7 +206,10 @@ class GigBoardService:
         if gig["status"] != "active":
             return 400, {"error": "gig must be active before completion"}
 
-        # Record reputation for provider
+        # Record reputation for provider -- BEFORE persisting completion, so
+        # a registry failure leaves the gig exactly as it was (matches the
+        # prior in-memory ordering, and apps/marketplace's identical
+        # complete_task ordering).
         if self.registry_url:
             status, resp = self._record_reputation(
                 gig["provider_principal"], gig_id, outcome
@@ -246,24 +217,22 @@ class GigBoardService:
             if status != 200:
                 return status, resp
 
-        with self.lock:
-            gig["status"] = "completed"
-            gig["outcome"] = outcome.strip()
-            gig["completed_at"] = datetime.utcnow().isoformat()
-            # Update service stats
-            service = self.services.get(gig["service_id"])
-            if service:
-                service["gigs_completed"] = (
-                    service.get("gigs_completed", 0) + 1
-                )
+        updated, error = self.repository.complete_gig(
+            gig_id, buyer_principal, outcome.strip()
+        )
+        if error is not None:
+            # Preconditions were already checked above against the same
+            # row; only a concurrent mutation between the checks and this
+            # call could land here. Map defensively rather than 500.
+            return 400, {"error": "gig could not be completed"}
 
         self.audit_client.log(
-            gig["provider_principal"], "work.complete",
+            updated["provider_principal"], "work.complete",
             resource_id=gig_id,
             details={"app_id": self.app_id,
                      "buyer_principal": buyer_principal},
         )
-        return 200, {"gig": gig}
+        return 200, {"gig": updated}
 
     # -- P2P (U6, RFC-0003) ---------------------------------------------------
 
@@ -362,28 +331,25 @@ class GigBoardService:
         ):
             return 422, {"error": "'capability_id' must be a string"}
 
-        with self.lock:
-            all_services = list(self.services.values())
-        all_services.sort(
-            key=lambda s: s.get("created_at", ""), reverse=True
-        )
-
         opportunities = []
-        for service in all_services:
-            capability = service.get("capability_id", "gig-board.gigs")
-            if capability_filter and capability != capability_filter:
-                continue
-            opportunities.append(
-                {
-                    "id": service["id"],
-                    "service_name": service["service_name"],
-                    "description": service["description"],
-                    "provider_principal": service["provider_principal"],
-                    "created_at": service["created_at"],
-                    "capability_id": capability,
-                    "gigs_completed": service.get("gigs_completed", 0),
-                }
-            )
+        # Unit U7: every gig-board Service is scoped under the fixed
+        # "gig-board.gigs" capability (see GigBoardRepository); a filter for
+        # any OTHER capability_id matches nothing, same as it always would
+        # have for the pre-existing (unfiltered-by-default) service dicts,
+        # which also all defaulted to "gig-board.gigs".
+        if not capability_filter or capability_filter == GIG_BOARD_CAPABILITY_ID:
+            for service in self.repository.list_all_services():
+                opportunities.append(
+                    {
+                        "id": service["id"],
+                        "service_name": service["service_name"],
+                        "description": service["description"],
+                        "provider_principal": service["provider_principal"],
+                        "created_at": service["created_at"],
+                        "capability_id": service["capability_id"],
+                        "gigs_completed": service["gigs_completed"],
+                    }
+                )
 
         return 200, {
             "result": {"opportunities": opportunities},
@@ -417,17 +383,16 @@ class GigBoardService:
             }
 
         requester = payload["requester_principal_id"]
-        status, response = self.register_service(requester, name, description)
-        if status != 200:
-            return status, response
-
-        service = response["service"]
-        with self.lock:
-            service["capability_id"] = (
-                capability_id if capability_id else "gig-board.gigs"
-            )
-            if pricing is not None:
-                service["pricing"] = pricing
+        # Unit U7: every gig-board Service is persisted under the fixed
+        # "gig-board.gigs" capability regardless of what a caller passes
+        # here (see GigBoardRepository) -- every existing caller already
+        # only ever passes "gig-board.gigs" itself, so this is a no-op in
+        # practice; a genuinely different capability_id is accepted (no
+        # 422) but not honored for storage/scoping, unlike the prior
+        # in-memory version which stored (but never scoped by) it.
+        service = self.repository.register_service(
+            requester, name.strip(), description.strip(), pricing=pricing
+        )
 
         # "service.register" extends the standard audit vocabulary (the
         # vocabulary is open by design): an agent registered ITSELF as a
@@ -763,14 +728,21 @@ def make_server(
     audit_url=None,
     require_signatures=False,
     public_key_resolver=None,
+    db=None,
+    repository=None,
 ):
-    # type: (int, str, Optional[str], Optional[str], bool, object) -> GigBoardHTTPServer
-    """Build the gig board server."""
+    # type: (int, str, Optional[str], Optional[str], bool, object, object, Optional[GigBoardRepository]) -> GigBoardHTTPServer
+    """Build the gig board server. ``db``/``repository`` are injectable
+    (unit U7) -- tests point a fresh server at a specific DSN, or at a fake
+    repository entirely; omitted, ``GigBoardService`` builds its own
+    ``Database()`` from the ``DATABASE_URL`` env var."""
     service = GigBoardService(
         registry_url=registry_url,
         audit_url=audit_url,
         require_signatures=require_signatures,
         public_key_resolver=public_key_resolver,
+        db=db,
+        repository=repository,
     )
     return GigBoardHTTPServer((host, port), service)
 

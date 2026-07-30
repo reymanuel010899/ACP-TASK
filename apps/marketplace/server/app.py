@@ -1,4 +1,5 @@
-"""Task Marketplace Backend (unit U3).
+"""Task Marketplace Backend (unit U3; Postgres-backed since unit U6 -- see
+``apps/marketplace/server/repository.py``).
 
 A federated task marketplace where users post tasks, accept them, negotiate
 outcomes, and earn reputation through the registry.
@@ -11,43 +12,61 @@ API endpoints:
 - GET  /api/tasks/{task_id}/bids - List agent bids on a task (U10)
 - POST /api/tasks/{task_id}/bids/{bid_id}/accept - Author accepts a bid (U10)
 - POST /api/negotiations/{task_id} - Send negotiation message
-- GET /api/negotiations/{task_id} - Get negotiation thread
+- GET /api/negotiations/{task_id}[?skip=&limit=] - Get negotiation thread
+  (U6: paginated, ``skip``/``limit`` optional and additive)
 - POST /api/negotiations/{task_id}/complete - Mark task complete with outcome
 - POST /p2p/request - Direct P2P request from another app/agent (U6,
   RFC-0003): permission is checked with the Registry when configured;
   standalone mode (no --registry-url) processes without the check.
-  Request types (U10 adds the work-coordination types):
+  Request types (U10 adds the work-coordination types; U6 adds the
+  RFC-0002 Offer/CounterOffer types):
   ping, list.work_opportunities, submit.work_bid, get.task_status,
-  submit.work_result.
+  submit.work_result, task.offer, task.counter.
 
 Run: python -m apps.marketplace.server.app [--port 8001] [--registry-url URL]
 """
 
 import argparse
 import json
-import threading
+import pathlib
 import uuid
-from datetime import datetime
+from typing import Optional, Tuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import jsonschema
 import requests
 
+from apps.marketplace.server.repository import MarketplaceRepository
 from libs.audit_client import make_audit_client
+from libs.db import Database, bind_organization_id
 from libs.federation_client import FederationClient, FederationError
 from libs.request_auth import RequestAuthenticator
 
+#: RFC-0002 competitive-negotiation schemas (unit U6 adoption) -- loaded once
+#: at import time, not per-request. See ``TaskService._p2p_task_offer``/
+#: ``_p2p_task_counter`` for why these are validated as real JSON Schema
+#: instances rather than hand-checked field by field.
+_SCHEMAS_DIR = pathlib.Path(__file__).resolve().parents[3] / "schemas"
+_OFFER_SCHEMA = json.loads((_SCHEMAS_DIR / "offer.schema.json").read_text())
+_COUNTER_OFFER_SCHEMA = json.loads(
+    (_SCHEMAS_DIR / "counter-offer.schema.json").read_text()
+)
+
 
 class TaskService:
-    """Core task marketplace logic; in-memory storage."""
+    """Core task marketplace logic (unit U6: Postgres-backed via
+    ``apps.marketplace.server.repository.MarketplaceRepository``, replacing
+    the prior in-memory ``self.tasks`` dict -- see that module's docstring
+    for the storage design)."""
 
     APP_ID = "marketplace"
     P2P_CAPABILITIES = ["marketplace.tasks", "p2p.ping"]
 
     def __init__(self, registry_url=None, http_timeout=3.0, audit_url=None,
-                 require_signatures=False, public_key_resolver=None):
-        # type: (Optional[str], float, Optional[str], bool, object) -> None
+                 require_signatures=False, public_key_resolver=None,
+                 db=None, repository=None):
+        # type: (Optional[str], float, Optional[str], bool, object, object, Optional[MarketplaceRepository]) -> None
         self.registry_url = (
             registry_url.rstrip("/") if registry_url else None
         )
@@ -68,19 +87,30 @@ class TaskService:
             http_timeout=http_timeout,
             public_key_resolver=public_key_resolver,
         )
-        self.tasks = {}  # type: Dict[str, dict]
-        self.lock = threading.Lock()
+        # Unit U6: Postgres-backed storage. `db=`/`repository=` are
+        # injectable (mirrors vault/app.py's make_server) so tests can point
+        # at a specific DSN or a fake, and so a "simulated restart" can build
+        # a brand new repository/pool against the same database.
+        self.repository = repository or MarketplaceRepository(db or Database())
         self.app_id = self.APP_ID
         self.capabilities = list(self.P2P_CAPABILITIES)
         # app_ids discovered at registration time (U9, RFC-0004).
         self.discovered_ecosystem = []  # type: list
         # request_type -> handler(payload); U10 plugs real work types in here.
+        # U6 adds "task.offer"/"task.counter" -- named after RFC-0002's own
+        # message discriminators (schemas/offer.schema.json's/
+        # counter-offer.schema.json's "type" const) rather than this
+        # module's verb.noun convention (e.g. "submit.work_bid"), since these
+        # ARE the wire vocabulary RFC-0002 already defines; see
+        # `_p2p_task_offer`'s docstring for the full adoption rationale.
         self._p2p_handlers = {
             "ping": self._p2p_ping,
             "list.work_opportunities": self._p2p_list_work_opportunities,
             "submit.work_bid": self._p2p_submit_work_bid,
             "get.task_status": self._p2p_get_task_status,
             "submit.work_result": self._p2p_submit_work_result,
+            "task.offer": self._p2p_task_offer,
+            "task.counter": self._p2p_task_counter,
         }
 
     def create_task(self, principal_id, description):
@@ -91,23 +121,7 @@ class TaskService:
         if not isinstance(description, str) or not description.strip():
             return 422, {"error": "missing or invalid 'description'"}
 
-        task_id = str(uuid.uuid4())
-        task = {
-            "id": task_id,
-            "author_principal": principal_id,
-            "description": description.strip(),
-            "status": "open",
-            "created_at": datetime.utcnow().isoformat(),
-            "worker_principal": None,
-            "negotiations": [],
-            "outcome": None,
-            "bids": [],
-            "work_result": None,
-        }
-
-        with self.lock:
-            self.tasks[task_id] = task
-
+        task = self.repository.create_task(principal_id, description.strip())
         return 200, {"task": task}
 
     def list_tasks(self, skip=0, limit=50):
@@ -118,16 +132,7 @@ class TaskService:
         if not isinstance(limit, int) or limit < 1 or limit > 100:
             return 400, {"error": "limit must be between 1 and 100"}
 
-        with self.lock:
-            all_tasks = list(self.tasks.values())
-
-        # Sort by created_at descending
-        all_tasks.sort(
-            key=lambda t: t.get("created_at", ""), reverse=True
-        )
-
-        total = len(all_tasks)
-        tasks = all_tasks[skip : skip + limit]
+        tasks, total = self.repository.list_tasks(skip, limit)
 
         return 200, {
             "tasks": tasks,
@@ -142,9 +147,7 @@ class TaskService:
         if not isinstance(task_id, str) or not task_id:
             return 422, {"error": "missing or invalid 'task_id'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
+        task = self.repository.get_task(task_id)
         if task is None:
             return 404, {"error": "task not found"}
 
@@ -158,21 +161,13 @@ class TaskService:
         if not isinstance(worker_principal, str) or not worker_principal:
             return 422, {"error": "missing or invalid 'worker_principal'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
-        if task is None:
+        task, error = self.repository.accept_task(task_id, worker_principal)
+        if error == "not_found":
             return 404, {"error": "task not found"}
-
-        if task["status"] != "open":
+        if error == "not_open":
             return 400, {"error": "task is not open for acceptance"}
-
-        if task["author_principal"] == worker_principal:
+        if error == "own_task":
             return 400, {"error": "cannot accept your own task"}
-
-        with self.lock:
-            task["status"] = "accepted"
-            task["worker_principal"] = worker_principal
 
         return 200, {"task": task}
 
@@ -182,13 +177,13 @@ class TaskService:
         if not isinstance(task_id, str) or not task_id:
             return 422, {"error": "missing or invalid 'task_id'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
-        if task is None:
+        if not self.repository.task_exists(task_id):
             return 404, {"error": "task not found"}
 
-        return 200, {"task_id": task_id, "bids": task.get("bids", [])}
+        return 200, {
+            "task_id": task_id,
+            "bids": self.repository.list_bids(task_id),
+        }
 
     def accept_bid(self, task_id, bid_id, author_principal):
         # type: (str, str, str) -> Tuple[int, dict]
@@ -202,35 +197,19 @@ class TaskService:
         if not isinstance(author_principal, str) or not author_principal:
             return 422, {"error": "missing or invalid 'author_principal'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
+        task, bid, error = self.repository.accept_bid(
+            task_id, bid_id, author_principal
+        )
+        if error == "not_found":
+            return 404, {"error": "task not found"}
+        if error == "not_author":
+            return 403, {"error": "only task author can accept bids"}
+        if error == "not_open":
+            return 400, {"error": "task is not open for bid acceptance"}
+        if error == "bid_not_found":
+            return 404, {"error": "bid not found"}
 
-            if task is None:
-                return 404, {"error": "task not found"}
-
-            if task["author_principal"] != author_principal:
-                return 403, {"error": "only task author can accept bids"}
-
-            if task["status"] != "open":
-                return 400, {"error": "task is not open for bid acceptance"}
-
-            accepted_bid = None
-            for bid in task.get("bids", []):
-                if bid["bid_id"] == bid_id:
-                    accepted_bid = bid
-                    break
-            if accepted_bid is None:
-                return 404, {"error": "bid not found"}
-
-            accepted_bid["status"] = "accepted"
-            for bid in task.get("bids", []):
-                if bid["bid_id"] != bid_id:
-                    bid["status"] = "rejected"
-
-            task["status"] = "accepted"
-            task["worker_principal"] = accepted_bid["agent_principal_id"]
-
-        return 200, {"task": task, "bid": accepted_bid}
+        return 200, {"task": task, "bid": bid}
 
     def send_negotiation_message(self, task_id, from_principal, message):
         # type: (str, str, str) -> Tuple[int, dict]
@@ -242,45 +221,32 @@ class TaskService:
         if not isinstance(message, str) or not message.strip():
             return 422, {"error": "missing or invalid 'message'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
-        if task is None:
+        msg_obj, task, error = self.repository.add_negotiation_message(
+            task_id, from_principal, message.strip()
+        )
+        if error == "not_found":
             return 404, {"error": "task not found"}
-
-        # Only author and worker can negotiate
-        if (
-            from_principal != task["author_principal"]
-            and from_principal != task["worker_principal"]
-        ):
+        if error == "not_authorized":
             return 403, {"error": "not authorized to negotiate this task"}
-
-        msg_obj = {
-            "from": from_principal,
-            "message": message.strip(),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-        with self.lock:
-            task["negotiations"].append(msg_obj)
 
         return 200, {"message": msg_obj, "task": task}
 
-    def get_negotiations(self, task_id):
-        # type: (str) -> Tuple[int, dict]
-        """Get all negotiation messages for a task."""
+    def get_negotiations(self, task_id, skip=0, limit=1000):
+        # type: (str, int, int) -> Tuple[int, dict]
+        """Get the negotiation thread for a task, in order and paginated
+        (never one unbounded blob) -- ``skip``/``limit`` are optional and
+        additive to the pre-existing response shape."""
         if not isinstance(task_id, str) or not task_id:
             return 422, {"error": "missing or invalid 'task_id'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
-        if task is None:
+        if not self.repository.task_exists(task_id):
             return 404, {"error": "task not found"}
 
         return 200, {
             "task_id": task_id,
-            "negotiations": task["negotiations"],
+            "negotiations": self.repository.list_negotiations(
+                task_id, skip=skip, limit=limit
+            ),
         }
 
     def complete_task(self, task_id, author_principal, outcome):
@@ -293,9 +259,7 @@ class TaskService:
         if not isinstance(outcome, str) or not outcome.strip():
             return 422, {"error": "missing or invalid 'outcome'"}
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-
+        task = self.repository.get_task(task_id)
         if task is None:
             return 404, {"error": "task not found"}
 
@@ -315,7 +279,9 @@ class TaskService:
         if not task["worker_principal"]:
             return 400, {"error": "task has no worker assigned"}
 
-        # Record reputation for worker
+        # Record reputation for worker -- BEFORE persisting completion, so a
+        # registry failure leaves the task exactly as it was (matches the
+        # prior in-memory ordering).
         if self.registry_url:
             status, resp = self._record_reputation(
                 task["worker_principal"], task_id, outcome
@@ -323,17 +289,22 @@ class TaskService:
             if status != 200:
                 return status, resp
 
-        with self.lock:
-            task["status"] = "completed"
-            task["outcome"] = outcome.strip()
+        updated, error = self.repository.complete_task(
+            task_id, author_principal, outcome.strip()
+        )
+        if error is not None:
+            # Preconditions were already checked above against the same
+            # row; only a concurrent mutation between the checks and this
+            # call could land here. Map defensively rather than 500.
+            return 400, {"error": "task could not be completed"}
 
         self.audit_client.log(
-            task["worker_principal"], "work.complete",
+            updated["worker_principal"], "work.complete",
             resource_id=task_id,
             details={"app_id": self.app_id,
                      "author_principal": author_principal},
         )
-        return 200, {"task": task}
+        return 200, {"task": updated}
 
     # -- P2P (U6, RFC-0003) ---------------------------------------------------
 
@@ -433,22 +404,9 @@ class TaskService:
 
         opportunities = []
         if not capability_filter or capability_filter == "marketplace.tasks":
-            with self.lock:
-                open_tasks = [
-                    t for t in self.tasks.values() if t["status"] == "open"
-                ]
-            open_tasks.sort(
-                key=lambda t: t.get("created_at", ""), reverse=True
-            )
             opportunities = [
-                {
-                    "id": t["id"],
-                    "description": t["description"],
-                    "author_principal": t["author_principal"],
-                    "created_at": t["created_at"],
-                    "capability_id": "marketplace.tasks",
-                }
-                for t in open_tasks
+                dict(t, capability_id="marketplace.tasks")
+                for t in self.repository.list_open_tasks()
             ]
 
         return 200, {
@@ -475,35 +433,13 @@ class TaskService:
 
         agent_principal = payload["requester_principal_id"]
 
-        with self.lock:
-            task = self.tasks.get(task_id)
-            if task is None:
-                return 404, {"error": "task not found"}
-            if task["status"] != "open":
-                return 400, {"error": "task is not open for bidding"}
-
-            bid = {
-                "bid_id": str(uuid.uuid4()),
-                "task_id": task_id,
-                "agent_principal_id": agent_principal,
-                "proposed_terms": proposed_terms.strip(),
-                "status": "pending",
-                "created_at": datetime.utcnow().isoformat(),
-            }
-            if note is not None:
-                bid["agent_reputation_note"] = note
-
-            bids = task.setdefault("bids", [])
-            # Replace this agent's pending bid instead of duplicating it.
-            task["bids"] = [
-                b
-                for b in bids
-                if not (
-                    b["agent_principal_id"] == agent_principal
-                    and b["status"] == "pending"
-                )
-            ]
-            task["bids"].append(bid)
+        bid, error = self.repository.create_bid(
+            task_id, agent_principal, proposed_terms.strip(), note
+        )
+        if error == "not_found":
+            return 404, {"error": "task not found"}
+        if error == "not_open":
+            return 400, {"error": "task is not open for bidding"}
 
         self.audit_client.log(
             agent_principal, "work.bid",
@@ -527,15 +463,14 @@ class TaskService:
             return 422, {"error": "missing or invalid 'task_id'"}
 
         requester = payload["requester_principal_id"]
-        with self.lock:
-            task = self.tasks.get(task_id)
-            if task is None:
-                return 404, {"error": "task not found"}
-            my_bid = None
-            for bid in reversed(task.get("bids", [])):
-                if bid["agent_principal_id"] == requester:
-                    my_bid = bid
-                    break
+        task = self.repository.get_task(task_id)
+        if task is None:
+            return 404, {"error": "task not found"}
+        my_bid = None
+        for bid in reversed(task.get("bids", [])):
+            if bid["agent_principal_id"] == requester:
+                my_bid = bid
+                break
 
         return 200, {
             "result": {"task": task, "my_bid": my_bid},
@@ -545,7 +480,11 @@ class TaskService:
     def _p2p_submit_work_result(self, payload):
         # type: (dict) -> Tuple[int, dict]
         """The accepted agent delivers its work: the task moves to
-        'delivered' and holds the work_result for author review."""
+        'delivered' and holds the work_result for author review. Unit U6:
+        each submission is a NEW row in ``marketplace.work_results``
+        (redelivery history is preserved), not an overwritten slot -- the
+        response still surfaces a single ``work_result`` object (the
+        latest), so this pre-existing response shape doesn't change."""
         p2p_input, err = self._p2p_input(payload)
         if err:
             return err
@@ -560,29 +499,22 @@ class TaskService:
             return 422, {"error": "'evidence' must be a JSON object"}
 
         requester = payload["requester_principal_id"]
-        with self.lock:
-            task = self.tasks.get(task_id)
-            if task is None:
-                return 404, {"error": "task not found"}
-            if task["status"] != "accepted":
-                return 400, {
-                    "error": "task must be accepted before submitting a "
-                    "work result"
-                }
-            if task["worker_principal"] != requester:
-                return 403, {
-                    "error": "permission denied",
-                    "reason": "only the accepted worker can submit the "
-                    "work result",
-                }
-
-            task["work_result"] = {
-                "result_summary": result_summary.strip(),
-                "evidence": evidence if evidence is not None else {},
-                "submitted_by": requester,
-                "submitted_at": datetime.utcnow().isoformat(),
+        task, error = self.repository.submit_work_result(
+            task_id, requester, result_summary.strip(), evidence=evidence
+        )
+        if error == "not_found":
+            return 404, {"error": "task not found"}
+        if error == "not_accepted":
+            return 400, {
+                "error": "task must be accepted before submitting a "
+                "work result"
             }
-            task["status"] = "delivered"
+        if error == "forbidden":
+            return 403, {
+                "error": "permission denied",
+                "reason": "only the accepted worker can submit the "
+                "work result",
+            }
 
         self.audit_client.log(
             requester, "work.submit",
@@ -591,6 +523,119 @@ class TaskService:
         )
         return 200, {
             "result": {"task": task},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    # -- P2P competitive negotiation (U6, RFC-0002 Offer/CounterOffer) --------
+    #
+    # Adoption decision: request_type dispatch, not a new REST surface.
+    # ``schemas/offer.schema.json``/``schemas/counter-offer.schema.json``
+    # exist as RFC-0002's wire bodies for `task.offer`/`task.counter`, but
+    # nothing in this codebase emitted them before this unit. The existing
+    # P2P envelope (`POST /p2p/request`, RFC-0003) already carries an
+    # arbitrary `request_type` + `input` body between apps/agents -- exactly
+    # the transport RFC-0002's message cycle needs -- so adding two more
+    # entries to `_p2p_handlers` is a natural fit; there is no dedicated
+    # negotiation transport elsewhere in this codebase to prefer instead. The
+    # ``input`` object for each is validated as a REAL instance of the
+    # corresponding schema (`jsonschema.validate`), so this literally is the
+    # wire shape now, not a hand-rolled lookalike.
+    #
+    # Coexistence with bids[]/agent_reputation_note: the pre-existing
+    # `submit.work_bid` mechanism ("I want to do this work, here are my
+    # terms/reputation") and RFC-0002's Offer/CounterOffer ("here is my
+    # public price for this work") answer different questions -- a bid is
+    # about WHO does the work, an offer/counter is about WHAT it costs. Nothing
+    # in the existing, must-pass test suite forces these into one shape (no
+    # test ties a bid's acceptance to an offer or vice versa), so -- mirroring
+    # the judgment call U5's agent made keeping the legacy skills[] and
+    # capabilities[] Agent Card conventions both alive, writing into the SAME
+    # underlying tables rather than collapsing them -- this unit lets both
+    # mechanisms coexist, persisted in their own ``marketplace.offers``/
+    # ``marketplace.counter_offers`` tables alongside ``marketplace.bids``.
+
+    def _p2p_task_offer(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """A provider agent quotes a public price for an open task
+        (RFC-0002 §6.2, ``schemas/offer.schema.json``)."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        try:
+            jsonschema.validate(instance=p2p_input, schema=_OFFER_SCHEMA)
+        except jsonschema.ValidationError as exc:
+            return 422, {"error": "invalid task.offer payload: %s" % exc.message}
+
+        provider = payload["requester_principal_id"]
+        offer, error = self.repository.create_offer(
+            p2p_input["task_id"], provider, p2p_input["price"],
+            p2p_input.get("currency", "USD"), p2p_input.get("delivery"),
+            p2p_input.get("terms"),
+        )
+        if error == "not_found":
+            return 404, {"error": "task not found"}
+        if error == "not_open":
+            return 400, {"error": "task is not open for offers"}
+
+        self.audit_client.log(
+            provider, "work.offer",
+            resource_id=p2p_input["task_id"],
+            details={"app_id": self.app_id, "offer_id": offer["offer_id"]},
+        )
+        return 200, {
+            "result": {"offer": offer},
+            "evidence_id": str(uuid.uuid4()),
+        }
+
+    def _p2p_task_counter(self, payload):
+        # type: (dict) -> Tuple[int, dict]
+        """The requester (task author) proposes a lower price, once, per
+        task (RFC-0002 §6.3/§6.1, ``schemas/counter-offer.schema.json``)."""
+        p2p_input, err = self._p2p_input(payload)
+        if err:
+            return err
+        try:
+            jsonschema.validate(
+                instance=p2p_input, schema=_COUNTER_OFFER_SCHEMA
+            )
+        except jsonschema.ValidationError as exc:
+            return 422, {
+                "error": "invalid task.counter payload: %s" % exc.message
+            }
+
+        task_id = p2p_input["task_id"]
+        requester = payload["requester_principal_id"]
+        task = self.repository.get_task(task_id)
+        if task is None:
+            return 404, {"error": "task not found"}
+        if requester != task["author_principal"]:
+            return 403, {
+                "error": "permission denied",
+                "reason": "only the task author (requester) can submit a "
+                "counter-offer",
+            }
+
+        counter, error = self.repository.create_counter_offer(
+            task_id, p2p_input["proposed_price"],
+            p2p_input.get("currency", "USD"),
+        )
+        if error == "not_found":
+            return 404, {"error": "task not found"}
+        if error == "no_standing_offer":
+            return 400, {"error": "no standing offer to counter"}
+        if error == "already_countered":
+            return 400, {
+                "error": "task.counter already submitted for this task "
+                "(single round only, RFC-0002 §6.1)"
+            }
+
+        self.audit_client.log(
+            requester, "work.counter",
+            resource_id=task_id,
+            details={"app_id": self.app_id, "counter_id": counter["counter_id"]},
+        )
+        return 200, {
+            "result": {"counter_offer": counter},
             "evidence_id": str(uuid.uuid4()),
         }
 
@@ -780,6 +825,22 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 "verification_rate": None
             }
 
+    def _bind_org_context(self):
+        # type: () -> None
+        """Bind this request's RLS org-context (U9) before any repository
+        call runs, via an optional ``X-Organization-Id`` header (no existing
+        marketplace endpoint accepts an organization in its body/query
+        shape, R10). Unconditional -- even when the header is absent -- so a
+        keep-alive connection reusing this thread never inherits a prior
+        request's value. ``marketplace.tasks.organization_id`` IS
+        RLS-protected as of this unit (migrations/0009_rls_policies.sql,
+        NULL-permissive) -- nothing populates it on any write path yet
+        (this unit's reality check, and R6's known gap), so today this only
+        matters for a caller that both sends the header AND hand-crafts a
+        row with a real organization_id outside the normal HTTP surface.
+        """
+        bind_organization_id(self.headers.get("X-Organization-Id"))
+
     def do_OPTIONS(self):
         # type: () -> None
         """Handle CORS preflight requests."""
@@ -790,6 +851,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
 
@@ -826,13 +888,27 @@ class _RequestHandler(BaseHTTPRequestHandler):
             and segments[0] == "api"
             and segments[1] == "negotiations"
         ):
-            # GET /api/negotiations/{task_id}
-            status, body = self.service.get_negotiations(segments[2])
+            # GET /api/negotiations/{task_id}[?skip=0&limit=1000] (U6:
+            # skip/limit are optional and additive -- the pre-existing
+            # unparameterized call still returns the full thread).
+            query = parse_qs(parts.query)
+            try:
+                skip = int(query.get("skip", ["0"])[0])
+                limit = int(query.get("limit", ["1000"])[0])
+            except ValueError:
+                self._send_json(
+                    400, {"error": "skip and limit must be integers"}
+                )
+                return
+            status, body = self.service.get_negotiations(
+                segments[2], skip=skip, limit=limit
+            )
             self._send_json(status, body)
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         body, raw_body, error = self._read_json_body()
@@ -949,14 +1025,21 @@ def make_server(
     audit_url=None,
     require_signatures=False,
     public_key_resolver=None,
+    db=None,
+    repository=None,
 ):
-    # type: (int, str, Optional[str], Optional[str], bool, object) -> MarketplaceHTTPServer
-    """Build the marketplace server."""
+    # type: (int, str, Optional[str], Optional[str], bool, object, object, Optional[MarketplaceRepository]) -> MarketplaceHTTPServer
+    """Build the marketplace server. ``db``/``repository`` are injectable
+    (unit U6) -- tests point a fresh server at a specific DSN, or at a fake
+    repository entirely; omitted, ``TaskService`` builds its own
+    ``Database()`` from the ``DATABASE_URL`` env var."""
     service = TaskService(
         registry_url=registry_url,
         audit_url=audit_url,
         require_signatures=require_signatures,
         public_key_resolver=public_key_resolver,
+        db=db,
+        repository=repository,
     )
     return MarketplaceHTTPServer((host, port), service)
 

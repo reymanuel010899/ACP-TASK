@@ -1,0 +1,56 @@
+version: '3.8'
+
+# Local/CI Postgres + Redis for the AgentTrust database architecture (unit U1).
+#
+# Bring up:   docker compose -f infra/docker-compose.yml up -d
+# Tear down:  docker compose -f infra/docker-compose.yml down -v
+#
+# After the containers are healthy, apply least-privilege roles once, then
+# run pending migrations (both are idempotent, safe to re-run):
+#
+#   psql "$DATABASE_URL" -f infra/roles.sql
+#   python -m tools.migrate
+#
+# libs/db.py and tools/migrate.py read the connection string from
+# DATABASE_URL (see libs/db.py for the exact env var contract). With the
+# ports below, the default local DSN is:
+#
+#   postgresql://postgres:postgres@localhost:5432/agenttrust
+#   redis://localhost:6379/0
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: agenttrust-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: agenttrust
+    ports:
+      - "5432:5432"
+    volumes:
+      - agenttrust_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agenttrust"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: agenttrust-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  agenttrust_pgdata:
+    driver: local

@@ -1,10 +1,10 @@
 # AgentTrust
 
-> **AgentTrust** is a **provisional placeholder name** (the original
-> "AgentNet"/"ANP" collided with published projects). So is the
-> `agenttrust.example` domain used in all URIs. Both will be replaced before
-> any non-draft release; what is specified here is the *structure*, not the
-> brand. Naming is a separate, non-blocking decision.
+> The project's brand is **Tessera** and its domain is **`treessera.com`**
+> (the `treessera` spelling matches the registered PyPI package, since bare
+> `tessera` was taken). All protocol URIs — the trust extension and schema
+> `$id`s — now use `treessera.com`. "AgentTrust" remains the working name of
+> the *protocol* described here; the SDK ships as `treessera`.
 
 A **trust / verification / reputation layer for AI agents**, built as an
 official **[A2A](https://a2a-protocol.org/) extension** — not a rival
@@ -108,9 +108,19 @@ requester and a provider — that exercise the full cycle (discovery →
 negotiation → execution → evidence → independent verification → reputation
 update) with **zero shared code beyond the published spec and schemas**.
 
+Every backend store (registry, vault, audit, verification service,
+marketplace/gig-board/agent_marketplace) persists to PostgreSQL 16, with
+Redis for the deliberately-ephemeral state — bring both up and apply the
+schema before running anything:
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+docker compose -f infra/docker-compose.yml up -d   # Postgres 16 + Redis 7
+psql "$DATABASE_URL" -f infra/roles.sql             # least-privilege roles (idempotent)
+python -m tools.migrate                             # apply pending migrations (idempotent)
+
 pytest                        # full suite, including the e2e two-agent demo
 pytest tests/e2e -q           # just the two-agent demo (four separate processes)
 ```
@@ -145,4 +155,8 @@ Design rationale and the full unit breakdown live in
 
 Draft. Schemas and RFCs are stable enough to build against; names, URIs, and
 the business model are explicitly open.
+
+## Secure provider orchestration
+
+Tessera supports tenant-bound Google and Slack connections through its OAuth service, encrypted credential vault, action broker, signed receipts, and revisioned workflow engine. Dynamic workflows are compiled from the live capability catalog; provider combinations are not encoded as named scenarios. Keep Slack and dynamic execution disabled until the sandbox gates in [the Slack runbook](docs/operations/slack-integration-runbook.md) and [the orchestrator runbook](docs/operations/dynamic-orchestrator-runbook.md) pass.
 # ACP

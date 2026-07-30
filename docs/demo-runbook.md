@@ -19,6 +19,32 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Además, desde la arquitectura de base de datos (U1-U9), todos los servicios
+persisten en Postgres 16 (Redis para el estado deliberadamente efímero) — ya
+no hay fallback en memoria ni archivos JSON. Antes de levantar los cuatro
+procesos de abajo:
+
+### 0. Levantar Postgres/Redis, roles y migraciones
+
+```bash
+docker compose -f infra/docker-compose.yml up -d
+```
+
+Con los contenedores sanos, aplicá los roles de mínimo privilegio (uno por
+servicio, KTD5) y corré las migraciones pendientes — ambos pasos son
+idempotentes, seguros de repetir:
+
+```bash
+psql "$DATABASE_URL" -f infra/roles.sql
+python -m tools.migrate
+```
+
+`libs/db.py` y `tools/migrate.py` leen la cadena de conexión de
+`DATABASE_URL`/`REDIS_URL` (ver el encabezado de `infra/docker-compose.yml`
+para el DSN local por defecto). Sin este paso, cada uno de los cuatro
+procesos de la demo falla al arrancar (no hay más in-memory ni JSON-file
+persistence al que caer).
+
 ## Topología
 
 ```

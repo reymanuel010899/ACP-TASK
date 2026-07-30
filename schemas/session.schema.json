@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/session.schema.json",
+  "$id": "https://treessera.com/schemas/session.schema.json",
   "title": "Session",
   "description": "A short-lived working context bound to its issuing Principal by a REQUIRED ed25519 signature over the session claims. A session without the signed principal link is invalid.",
   "type": "object",

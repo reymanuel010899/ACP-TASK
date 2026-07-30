@@ -1,1 +1,0 @@
-"""Gig Board server package."""

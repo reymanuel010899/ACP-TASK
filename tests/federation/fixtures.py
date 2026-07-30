@@ -7,7 +7,6 @@ Provides:
 - Cleanup utilities
 """
 
-import json
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -316,19 +315,10 @@ class AppClient:
 
 
 @pytest.fixture
-def registry_data_dir(tmp_path):
-    """Temporary directory for registry data."""
-    return tmp_path
-
-
-@pytest.fixture
-def registry_service(registry_data_dir):
-    """Create a RegistryService with persistence."""
-    index_path = registry_data_dir / "registry_index.json"
-    user_index_path = registry_data_dir / "user_index.json"
-
-    index = IndexStore(path=str(index_path))
-    user_index = UserIndex(path=str(user_index_path))
+def registry_service():
+    """Create a RegistryService (Postgres-backed, unit U5)."""
+    index = IndexStore()
+    user_index = UserIndex()
     return RegistryService(index, user_index=user_index)
 
 

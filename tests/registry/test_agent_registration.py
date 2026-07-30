@@ -94,6 +94,32 @@ class TestAgentRegistration:
         assert status == 409, body
         assert "error" in body
 
+    def test_list_all_agents_empty(self, service):
+        """Full directory is empty before any registration."""
+        status, body = service.list_all_agents()
+        assert status == 200, body
+        assert body == {"agents": []}
+
+    def test_list_all_agents_returns_every_agent_with_reputation(self, service):
+        """GET /agents (no capability) returns every registered agent, each
+        with its aggregated reputation slice (neutral for fresh agents)."""
+        register_agent(service, "ed25519_agent_one", name="one",
+                       capabilities=["aws.deploy"])
+        register_agent(service, "ed25519_agent_two", name="two",
+                       capabilities=["terraform.apply", "k8s.manage"])
+        status, body = service.list_all_agents()
+        assert status == 200, body
+        agents = body["agents"]
+        assert len(agents) == 2
+        ids = {item["agent"]["principal_id"] for item in agents}
+        assert ids == {"ed25519_agent_one", "ed25519_agent_two"}
+        for item in agents:
+            assert item["agent"]["agent_card"]["name"] in {"one", "two"}
+            # Fresh agents are reputation-neutral (0/0/null), not 0.0.
+            assert item["reputation"]["verification_rate"] is None
+            assert item["reputation"]["tasks_verified"] == 0
+            assert item["reputation"]["tasks_rejected"] == 0
+
     def test_register_missing_capabilities_is_422(self, service):
         """Scenario 3a: agent_card without capabilities -> 422."""
         status, body = service.register_agent(
@@ -406,7 +432,7 @@ class TestBackwardCompatibility:
                     "capabilities": {
                         "extensions": [
                             {
-                                "uri": "https://agenttrust.example/"
+                                "uri": "https://treessera.com/"
                                 "extensions/trust/v1"
                             }
                         ]

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/counter-offer.schema.json",
+  "$id": "https://treessera.com/schemas/counter-offer.schema.json",
   "title": "CounterOffer",
   "description": "A requester's single-round counter-offer proposing a lower price for an existing task (the 'task.counter' message body, RFC-0002). The provider accepts if 'proposed_price' meets or exceeds its private reservation, otherwise it holds its floor. There is no unbounded haggling: one counter per task.",
   "type": "object",

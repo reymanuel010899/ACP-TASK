@@ -10,6 +10,8 @@ import requests
 
 from apps.gig_board.server.app import make_server as make_gig_board
 from apps.marketplace.server.app import make_server as make_marketplace
+from libs.db import Database
+from libs.ulid import generate_ulid
 
 
 def base_url(server):
@@ -91,6 +93,14 @@ def test_user_can_participate_in_both_apps(gig_board, marketplace):
         base_url(marketplace) + "/api/tasks",
         timeout=5,
     )
+    # Unit U7: gig-board's Service listing is now a row in the SAME shared
+    # ``marketplace.tasks`` table apps/marketplace uses (unit U6), scoped by
+    # capability_id = 'gig-board.gigs'. apps/marketplace's own /api/tasks
+    # excludes rows carrying that capability_id (see
+    # MarketplaceRepository.list_tasks's docstring) precisely so a
+    # marketplace user's task list never shows unrelated gig-board postings
+    # -- so this still sees only the 1 task it created itself, exactly as
+    # before table consolidation.
     assert len(mp_tasks.json()["tasks"]) == 1
 
 
@@ -235,9 +245,18 @@ def test_both_apps_scale_independently(gig_board, marketplace):
 
     # Verify counts
     gb_services = requests.get(base_url(gig_board) + "/api/services", timeout=5)
+    # gig-board's OWN listing stays correctly scoped to its
+    # "gig-board.gigs"-capability rows -- proves it in isolation regardless
+    # of how many unrelated marketplace tasks share the same physical table.
     assert gb_services.json()["total"] == 5
 
     mp_tasks = requests.get(base_url(marketplace) + "/api/tasks", timeout=5)
+    # Unit U7: gig-board's 5 services are now rows in the SAME shared
+    # ``marketplace.tasks`` table (unit U6), but marketplace's own
+    # /api/tasks excludes 'gig-board.gigs'-capability rows -- so its total
+    # is exactly the 3 marketplace tasks this test created, unaffected by
+    # how many unrelated gig-board services exist. See the identical note
+    # in test_user_can_participate_in_both_apps.
     assert mp_tasks.json()["total"] == 3
 
 
@@ -277,3 +296,143 @@ def test_federation_different_data_models(gig_board, marketplace):
     # They're different!
     assert "service_name" not in marketplace_task
     assert "negotiations" not in gig_board_service
+
+
+# ---------------------------------------------------------------------------
+# Unit U7: gig-board consolidated onto the SAME marketplace.tasks table.
+# ---------------------------------------------------------------------------
+
+
+def test_capability_scoping_isolates_services_from_marketplace_tasks(
+    gig_board, marketplace
+):
+    """Prove capability_id-based scoping actually isolates gig-board's own
+    Service/Gig views from apps/marketplace's unrelated tasks that now live
+    in the SAME physical ``marketplace.tasks`` table (unit U6/U7) -- and
+    vice versa: a marketplace task_id is never mistaken for a gig-board
+    resource."""
+    provider = "ed25519_shared_principal"
+
+    # Same principal posts a plain marketplace task AND registers a
+    # gig-board service -- both land as rows in marketplace.tasks.
+    mp_task = requests.post(
+        base_url(marketplace) + "/api/tasks",
+        json={
+            "principal_id": provider,
+            "description": "A perfectly ordinary marketplace task",
+        },
+        timeout=5,
+    ).json()["task"]
+
+    gb_service = requests.post(
+        base_url(gig_board) + "/api/services",
+        json={
+            "principal_id": provider,
+            "service_name": "Isolated Service",
+            "description": "Should never be confused with the task above",
+        },
+        timeout=5,
+    ).json()["service"]
+
+    # gig-board's own listing shows exactly the 1 service it created -- the
+    # marketplace task by the SAME principal never leaks in.
+    services = requests.get(
+        base_url(gig_board) + "/api/services", timeout=5
+    ).json()
+    assert services["total"] == 1
+    assert [s["id"] for s in services["services"]] == [gb_service["id"]]
+
+    # The marketplace task_id is not a gig-board service, and is never
+    # mistaken for a gig either (both scoping checks in
+    # GigBoardRepository -- capability_id AND the "kind" envelope -- hold).
+    not_a_service = requests.get(
+        base_url(gig_board) + "/api/services/%s" % mp_task["id"], timeout=5
+    )
+    assert not_a_service.status_code == 404
+
+    not_a_gig = requests.get(
+        base_url(gig_board) + "/api/gigs?principal_id=%s" % provider,
+        timeout=5,
+    ).json()
+    assert not_a_gig["gigs"] == []  # no gig-board booking exists at all yet
+
+    # And the gig-board service_id is never mistaken for a marketplace task
+    # in the other direction either (defense in depth -- apps/marketplace's
+    # own GET /api/tasks/{id} still finds it, since it IS a real
+    # marketplace.tasks row; what matters is gig-board's OWN scoping, above).
+    mp_view_of_service = requests.get(
+        base_url(marketplace) + "/api/tasks/%s" % gb_service["id"], timeout=5
+    ).json()["task"]
+    assert mp_view_of_service["author_principal"] == provider
+
+
+def test_gigs_completed_is_derived_and_cannot_drift(gig_board):
+    """``gigs_completed`` is a live COUNT over completed
+    ``marketplace.tasks`` rows (``GigBoardRepository.gigs_completed``), not
+    a stored/incremented counter -- so directly manipulating the underlying
+    rows (bypassing every gig-board code path entirely) changes what's
+    reported immediately, proving there is no separate counter to drift out
+    of sync."""
+    provider = "ed25519_derive_provider"
+    buyer = "ed25519_derive_buyer"
+
+    service = requests.post(
+        base_url(gig_board) + "/api/services",
+        json={
+            "principal_id": provider,
+            "service_name": "Derivation Test Service",
+            "description": "Proves gigs_completed can't drift",
+        },
+        timeout=5,
+    ).json()["service"]
+    assert service["gigs_completed"] == 0
+
+    # Complete 2 real gigs through the normal API -- no manual increment
+    # path exists anywhere in this codebase to reach for comparison.
+    for _ in range(2):
+        gig = requests.post(
+            base_url(gig_board) + "/api/gigs",
+            json={
+                "service_id": service["id"],
+                "buyer_principal": buyer,
+                "description": "a booking",
+            },
+            timeout=5,
+        ).json()["gig"]
+        requests.post(
+            base_url(gig_board) + "/api/gigs/%s/complete" % gig["id"],
+            json={"buyer_principal": buyer, "outcome": "done"},
+            timeout=5,
+        )
+
+    after_two = requests.get(
+        base_url(gig_board) + "/api/services/%s" % service["id"], timeout=5
+    ).json()["service"]
+    assert after_two["gigs_completed"] == 2
+
+    # Now bypass EVERY gig-board code path and insert a THIRD completed
+    # "gig" row directly, straight into marketplace.tasks -- there is no
+    # gig-board method that could have done this (no increment path
+    # exists), and yet the reported count must already reflect it, because
+    # it's a live query, not a cached/stored field.
+    db = Database()
+    with db.transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO marketplace.tasks
+                    (task_id, author_principal_id, worker_principal_id,
+                     capability_id, description, status)
+                VALUES (%s, %s, %s, 'gig-board.gigs', %s, 'completed')
+                """,
+                (
+                    generate_ulid(), buyer, provider,
+                    '{"kind": "gig", "service_id": "%s", '
+                    '"description": "injected directly"}' % service["id"],
+                ),
+            )
+
+    after_direct_insert = requests.get(
+        base_url(gig_board) + "/api/services/%s" % service["id"], timeout=5
+    ).json()["service"]
+    assert after_direct_insert["gigs_completed"] == 3

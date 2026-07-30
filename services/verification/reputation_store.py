@@ -1,19 +1,49 @@
 """Storage for the AgentTrust Verification & Reputation Service.
 
-In-memory by default, with optional JSON-file persistence:
+Unit U5 (database architecture): reputation records and the verified-work
+portfolio -- the ``_reputation``/``_portfolio`` dicts this class used to
+keep in-memory -- now go through
+``libs.reputation_repository.ReputationRepository`` against the SAME
+Postgres ``trust.reputation_records``/``trust.reputation_portfolio`` tables
+Registry's ``registry/user_index.py`` writes through. This is R2's
+consolidation: a verdict recorded here is visible to a Registry search on
+its very next read, with no manual sync step and no shared Python object
+required (see ``libs/reputation_repository.py``'s docstring, and
+``tests/registry/test_reputation_unification.py`` for a cross-service,
+two-independent-connections proof).
 
-* ``path`` — Verification Results and Reputation Records are loaded from and
-  saved to this file after every mutation.
-* ``revocation_path`` — the Principal key revocation list (a JSON array of
-  strings; each entry is either a ``principal_id`` or a base64 ``public_key``)
-  is loaded from this file and saved back when mutated at runtime.
+``_results`` (Verification Results by ``evidence_id``) and ``_revoked``
+(the Principal key/id revocation list) are UNCHANGED by this unit -- they
+stay exactly as they were, in-memory with optional JSON-file persistence
+(``path``/``revocation_path``). The plan's scope for this unit calls out
+only the reputation/portfolio dicts; wiring the full Evidence/
+VerificationResult submission trail into ``trust.evidence``/
+``trust.verification_results`` is a larger change deferred past this unit
+(see ``libs/reputation_repository.py``'s module docstring for the detailed
+reasoning) -- those two tables are created by this unit's migration for
+schema completeness (``trust.reputation_portfolio.evidence_id`` has a real,
+enforced foreign key into ``trust.evidence``, satisfied here via a minimal
+placeholder row -- see ``ReputationRepository.add_portfolio_entry``) but are
+not yet the backing store for ``put_result``/``get_result``.
+
+Unit U10 checked ``path``/``revocation_path`` against KTD9's cutover list
+and kept them: unlike ``registry/index_store.py``'s and
+``registry/user_index.py``'s ``path`` (dead no-ops once Postgres backed
+those stores in this same unit), ``_results``/``_revoked`` never got a
+Postgres table in this plan (the deferral above), so these two arguments
+remain the ONLY durability ``put_result``/``revoke`` have -- removing them
+would delete real persistence, not dead code (see
+``tests/services/test_verification_service.py::TestStorePersistence`` for
+the round-trip these arguments back).
 
 Reputation Records are indexed by the pair ``(principal_id, capability_id)``
 per RFC-0001 §3.6 and obey the neutral-reputation rule: ``verification_rate``
 is ``null`` when both counts are 0, and the derived ratio otherwise.
 
-Thread-safe (a single lock guards all mutation) so it can back the
-``ThreadingHTTPServer`` in ``app.py``.
+Thread-safe for the parts still in-memory (a single lock guards ``_results``/
+``_revoked`` mutation); reputation/portfolio concurrency safety now comes
+from Postgres itself (see ``ReputationRepository.record_verdict``'s
+docstring), not this class's lock.
 """
 
 import datetime
@@ -21,7 +51,9 @@ import json
 import os
 import threading
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
+from libs.reputation_repository import ReputationRepository
 
 
 def _utcnow_rfc3339():
@@ -37,24 +69,17 @@ def _utcnow_rfc3339():
 class ReputationStore(object):
     """Store for Verification Results, Reputation Records, and revocations."""
 
-    def __init__(self, path=None, revocation_path=None):
-        # type: (Optional[str], Optional[str]) -> None
+    def __init__(self, path=None, revocation_path=None, db=None):
+        # type: (Optional[str], Optional[str], Optional[object]) -> None
         self._lock = threading.RLock()
         self._path = path
         self._revocation_path = revocation_path
+        self._repository = ReputationRepository(db=db)
 
-        # evidence_id -> Verification Result
+        # evidence_id -> Verification Result (unchanged by U5, see docstring)
         self._results = {}  # type: Dict[str, dict]
-        # (principal_id, capability_id) -> Reputation Record
-        self._reputation = {}  # type: Dict[Tuple[str, str], dict]
-        # (subject principal_id, capability_id) -> list of verified portfolio
-        # entries, in insertion order. Only 'verified' work is ever appended.
-        self._portfolio = {}  # type: Dict[Tuple[str, str], List[dict]]
-        # Monotonic sequence for portfolio ordering. verified_at is only
-        # second-resolution, so it can tie; the sequence breaks ties so
-        # "newest first" is honored even within the same second.
-        self._portfolio_seq = 0
-        # Revoked principal_ids and/or public_keys, in one set.
+        # Revoked principal_ids and/or public_keys, in one set (unchanged by
+        # U5, see docstring).
         self._revoked = set()  # type: Set[str]
 
         if path is not None and os.path.exists(path):
@@ -62,28 +87,21 @@ class ReputationStore(object):
         if revocation_path is not None and os.path.exists(revocation_path):
             self._load_revocations(revocation_path)
 
-    # -- persistence --------------------------------------------------------
+    # -- persistence (verification results only -- see docstring) ------------
 
     def _load_data(self, path):
         # type: (str) -> None
         with open(path) as f:
             data = json.load(f)
         self._results = dict(data.get("verification_results", {}))
-        self._reputation = {
-            (rec["principal_id"], rec["capability_id"]): rec
-            for rec in data.get("reputation_records", [])
-        }
-        self._portfolio = {
-            (slot["principal_id"], slot["capability_id"]): list(slot["entries"])
-            for slot in data.get("portfolios", [])
-        }
-        seqs = [
-            e["_seq"]
-            for entries in self._portfolio.values()
-            for e in entries
-            if isinstance(e.get("_seq"), int)
-        ]
-        self._portfolio_seq = max(seqs) if seqs else 0
+
+    def _save_data(self):
+        # type: () -> None
+        if self._path is None:
+            return
+        payload = {"verification_results": self._results}
+        with open(self._path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
 
     def _load_revocations(self, path):
         # type: (str) -> None
@@ -94,28 +112,6 @@ class ReputationStore(object):
                 "revocation file must contain a JSON array of strings"
             )
         self._revoked = set(str(e) for e in entries)
-
-    def _save_data(self):
-        # type: () -> None
-        if self._path is None:
-            return
-        payload = {
-            "verification_results": self._results,
-            "reputation_records": sorted(
-                self._reputation.values(),
-                key=lambda r: (r["principal_id"], r["capability_id"]),
-            ),
-            "portfolios": [
-                {
-                    "principal_id": pid,
-                    "capability_id": cid,
-                    "entries": entries,
-                }
-                for (pid, cid), entries in sorted(self._portfolio.items())
-            ],
-        }
-        with open(self._path, "w") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
 
     def _save_revocations(self):
         # type: () -> None
@@ -148,19 +144,10 @@ class ReputationStore(object):
         """
         if result.get("verdict") != "verified":
             return
-        with self._lock:
-            self._portfolio_seq += 1
-            entry = {
-                "evidence_id": result["evidence_id"],
-                "capability_id": capability_id,
-                "verdict": "verified",
-                "verified_at": result.get("verified_at"),
-                "_seq": self._portfolio_seq,
-            }
-            self._portfolio.setdefault((principal_id, capability_id), []).append(
-                entry
-            )
-            self._save_data()
+        self._repository.add_portfolio_entry(
+            principal_id, capability_id, result["evidence_id"],
+            verified_at=result.get("verified_at"),
+        )
 
     def get_portfolio(self, principal_id, capability_id=None, limit=None):
         # type: (str, Optional[str], Optional[int]) -> List[dict]
@@ -168,68 +155,29 @@ class ReputationStore(object):
 
         Empty (never an error) for a principal with no verified history.
         """
-        with self._lock:
-            items = []  # type: List[dict]
-            for (pid, cid), entries in self._portfolio.items():
-                if pid == principal_id and (
-                    capability_id is None or cid == capability_id
-                ):
-                    items.extend(entries)
-        # Newest first: by timestamp, then insertion sequence to break
-        # same-second ties (the sequence is monotonic with append order).
-        items.sort(
-            key=lambda e: (e.get("verified_at") or "", e.get("_seq", 0)),
-            reverse=True,
+        return self._repository.get_portfolio(
+            principal_id, capability_id=capability_id, limit=limit
         )
-        if limit is not None:
-            items = items[:limit]
-        # _seq is an internal ordering aid; never leak it to API consumers.
-        return [{k: v for k, v in e.items() if k != "_seq"} for e in items]
 
     # -- reputation records ---------------------------------------------------
 
     def get_reputation(self, principal_id, capability_id=None):
         # type: (str, Optional[str]) -> List[dict]
         """All Reputation Records for a principal, optionally one capability."""
-        with self._lock:
-            return [
-                rec
-                for (pid, cid), rec in sorted(self._reputation.items())
-                if pid == principal_id
-                and (capability_id is None or cid == capability_id)
-            ]
+        return self._repository.get_reputation(
+            principal_id, capability_id=capability_id
+        )
 
     def record_verdict(self, principal_id, capability_id, verdict):
         # type: (str, str, str) -> dict
         """Fold one verdict into the (principal, capability) record.
 
-        Returns the updated Reputation Record (a fresh copy each call so
-        previously returned records are not mutated in place).
+        Returns the updated Reputation Record. The ONE write path for
+        reputation (R2) -- shared with Registry via
+        ``libs.reputation_repository.ReputationRepository`` against the
+        same Postgres table.
         """
-        if verdict not in ("verified", "rejected"):
-            raise ValueError("verdict must be 'verified' or 'rejected'")
-        with self._lock:
-            key = (principal_id, capability_id)
-            previous = self._reputation.get(key)
-            verified = previous["tasks_verified"] if previous else 0
-            rejected = previous["tasks_rejected"] if previous else 0
-            if verdict == "verified":
-                verified += 1
-            else:
-                rejected += 1
-            total = verified + rejected
-            record = {
-                "principal_id": principal_id,
-                "capability_id": capability_id,
-                "tasks_verified": verified,
-                "tasks_rejected": rejected,
-                # Neutral-reputation rule: null when no data, never 0.0.
-                "verification_rate": (verified / total) if total else None,
-                "updated_at": _utcnow_rfc3339(),
-            }
-            self._reputation[key] = record
-            self._save_data()
-            return record
+        return self._repository.record_verdict(principal_id, capability_id, verdict)
 
     # -- revocation list -------------------------------------------------------
 

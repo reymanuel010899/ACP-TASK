@@ -12,13 +12,16 @@ production wiring works (--registry-url / --vault-url equivalents via
 ``make_server`` kwargs, service registration via ``POST /apps/register``).
 
 Note on per-capability reputation reads (scenarios 3, 4, 10): the Registry
-exposes per-capability reputation records only via ``GET /users/{id}``,
-which answers 404 for agent-only principals (``GET /agents/{id}`` returns
-the AGGREGATED reputation). Reputation records live in one shared store
-keyed by (principal, capability), so these tests additionally register the
-agent's principal_id through ``POST /auth/register`` — a public-API-only
-step that makes the per-capability breakdown readable without touching any
-production code.
+exposes per-capability reputation records via ``GET /users/{id}`` (``GET
+/agents/{id}`` returns the AGGREGATED reputation instead). Reputation
+records live in one shared store keyed by (principal, capability). Before
+unit U5 (database architecture), ``GET /users/{id}`` 404'd for agent-only
+principals, so these tests worked around it by additionally registering the
+agent's principal_id through ``POST /auth/register``. Since U5 unified
+Users and Agents into one ``identity.principals`` table (R2), that
+workaround would instead collide on the primary key -- so ``GET
+/users/{id}`` was changed to serve any registered principal regardless of
+type (registry/user_index.py), and the workaround is no longer needed here.
 """
 
 import threading
@@ -384,10 +387,9 @@ class TestGigBoardAgentWork:
         assert reputation["tasks_verified"] == 1
         assert reputation["verification_rate"] == 1.0
 
-        # The record is attributed to the gig-board capability (mirror the
-        # principal into the user store to read the per-capability records;
-        # see module docstring).
-        _register_user(stack.registry, "agent:b")
+        # The record is attributed to the gig-board capability. GET /users/{id}
+        # now serves any registered principal (registry/user_index.py, U5),
+        # not only type="user", so no extra registration step is needed here.
         records = _reputation_records(stack.registry, "agent:b")
         assert len(records) == 1
         assert records[0]["capability_id"] == GIG_BOARD_CAP
@@ -412,7 +414,6 @@ class TestCrossCapabilityIsolation:
 
         # Per-capability records distinguish capability_id: agent A has a
         # marketplace.tasks record and NO gig-board.gigs record.
-        _register_user(stack.registry, "agent:a")
         records = _reputation_records(stack.registry, "agent:a")
         by_capability = {r["capability_id"]: r for r in records}
         assert MARKETPLACE_CAP in by_capability
@@ -458,7 +459,6 @@ class TestMixedCrossAppHistory:
         assert reputation["verification_rate"] == 1.0
 
         # Per-capability records show BOTH apps under ONE principal.
-        _register_user(stack.registry, "agent:a")
         records = _reputation_records(stack.registry, "agent:a")
         by_capability = {r["capability_id"]: r for r in records}
         assert set(by_capability) == {MARKETPLACE_CAP, GIG_BOARD_CAP}
@@ -722,7 +722,6 @@ class TestAutonomousCrossAppCycle:
         assert reputation["tasks_verified"] == 2
         assert reputation["verification_rate"] == 1.0
 
-        _register_user(stack.registry, "agent:c")
         records = _reputation_records(stack.registry, "agent:c")
         assert {r["capability_id"] for r in records} == {
             MARKETPLACE_CAP, GIG_BOARD_CAP,

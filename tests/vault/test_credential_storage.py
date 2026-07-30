@@ -147,31 +147,71 @@ def test_rotate_keyring_unknown_user_404(client):
     assert excinfo.value.response.status_code == 404
 
 
-# Scenario 13: rotation logs audit event with reason -------------------------
+# Scenario 13: rotation logs a CENTRAL audit entry with the reason ----------
+#
+# Unit U4 deviation (documented R10 exception, see vault/app.py's module
+# docstring): the vault's local, in-memory audit log (vault/audit_log.py)
+# has been removed -- GET /audit now PROXIES to the central Audit &
+# Compliance service instead of reading a local list, per KTD3. That means
+# this scenario needs a real (ephemeral) audit service wired via audit_url
+# to observe anything at all -- the shared `vault` fixture used elsewhere in
+# this file has no audit_url and would see an empty NullAuditClient result,
+# which is expected/correct, not a bug. The entry shape read here is also
+# the central one: activity_type "keyring.rotate" (not the old local
+# "keyring_rotated"), with the rotation reason nested under `details`
+# (not a top-level "reason" key).
 
 
-def test_rotation_logs_audit_event_with_reason(client, vault):
-    user = "ed25519_erin"
-    client.register_user_keyring(
-        "pw-1", user, os.urandom(32), iterations=TEST_ITERATIONS
-    )
-    client.change_password(
-        user, "pw-1", "pw-2",
-        rotation_reason="suspected phishing",
-        iterations=TEST_ITERATIONS,
-    )
+def test_rotation_logs_audit_event_with_reason():
+    from audit.app import make_server as make_audit_server
 
-    resp = requests.get(
-        base_url(vault) + "/audit", params={"principal_id": user}, timeout=5
+    audit_server = make_audit_server(port=0)
+    audit_thread = threading.Thread(
+        target=audit_server.serve_forever, daemon=True
     )
-    assert resp.status_code == 200
-    entries = resp.json()["entries"]
-    rotations = [e for e in entries if e["action"] == "keyring_rotated"]
-    assert len(rotations) == 1
-    entry = rotations[0]
-    assert entry["principal_id"] == user
-    assert entry["reason"] == "suspected phishing"
-    assert "timestamp" in entry
+    audit_thread.start()
+
+    vault_server = make_server(port=0, audit_url=base_url(audit_server))
+    vault_thread = threading.Thread(
+        target=vault_server.serve_forever, daemon=True
+    )
+    vault_thread.start()
+    try:
+        vault_client = VaultClient(base_url(vault_server))
+        # Unique per test run: the central audit.audit_log table persists
+        # across runs (unlike the old per-test in-memory list), and this
+        # asserts an EXACT count of matching entries for this principal_id.
+        user = "ed25519_erin_%s" % os.urandom(4).hex()
+        vault_client.register_user_keyring(
+            "pw-1", user, os.urandom(32), iterations=TEST_ITERATIONS
+        )
+        vault_client.change_password(
+            user, "pw-1", "pw-2",
+            rotation_reason="suspected phishing",
+            iterations=TEST_ITERATIONS,
+        )
+
+        resp = requests.get(
+            base_url(vault_server) + "/audit",
+            params={"principal_id": user}, timeout=5,
+        )
+        assert resp.status_code == 200
+        entries = resp.json()["entries"]
+        rotations = [
+            e for e in entries if e["activity_type"] == "keyring.rotate"
+        ]
+        assert len(rotations) == 1
+        entry = rotations[0]
+        assert entry["principal_id"] == user
+        assert entry["details"]["reason"] == "suspected phishing"
+        assert "timestamp" in entry
+    finally:
+        vault_server.shutdown()
+        vault_server.server_close()
+        vault_thread.join(timeout=5)
+        audit_server.shutdown()
+        audit_server.server_close()
+        audit_thread.join(timeout=5)
 
 
 # Scenario 8: credential upload + metadata-only listing ----------------------

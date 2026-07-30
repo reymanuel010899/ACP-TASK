@@ -1,44 +1,37 @@
-"""Storage for the AgentTrust Reference Registry.
+"""Registrations and API-key management for the AgentTrust Reference Registry.
 
-Two concerns, one store:
+Unit U5: this module is now a thin wrapper over
+:class:`registry.repository.RegistryRepository` (Postgres, ``registry``
+schema) -- the actual persistence logic moved to ``registry/repository.py``
+so it's shared with ``registry/agent_index.py`` and
+``registry/app_registry.py`` against the same tables. ``IndexStore`` keeps
+its exact pre-existing public method signatures so ``registry/app.py`` and
+every existing test needed no changes here.
 
-* **Registrations** — ``principal_id -> {principal_id, agent_card,
-  registered_at}`` plus a capability index (each ``skills[].id`` on the card
-  is a capability id). In-memory by default; when ``path`` is given, the
-  registrations are loaded from and saved to that JSON file after every
-  mutation (the capability index is rebuilt from the cards on load, so the
-  file stays a plain list of registrations).
-* **API keys** — the invite keys that gate ``POST /register`` (anti-Sybil
-  friction, KTD8). Keys minted at runtime live in memory; ``api_keys_path``
-  optionally seeds the set from a JSON array of strings (the file is never
-  written back — it is operator-owned input).
-
-Thread-safe (a single lock guards all mutation) so it can back the
-``ThreadingHTTPServer`` in ``registry.app``.
+Unit U10 (KTD9): the dead ``path`` constructor argument and its
+corresponding ``--index-path`` CLI flag are removed -- registrations
+persist via Postgres unconditionally now, so there is nothing left for a
+JSON-file path to do. ``api_keys_path`` stays: it seeds the given raw keys
+as valid, hashed the same way a minted key is (R8) -- this is genuinely
+still needed (``tests/registry/test_agent_registration.py``'s
+``test_api_keys_seeded_from_file`` exercises it).
 """
 
-import datetime
 import json
 import os
-import secrets
-import threading
 
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 
-
-def _utcnow_rfc3339():
-    # type: () -> str
-    return (
-        datetime.datetime.now(datetime.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+from registry.repository import RegistryRepository
 
 
 def card_capability_ids(agent_card):
     # type: (dict) -> List[str]
-    """The capability ids an Agent Card offers: each ``skills[].id``."""
+    """The capability ids an Agent Card offers: each ``skills[].id`` --
+    the legacy (``POST /register``) extraction convention. See
+    ``registry/repository.py``'s docstring for why this convention and
+    ``AgentIndex``'s ``agent_card["capabilities"]`` list convention both
+    stay, backed by the same indexed tables."""
     skills = agent_card.get("skills") or []
     ids = []
     for skill in skills:
@@ -48,109 +41,56 @@ def card_capability_ids(agent_card):
 
 
 class IndexStore(object):
-    """Registrations, capability index, and API-key management."""
+    """Registrations, capability index, and API-key management (Postgres-backed,
+    unit U5)."""
 
-    def __init__(self, path=None, api_keys_path=None):
-        # type: (Optional[str], Optional[str]) -> None
-        self._lock = threading.RLock()
-        self._path = path
-
-        # principal_id -> registration dict
-        self._registrations = {}  # type: Dict[str, dict]
-        # capability_id -> set of principal_ids
-        self._by_capability = {}  # type: Dict[str, Set[str]]
-        # Valid invite/API keys.
-        self._api_keys = set()  # type: Set[str]
-
-        if path is not None and os.path.exists(path):
-            self._load(path)
+    def __init__(self, api_keys_path=None, db=None):
+        # type: (Optional[str], Optional[object]) -> None
+        self._repo = RegistryRepository(db=db)
         if api_keys_path is not None and os.path.exists(api_keys_path):
-            self._load_api_keys(api_keys_path)
+            self._seed_api_keys(api_keys_path)
 
-    # -- persistence ----------------------------------------------------------
-
-    def _load(self, path):
-        # type: (str) -> None
-        with open(path) as f:
-            registrations = json.load(f)
-        if not isinstance(registrations, list):
-            raise ValueError("index file must contain a JSON array")
-        for registration in registrations:
-            self._index(registration)
-
-    def _load_api_keys(self, path):
+    def _seed_api_keys(self, path):
         # type: (str) -> None
         with open(path) as f:
             keys = json.load(f)
         if not isinstance(keys, list):
             raise ValueError("api keys file must contain a JSON array")
-        self._api_keys.update(str(k) for k in keys)
-
-    def _save(self):
-        # type: () -> None
-        if self._path is None:
-            return
-        registrations = sorted(
-            self._registrations.values(), key=lambda r: r["principal_id"]
-        )
-        with open(self._path, "w") as f:
-            json.dump(registrations, f, indent=2, sort_keys=True)
+        for key in keys:
+            self._repo.seed_api_key(str(key))
 
     # -- registrations ---------------------------------------------------------
-
-    def _index(self, registration):
-        # type: (dict) -> None
-        principal_id = registration["principal_id"]
-        previous = self._registrations.get(principal_id)
-        if previous is not None:
-            for capability_id in card_capability_ids(previous["agent_card"]):
-                self._by_capability.get(capability_id, set()).discard(
-                    principal_id
-                )
-        self._registrations[principal_id] = registration
-        for capability_id in card_capability_ids(registration["agent_card"]):
-            self._by_capability.setdefault(capability_id, set()).add(
-                principal_id
-            )
 
     def register(self, principal_id, agent_card):
         # type: (str, dict) -> dict
         """Store (or replace) a registration; index its capabilities."""
-        registration = {
-            "principal_id": principal_id,
-            "agent_card": agent_card,
-            "registered_at": _utcnow_rfc3339(),
-        }
-        with self._lock:
-            self._index(registration)
-            self._save()
-            return registration
+        return self._repo.register_registration(
+            principal_id, agent_card, card_capability_ids(agent_card)
+        )
 
     def get(self, principal_id):
         # type: (str) -> Optional[dict]
-        with self._lock:
-            return self._registrations.get(principal_id)
+        return self._repo.get_registration(principal_id)
 
     def find_by_capability(self, capability_id):
         # type: (str) -> List[dict]
         """Registrations offering the capability, ordered by principal_id."""
-        with self._lock:
-            principal_ids = sorted(self._by_capability.get(capability_id, ()))
-            return [self._registrations[pid] for pid in principal_ids]
+        return self._repo.find_registrations_by_capability(capability_id)
+
+    def list_capabilities(self):
+        # type: () -> List[dict]
+        """The capability catalog with card-derived context (name,
+        description, tags) and the agents declaring each capability."""
+        return self._repo.list_capabilities()
 
     # -- API keys ---------------------------------------------------------------
 
     def issue_api_key(self):
         # type: () -> str
-        """Mint a new invite/API key and remember it as valid."""
-        key = "atk_%s" % secrets.token_urlsafe(24)
-        with self._lock:
-            self._api_keys.add(key)
-        return key
+        """Mint a new invite/API key and remember it as valid. The raw token
+        is returned ONCE, here; only its hash is ever stored (R8)."""
+        return self._repo.issue_api_key()
 
     def is_valid_api_key(self, key):
         # type: (object) -> bool
-        if not isinstance(key, str) or not key:
-            return False
-        with self._lock:
-            return key in self._api_keys
+        return self._repo.is_valid_api_key(key)

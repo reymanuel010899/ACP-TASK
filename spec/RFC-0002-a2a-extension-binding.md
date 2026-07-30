@@ -7,7 +7,7 @@
 - **Examples:** `examples/agent-card-with-extension.json`, `examples/task-message-with-evidence.json`
 
 > The project name **AgentTrust** is a provisional placeholder, as is the
-> `agenttrust.example` domain in all URIs below. Both will be replaced before
+> `treessera.com` domain in all URIs below. Both will be replaced before
 > any non-draft release; the *structure* of this binding is what is specified.
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be
@@ -25,7 +25,7 @@ document alone.
 The extension is identified everywhere by the single URI:
 
 ```
-https://agenttrust.example/extensions/trust/v1
+https://treessera.com/extensions/trust/v1
 ```
 
 ## 2. Declaration on the Agent Card
@@ -37,12 +37,12 @@ AgentTrust MUST add one `AgentExtension` object to
 
 ```json
 {
-  "uri": "https://agenttrust.example/extensions/trust/v1",
+  "uri": "https://treessera.com/extensions/trust/v1",
   "description": "AgentTrust trust layer: signed sessions, verifiable evidence, per-capability reputation.",
   "required": false,
   "params": {
     "principal_id": "atp:principal:agents.example.com:terraformsmith",
-    "verification_service_url": "https://verify.agenttrust.example/v1"
+    "verification_service_url": "https://verify.treessera.com/v1"
   }
 }
 ```
@@ -75,7 +75,7 @@ Extension activation follows A2A's standard opt-in flow:
 1. The client reads the Agent Card and sees the extension declared.
 2. On each request where it wants trust data, the client sends the HTTP
    header `A2A-Extensions:` with a comma-separated list of extension URIs
-   that includes `https://agenttrust.example/extensions/trust/v1`.
+   that includes `https://treessera.com/extensions/trust/v1`.
 3. A compliant server echoes back the extensions it actually activated
    (per A2A: the `A2A-Extensions` response header). The client MUST treat
    the extension as active only if the server echoed its URI.
@@ -92,7 +92,7 @@ fields:
 - `Message.extensions[]` MUST include the extension URI, signalling that
   extension data is present on this message.
 - `Message.metadata` MUST contain the key
-  `"https://agenttrust.example/extensions/trust/v1"` — the extension URI
+  `"https://treessera.com/extensions/trust/v1"` — the extension URI
   used verbatim as a namespace key — whose value is the **trust metadata
   payload**:
 
@@ -172,7 +172,7 @@ just etiquette).
 ### 6.2 Offer body (`schemas/offer.schema.json`)
 
 `task.offer` carries a public `price` and `currency`
-(`$id: https://agenttrust.example/schemas/offer.schema.json`). The price is a
+(`$id: https://treessera.com/schemas/offer.schema.json`). The price is a
 demo-scale number; **no real funds move** — escrow/payment is out of scope for
 this binding (a payment extension such as `a2a-x402` is the natural future
 home).
@@ -278,7 +278,7 @@ only to those that ask for one.
 ## 8. Descriptor schema
 
 `schemas/a2a-extension-descriptor.schema.json`
-(`$id: https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json`)
+(`$id: https://treessera.com/schemas/a2a-extension-descriptor.schema.json`)
 validates both shapes this binding introduces:
 
 - `#/definitions/agentExtension` — the Agent Card declaration entry (§2);
@@ -287,7 +287,7 @@ validates both shapes this binding introduces:
 The root schema is a `oneOf` of the two, so any AgentTrust-shaped fragment
 can be checked against the schema as a whole. Relative `$ref`s
 (`evidence.schema.json`, `verification-result.schema.json`) resolve against
-the `$id` base `https://agenttrust.example/schemas/`; offline validators
+the `$id` base `https://treessera.com/schemas/`; offline validators
 SHOULD preload the sibling schema files into their resolver rather than
 fetching them.
 

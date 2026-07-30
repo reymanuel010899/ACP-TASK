@@ -127,7 +127,7 @@ def test_schema_file_is_valid_draft07(name):
 @pytest.mark.parametrize("name", SCHEMA_NAMES)
 def test_schema_has_expected_id(name):
     schema = load_schema(name)
-    assert schema["$id"] == f"https://agenttrust.example/schemas/{name}.schema.json"
+    assert schema["$id"] == f"https://treessera.com/schemas/{name}.schema.json"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/user-principal.schema.json",
+  "$id": "https://treessera.com/schemas/user-principal.schema.json",
   "title": "UserPrincipal",
   "description": "A user Principal registered in the AgentTrust federation. Users are identified by their ed25519 Principal and may have an optional username for display.",
   "type": "object",

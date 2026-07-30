@@ -20,7 +20,7 @@ as described in RFC 2119.
 ## 2. Conventions
 
 - Every object is a JSON object validated by a draft-07 JSON Schema whose
-  `$id` is `https://agenttrust.example/schemas/<name>.schema.json`.
+  `$id` is `https://treessera.com/schemas/<name>.schema.json`.
 - `additionalProperties` is `false` on every object. Unknown top-level fields
   are a validation error. Extensions MUST be placed in the optional
   `extensions` object present on every type; keys inside it SHOULD be

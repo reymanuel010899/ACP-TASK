@@ -44,8 +44,11 @@ import argparse
 import base64
 import binascii
 import datetime
+import importlib
 import json
+import os
 import re
+import threading
 import uuid
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +60,10 @@ import jsonschema
 import nacl.exceptions
 import nacl.signing
 
+from agents.orchestrator.attestation import (
+    AttestationError,
+    verify_execution_attestation,
+)
 from services.verification.reputation_store import ReputationStore
 
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schemas"
@@ -214,10 +221,18 @@ def validate_terraform_syntax(text):
 class VerificationService(object):
     """Core accept/reject pipeline; callable directly from tests (no HTTP)."""
 
-    def __init__(self, store, verifier_principal_id=DEFAULT_VERIFIER_PRINCIPAL_ID):
-        # type: (ReputationStore, str) -> None
+    def __init__(
+        self,
+        store,
+        verifier_principal_id=DEFAULT_VERIFIER_PRINCIPAL_ID,
+        broker_keys=None,
+        receipt_verifiers=None,
+    ):
         self.store = store
         self.verifier_principal_id = verifier_principal_id
+        self.broker_keys = broker_keys or {}
+        self.receipt_verifiers = dict(receipt_verifiers or {})
+        self._execution_lock = threading.RLock()
 
     # -- pipeline -------------------------------------------------------------
 
@@ -235,6 +250,8 @@ class VerificationService(object):
         if not isinstance(payload, dict):
             return 422, {"error": "request body must be a JSON object"}
         evidence = payload.get("evidence")
+        if isinstance(evidence, dict) and "execution_attestation" in evidence:
+            return self.process_execution_evidence(evidence)
         session = payload.get("session")
         principal = payload.get("principal")
         for name, obj in (
@@ -306,6 +323,93 @@ class VerificationService(object):
             principal["principal_id"], evidence["capability_id"], result
         )
         return 200, {"verification_result": result, "reputation_record": record}
+
+    def process_execution_evidence(self, evidence):
+        """Verify broker authority, replay identity, and provider-grounded fields."""
+        with self._execution_lock:
+            return self._process_execution_evidence(evidence)
+
+    def _process_execution_evidence(self, evidence):
+        error = _schema_error(_EVIDENCE_VALIDATOR, evidence)
+        if error:
+            return 422, {
+                "evidence_status": "rejected",
+                "error": "invalid evidence: %s" % error,
+            }
+        attestation = evidence["execution_attestation"]
+        try:
+            verify_execution_attestation(attestation, self.broker_keys)
+        except AttestationError:
+            return 422, {
+                "evidence_status": "rejected",
+                "error": "invalid broker execution attestation",
+            }
+        if self.store.is_revoked(
+            attestation.get("agent_principal_id"),
+            attestation.get("user_principal_id"),
+            attestation.get("broker_key_id"),
+        ):
+            return 403, {
+                "evidence_status": "rejected",
+                "error": "revoked execution principal or broker key",
+            }
+        if (
+            evidence["evidence_id"] != attestation["attestation_id"]
+            or evidence["capability_id"] != attestation["capability_id"]
+            or attestation["outcome"] != "succeeded"
+        ):
+            return 422, {
+                "evidence_status": "rejected",
+                "error": "evidence does not match execution attestation",
+            }
+        if self.store.get_result(evidence["evidence_id"]) is not None:
+            return 409, {
+                "evidence_status": "rejected",
+                "error": "execution attestation was already submitted",
+            }
+
+        provider = attestation["provider_receipt"]["provider"]
+        verifier = self.receipt_verifiers.get(provider)
+        if verifier is None:
+            return 200, {
+                "evidence_status": "unverified",
+                "reasoning": "no receipt verifier is configured for %s" % provider,
+            }
+        check = verifier.verify(attestation)
+        verdict = check.get("verdict")
+        reasoning = check.get("reasoning") or "receipt verification failed"
+        if verdict == "unverified":
+            return 200, {
+                "evidence_status": "unverified",
+                "reasoning": reasoning,
+            }
+        if verdict not in ("verified", "rejected"):
+            return 200, {
+                "evidence_status": "unverified",
+                "reasoning": "receipt verifier returned no authoritative verdict",
+            }
+
+        result = self._make_result(
+            evidence["evidence_id"], verdict, reasoning
+        )
+        self.store.put_result(result)
+        response = {
+            "evidence_status": verdict,
+            "verification_result": result,
+        }
+        if verdict == "verified":
+            record = self.store.record_verdict(
+                attestation["agent_principal_id"],
+                attestation["capability_id"],
+                "verified",
+            )
+            self.store.add_portfolio_entry(
+                attestation["agent_principal_id"],
+                attestation["capability_id"],
+                result,
+            )
+            response["reputation_record"] = record
+        return 200, response
 
     def _decide_verdict(self, evidence):
         # type: (dict) -> Tuple[str, str]
@@ -492,6 +596,22 @@ def make_server(port=0, host="127.0.0.1", store=None, service=None, rate_limiter
     return VerificationHTTPServer((host, port), service, rate_limiter=rate_limiter)
 
 
+def load_broker_keys(path, environment=None):
+    """Load attestation trust roots; production never starts without them."""
+    environment = (environment or os.environ.get("TESSERA_ENV", "development")).lower()
+    if not path:
+        if environment == "production":
+            raise RuntimeError(
+                "--broker-keys-path or TESSERA_BROKER_KEYS_PATH is required in production"
+            )
+        return {}
+    with open(path, encoding="utf-8") as key_file:
+        broker_keys = json.load(key_file)
+    if not isinstance(broker_keys, dict) or not broker_keys:
+        raise ValueError("broker keys file must contain a non-empty object")
+    return broker_keys
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="AgentTrust Verification & Reputation Service"
@@ -519,12 +639,38 @@ def main(argv=None):
         default=0,
         help="Max requests per IP per 60s window (0 = off).",
     )
+    parser.add_argument(
+        "--broker-keys-path",
+        default=os.environ.get("TESSERA_BROKER_KEYS_PATH"),
+        help="JSON object mapping trusted broker key ids to public keys.",
+    )
     args = parser.parse_args(argv)
+
+    broker_keys = load_broker_keys(args.broker_keys_path)
+    receipt_verifiers = {}
+    verifier_factory_path = os.environ.get(
+        "TESSERA_RECEIPT_VERIFIER_FACTORY"
+    )
+    if verifier_factory_path:
+        if ":" not in verifier_factory_path:
+            raise ValueError(
+                "TESSERA_RECEIPT_VERIFIER_FACTORY must be module:function"
+            )
+        module_name, factory_name = verifier_factory_path.split(":", 1)
+        factory = getattr(importlib.import_module(module_name), factory_name)
+        receipt_verifiers = factory()
+        if not isinstance(receipt_verifiers, dict):
+            raise TypeError("receipt verifier factory must return a dict")
 
     store = ReputationStore(
         path=args.store_path, revocation_path=args.revocations_path
     )
-    service = VerificationService(store, verifier_principal_id=args.verifier_id)
+    service = VerificationService(
+        store,
+        verifier_principal_id=args.verifier_id,
+        broker_keys=broker_keys,
+        receipt_verifiers=receipt_verifiers,
+    )
     rate_limiter = None
     if args.rate_limit > 0:
         from common.ratelimit import RateLimiter

@@ -43,6 +43,7 @@ import requests
 
 from agent_marketplace.hiring import HiringStore, parse_expires_at
 from libs.audit_client import make_audit_client
+from libs.db import bind_organization_id
 from libs.request_auth import RequestAuthenticator
 
 DEFAULT_HTTP_TIMEOUT = 3.0
@@ -514,6 +515,25 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self.command, self.path, raw_body, self.headers
         )
 
+    def _bind_org_context(self):
+        # type: () -> None
+        """Bind this request's RLS org-context (U9) before any repository
+        call runs, via an optional ``X-Organization-Id`` header (no existing
+        agent_marketplace endpoint accepts an organization in its body/query
+        shape, R10). Unconditional -- even when the header is absent -- so a
+        keep-alive connection reusing this thread never inherits a prior
+        request's value.
+
+        NOTE: ``marketplace.hiring_grants``/``marketplace.ratings``/
+        ``marketplace.rating_summary`` (this service's own tables, U8) have
+        NO RLS policy as of this unit (see migrations/
+        0009_rls_policies.sql's header -- no organization_id column, an
+        explicit scope decision, not an oversight). This call is still
+        made, for consistency with every other service and so the plumbing
+        is already in place the day these tables DO grow tenant scoping.
+        """
+        bind_organization_id(self.headers.get("X-Organization-Id"))
+
     def do_OPTIONS(self):
         # type: () -> None
         """Handle CORS preflight requests."""
@@ -527,6 +547,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         query = parse_qs(parts.query)
@@ -562,6 +583,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         raw, body, error = self._read_json_body()
@@ -589,6 +611,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self):
+        self._bind_org_context()
         parts = urlsplit(self.path)
         segments = [unquote(s) for s in parts.path.split("/") if s]
         query = parse_qs(parts.query)

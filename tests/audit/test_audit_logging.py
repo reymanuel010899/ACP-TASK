@@ -1,10 +1,18 @@
-"""Tests for the central Audit & Compliance service (Phase B, unit U12).
+"""Tests for the central Audit & Compliance service (Phase B unit U12;
+persistence + authentication, unit U4).
 
-Covers the audit service itself (append-only store + HTTP API), the
-best-effort AuditClient, and the ecosystem integrations: Registry, Vault,
-Task Marketplace, and Agent Marketplace emitting central audit entries.
+Covers the audit service itself (now Postgres-backed, append-only at the
+database level -- see ``audit/repository.py`` -- plus the HTTP API and its
+opt-in request authentication), the best-effort AuditClient, and the
+ecosystem integrations: Registry, Vault, Task Marketplace, and Agent
+Marketplace emitting central audit entries.
 
 All servers run on EPHEMERAL ports (port=0), never fixed ports.
+
+Needs a real Postgres with ``migrations/0004_audit.sql`` applied --
+``tests/audit/conftest.py`` truncates ``audit.audit_log`` before every test
+so this suite stays isolated the way a fresh in-memory store used to give
+for free (see that fixture's docstring).
 """
 
 import re
@@ -19,7 +27,7 @@ import requests
 from agent_marketplace.app import make_server as make_agent_marketplace_server
 from apps.marketplace.server.app import make_server as make_marketplace_server
 from audit.app import make_server as make_audit_server
-from audit.audit_store import AuditStore
+from audit.repository import AuditRepository
 from libs.audit_client import AuditClient, NullAuditClient
 from registry.app import make_server as make_registry_server
 from vault.app import make_server as make_vault_server
@@ -164,15 +172,61 @@ def test_put_and_delete_are_405_immutable(audit_server):
     assert body["entries"][0]["status"] == "ok"
 
 
-def test_audit_store_has_no_update_or_delete_api():
-    store = AuditStore()
+def test_audit_repository_has_no_update_or_delete_api():
+    repo = AuditRepository()
     for name in (
         "delete", "remove", "update", "pop", "clear",
         "delete_entry", "update_entry", "remove_entry", "truncate",
     ):
-        assert not hasattr(store, name), (
-            "AuditStore must be append-only; found %r" % name
+        assert not hasattr(repo, name), (
+            "AuditRepository must be append-only; found %r" % name
         )
+
+
+def test_update_and_delete_rejected_at_the_database_level():
+    """The append-only guarantee doesn't rely on this repository (or the
+    HTTP 405s) alone: migrations/0004_audit.sql installs a no-op rule for
+    both UPDATE and DELETE against ``audit.audit_log`` (on top of a
+    ``REVOKE UPDATE, DELETE ... FROM PUBLIC``). A Postgres rule rewrites the
+    query itself regardless of which role issues it -- including the
+    table-owning/migration role, which would otherwise bypass a bare REVOKE
+    -- so this is proven with a direct SQL statement, NOT through the HTTP
+    layer's 405."""
+    from libs.db import Database
+
+    repo = AuditRepository()
+    entry = repo.append(
+        principal_id="user:tamper-target", activity_type="work.bid",
+        status="ok",
+    )
+
+    db = Database()
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            # The rule silently absorbs the statement (no exception, no
+            # effect) -- exactly the DDL's documented "do instead nothing".
+            cur.execute(
+                "UPDATE audit.audit_log SET status = 'tampered' "
+                "WHERE entry_id = %s",
+                (entry["entry_id"],),
+            )
+        conn.commit()
+
+    entries, _total = repo.query(principal_id="user:tamper-target", limit=10)
+    assert len(entries) == 1
+    assert entries[0]["status"] == "ok"  # untouched by the UPDATE attempt
+
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM audit.audit_log WHERE entry_id = %s",
+                (entry["entry_id"],),
+            )
+        conn.commit()
+
+    entries, total = repo.query(principal_id="user:tamper-target", limit=10)
+    assert total == 1
+    assert entries[0]["entry_id"] == entry["entry_id"]  # survived the DELETE
 
 
 # ---------------------------------------------------------------------------
@@ -483,20 +537,247 @@ def test_vault_emits_credential_access_granted_and_denied(audit_server):
         body = _query(audit_url, activity_type="credential.grant")
         assert body["total_matched"] == 1
 
-        # Local vault audit (U7 contract) still works alongside.
+        # Vault's own GET /audit (unit U4) no longer reads a local list --
+        # it PROXIES to the central service and returns THAT shape directly
+        # (activity_type, not the old vault-local "action"; see
+        # vault/app.py's module docstring for why this is a deliberate,
+        # documented R10 exception rather than a silent translation back).
         resp = requests.get(
             "%s/audit" % vault_url,
             params={"principal_id": "agent:worker"},
             timeout=TIMEOUT,
         )
         assert resp.status_code == 200
-        local = resp.json()["entries"]
+        proxied = resp.json()["entries"]
         assert any(
-            e["action"] == "access" and e["status"] == "granted"
-            for e in local
+            e["activity_type"] == "credential.access"
+            and e["status"] == "granted"
+            for e in proxied
         )
+        # There is exactly ONE trail now -- no second, unsynchronized entry
+        # anywhere else: the vault-proxied view and a direct central query
+        # for the same principal return the identical set of entry_ids.
+        direct = _query(audit_url, principal_id="agent:worker")
+        assert {e["entry_id"] for e in proxied} == {
+            e["entry_id"] for e in direct["entries"]
+        }
     finally:
         _stop(vault, thread)
+
+
+# ---------------------------------------------------------------------------
+# 14. Persistence: restarting the audit service does not lose entries
+# ---------------------------------------------------------------------------
+
+
+def test_restart_does_not_lose_previously_written_entries():
+    """A "restart" here means throwing away one AuditService/repository/pool
+    and building a brand new one against the same DATABASE_URL -- the
+    closest a test gets to actually killing and relaunching the process,
+    matching tests/vault/test_persistence.py's convention."""
+    repo_a = AuditRepository()
+    entry = repo_a.append(
+        principal_id="user:restart-survivor", activity_type="work.bid",
+        status="ok", resource_id="task-restart-1",
+    )
+
+    # Fresh repository/pool -- "the process restarted".
+    repo_b = AuditRepository()
+    entries, total = repo_b.query(
+        principal_id="user:restart-survivor", limit=10
+    )
+    assert total == 1
+    assert entries[0]["entry_id"] == entry["entry_id"]
+    assert entries[0]["resource_id"] == "task-restart-1"
+
+
+def test_service_over_http_survives_a_simulated_restart():
+    """Same idea, driven over the real HTTP contract: two independently
+    constructed servers pointed at the same database."""
+    import os
+
+    from libs.db import Database
+
+    dsn = os.environ.get(
+        "DATABASE_URL",
+        "postgresql://postgres:postgres@localhost:5432/agenttrust",
+    )
+
+    server_a = make_audit_server(port=0, db=Database(dsn=dsn))
+    thread_a = _start(server_a)
+    try:
+        entry = _post_entry(
+            _url(server_a), "user:http-restart", "work.bid",
+            resource_id="task-http-restart-1",
+        )
+    finally:
+        _stop(server_a, thread_a)
+
+    server_b = make_audit_server(port=0, db=Database(dsn=dsn))
+    thread_b = _start(server_b)
+    try:
+        body = _query(_url(server_b), principal_id="user:http-restart")
+        assert body["total_matched"] == 1
+        assert body["entries"][0]["entry_id"] == entry["entry_id"]
+    finally:
+        _stop(server_b, thread_b)
+
+
+# ---------------------------------------------------------------------------
+# 15. Security: unauthenticated POST/GET are rejected once signatures are
+#     required (the fix this unit adds: audit/app.py had NO authentication
+#     at all before, unlike every other rewired service).
+# ---------------------------------------------------------------------------
+
+
+def test_unauthenticated_post_and_get_rejected_when_signatures_required():
+    # A resolver is irrelevant here -- these requests never even carry the
+    # auth headers, so authentication fails before any key lookup happens.
+    server = make_audit_server(
+        port=0, require_signatures=True,
+        public_key_resolver=lambda principal_id: principal_id,
+    )
+    thread = _start(server)
+    try:
+        url = _url(server)
+        resp = requests.post(
+            "%s/audit" % url,
+            json={
+                "principal_id": "user:forger",
+                "activity_type": "work.bid",
+                "status": "ok",
+            },
+            timeout=TIMEOUT,
+        )
+        assert resp.status_code == 401, resp.text
+
+        resp = requests.get("%s/audit" % url, timeout=TIMEOUT)
+        assert resp.status_code == 401, resp.text
+
+        # And nothing was actually recorded by the rejected POST.
+        resp = requests.get(
+            "%s/audit" % url,
+            params={"principal_id": "user:forger"},
+            timeout=TIMEOUT,
+        )
+        assert resp.status_code == 401, resp.text
+    finally:
+        _stop(server, thread)
+
+
+def test_authenticated_post_and_get_succeed_when_signatures_required():
+    from libs import request_auth, signing
+
+    principal = signing.generate_keypair()
+    principal_id = principal.public_key_b64()
+    session = signing.generate_keypair()
+    assertion = signing.build_session_assertion(
+        principal_id, principal.signing_key, session.public_key_b64()
+    )
+
+    def resolver(pid):
+        return pid  # principal_id IS its own public key in this MVP
+
+    server = make_audit_server(
+        port=0, require_signatures=True, public_key_resolver=resolver,
+    )
+    thread = _start(server)
+    try:
+        url = _url(server)
+
+        def signed(method, path, payload=None):
+            import os
+            import time
+
+            body_bytes = (
+                b"" if payload is None
+                else __import__("json").dumps(payload).encode("utf-8")
+            )
+            now = time.time()
+            headers = request_auth.build_auth_headers(
+                principal_id, assertion, session.signing_key,
+                method, path, body_bytes, now_ts=now,
+                nonce=os.urandom(8).hex(),
+            )
+            headers["Content-Type"] = "application/json"
+            return requests.request(
+                method, url + path, data=body_bytes, headers=headers,
+                timeout=TIMEOUT,
+            )
+
+        resp = signed(
+            "POST", "/audit",
+            {
+                "principal_id": principal_id,
+                "activity_type": "work.bid",
+                "status": "ok",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        entry_id = resp.json()["entry"]["entry_id"]
+
+        resp = signed("GET", "/audit")
+        assert resp.status_code == 200, resp.text
+        assert any(
+            e["entry_id"] == entry_id for e in resp.json()["entries"]
+        )
+    finally:
+        _stop(server, thread)
+
+
+def test_caller_cannot_forge_an_entry_under_a_principal_it_is_not():
+    """A caller with a VALID signature for principal A cannot make the
+    audit service accept an entry claiming to be principal B -- the
+    authenticator's identity-binding (verified elsewhere in this codebase,
+    e.g. tests/vault/test_signature_enforcement.py) is exercised here at the
+    HTTP layer: the request succeeds as A (whoever signed it), and the
+    caller has no way to make the accepted body's principal_id be anyone
+    else's identity while unauthenticated."""
+    from libs import request_auth, signing
+
+    a = signing.generate_keypair()
+    a_id = a.public_key_b64()
+    a_session = signing.generate_keypair()
+    a_assertion = signing.build_session_assertion(
+        a_id, a.signing_key, a_session.public_key_b64()
+    )
+
+    def resolver(pid):
+        return pid
+
+    server = make_audit_server(
+        port=0, require_signatures=True, public_key_resolver=resolver,
+    )
+    thread = _start(server)
+    try:
+        url = _url(server)
+        import json as _json
+        import os
+        import time
+
+        payload = {
+            "principal_id": "user:someone-else",
+            "activity_type": "work.bid",
+            "status": "ok",
+        }
+        body_bytes = _json.dumps(payload).encode("utf-8")
+        now = time.time()
+        headers = request_auth.build_auth_headers(
+            a_id, a_assertion, a_session.signing_key,
+            "POST", "/audit", body_bytes, now_ts=now,
+            nonce=os.urandom(8).hex(),
+        )
+        # Claim to BE "user:someone-else" in the principal header while only
+        # having signed for `a_id` -- the session assertion cannot verify
+        # against a public key that was never resolved for this principal.
+        headers[request_auth.HEADER_PRINCIPAL] = "user:someone-else"
+        headers["Content-Type"] = "application/json"
+        resp = requests.post(
+            url + "/audit", data=body_bytes, headers=headers, timeout=TIMEOUT
+        )
+        assert resp.status_code == 401, resp.text
+    finally:
+        _stop(server, thread)
 
 
 # ---------------------------------------------------------------------------
@@ -701,18 +982,18 @@ def test_services_without_audit_url_use_null_client_and_work_as_before():
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_store_appends_all_recorded():
-    store = AuditStore()
+def test_concurrent_repository_appends_all_recorded():
+    repo = AuditRepository()
     n_threads, per_thread = 8, 25
 
     def worker(i):
         for j in range(per_thread):
-            store.append({
-                "principal_id": "user:t%d" % i,
-                "activity_type": "stress.test",
-                "status": "ok",
-                "resource_id": "r%d-%d" % (i, j),
-            })
+            repo.append(
+                principal_id="user:t%d" % i,
+                activity_type="stress.test",
+                status="ok",
+                resource_id="r%d-%d" % (i, j),
+            )
 
     threads = [
         threading.Thread(target=worker, args=(i,)) for i in range(n_threads)
@@ -722,7 +1003,10 @@ def test_concurrent_store_appends_all_recorded():
     for t in threads:
         t.join()
 
-    entries = store.query(limit=n_threads * per_thread + 10)
+    entries, total = repo.query(
+        activity_type="stress.test", limit=n_threads * per_thread + 10
+    )
+    assert total == n_threads * per_thread
     assert len(entries) == n_threads * per_thread
     entry_ids = {e["entry_id"] for e in entries}
     assert len(entry_ids) == n_threads * per_thread

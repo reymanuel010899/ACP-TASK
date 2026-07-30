@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/verification-result.schema.json",
+  "$id": "https://treessera.com/schemas/verification-result.schema.json",
   "title": "VerificationResult",
   "description": "The outcome of an independent verifier Principal checking one Evidence bundle: a binary verdict plus human-readable reasoning.",
   "type": "object",

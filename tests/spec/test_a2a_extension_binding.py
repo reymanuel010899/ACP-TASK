@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = ROOT / "schemas"
 EXAMPLES_DIR = ROOT / "examples"
 
-TRUST_EXTENSION_URI = "https://agenttrust.example/extensions/trust/v1"
+TRUST_EXTENSION_URI = "https://treessera.com/extensions/trust/v1"
 DESCRIPTOR_PATH = SCHEMA_DIR / "a2a-extension-descriptor.schema.json"
 AGENT_CARD_PATH = EXAMPLES_DIR / "agent-card-with-extension.json"
 TASK_MESSAGE_PATH = EXAMPLES_DIR / "task-message-with-evidence.json"
@@ -143,7 +143,7 @@ class TestDescriptorSchema:
 
     def test_descriptor_id_and_definitions(self, descriptor):
         assert descriptor["$id"] == (
-            "https://agenttrust.example/schemas/a2a-extension-descriptor.schema.json"
+            "https://treessera.com/schemas/a2a-extension-descriptor.schema.json"
         )
         assert "agentExtension" in descriptor["definitions"]
         assert "trustMetadata" in descriptor["definitions"]

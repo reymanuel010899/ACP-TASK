@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://agenttrust.example/schemas/user-reputation-record.schema.json",
+  "$id": "https://treessera.com/schemas/user-reputation-record.schema.json",
   "title": "UserReputationRecord",
   "description": "Aggregated verification history for one (User Principal, Capability) pair. A user with zero completed tasks is NEUTRAL: counts are 0 and verification_rate is null (unknown), never 0.0 (failed-by-default). Same structure as agent ReputationRecord, but keyed by user Principal instead of agent Principal.",
   "type": "object",

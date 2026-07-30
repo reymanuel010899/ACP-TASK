@@ -2,6 +2,18 @@
 
 This guide gets the independent registry running in 30 seconds.
 
+## Prerequisite: Postgres + Redis
+
+Unit U10: the registry persists through Postgres unconditionally now --
+there is no in-memory or JSON-file fallback. Bring these up once, from the
+repo root, before any of the options below:
+
+```bash
+docker compose -f ../infra/docker-compose.yml up -d   # Postgres 16 + Redis 7
+psql "$DATABASE_URL" -f ../infra/roles.sql             # least-privilege roles (idempotent)
+python -m tools.migrate                                # apply pending migrations (idempotent)
+```
+
 ## Option 1: Docker Compose (Recommended for Phase A)
 
 ```bash

@@ -14,7 +14,7 @@ export default function OrgContent() {
         <div
           className="text-[12px]/[normal] box-border text-[var(--ag2-dim)] font-[Inter,system-ui,sans-serif] font-normal text-left [white-space:nowrap]"
         >
-          Organizations › Agentio Corp
+          Organizations › Console Corp
         </div>
       </div>
       <div
@@ -41,7 +41,7 @@ export default function OrgContent() {
               <div
                 className="text-[24px]/[normal] box-border text-[var(--ag2-text)] font-[Inter,system-ui,sans-serif] font-bold text-left [white-space:nowrap]"
               >
-                Agentio Corp
+                Console Corp
               </div>
               <div
                 className="box-border w-fit shrink-0 h-fit flex flex-row gap-0 p-[4px_7px] justify-start items-start bg-[#2A1859] rounded-[4px]"
@@ -353,7 +353,7 @@ export default function OrgContent() {
             <div
               className="text-[11px]/[normal] box-border text-[#B267FF] font-[Inter,system-ui,sans-serif] font-medium text-left [white-space:nowrap]"
             >
-              https://agentio.com
+              https://console.com
             </div>
           </div>
           <div
