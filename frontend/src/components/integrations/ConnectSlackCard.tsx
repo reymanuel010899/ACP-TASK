@@ -26,11 +26,14 @@ const CAPABILITIES = [
   "slack.channels.list",
   "slack.conversation.read",
   "slack.thread.read",
+  "slack.users.list",
+  "slack.message.permalink",
   "slack.private_channels.list",
   "slack.private_conversation.read",
   "slack.private_thread.read",
   "slack.message.send",
   "slack.thread.reply",
+  "slack.direct_message.send",
   "slack.reaction.add",
   "slack.file.upload",
 ];
@@ -167,6 +170,8 @@ export default function ConnectSlackCard({
           const missingPrivateChannels = !connection.enabled_capabilities.includes("slack.private_channels.list")
             || !connection.enabled_capabilities.includes("slack.private_conversation.read")
             || !connection.enabled_capabilities.includes("slack.private_thread.read");
+          const missingPeople = !connection.enabled_capabilities.includes("slack.users.list");
+          const missingDirectMessages = !connection.enabled_capabilities.includes("slack.direct_message.send");
           return (
             <div key={connection.connection_id} role="group" aria-label={`${name} workspace`} className="rounded-[7px] border border-[var(--ag-card-border)] p-[8px]">
               <div className="flex items-center justify-between gap-2">
@@ -175,6 +180,8 @@ export default function ConnectSlackCard({
               </div>
               {missingUpload && <p className="mt-1 text-[9px] text-[#FBBF24]">File uploads need an additional scope</p>}
               {missingPrivateChannels && <p className="mt-1 text-[9px] text-[#FBBF24]">Private channels need additional scopes</p>}
+              {missingPeople && <p className="mt-1 text-[9px] text-[#FBBF24]">Finding people needs the users:read scope</p>}
+              {missingDirectMessages && <p className="mt-1 text-[9px] text-[#FBBF24]">Direct messages need the im:write scope</p>}
               {connection.owner !== false && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   <button type="button" disabled={busy !== null} onClick={() => void connect(connection)} className="rounded border border-[var(--ag-card-border)] px-2 py-1 text-[9px] text-[var(--ag-text)] disabled:opacity-50">Upgrade {name} permissions</button>

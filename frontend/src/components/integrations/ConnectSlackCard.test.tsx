@@ -61,6 +61,8 @@ describe("ConnectSlackCard", () => {
     render(<ConnectSlackCard redirect={redirect} />);
     expect(await screen.findByText("File uploads need an additional scope")).toBeInTheDocument();
     expect(screen.getByText("Private channels need additional scopes")).toBeInTheDocument();
+    expect(screen.getByText("Finding people needs the users:read scope")).toBeInTheDocument();
+    expect(screen.getByText("Direct messages need the im:write scope")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Upgrade Acme permissions" }));
 
     await waitFor(() => expect(redirect).toHaveBeenCalledWith("https://slack.test/consent"));
@@ -70,6 +72,20 @@ describe("ConnectSlackCard", () => {
       "slack.private_channels.list",
       "slack.private_conversation.read",
       "slack.private_thread.read",
+      "slack.users.list",
+      "slack.direct_message.send",
     ]));
+  });
+
+  it("shows a tenant-authorized workspace to members without lifecycle controls", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => response({ provider: "slack", connections: [
+      { connection_id: "conn-a", team_id: "T-A", team_name: "Acme", status: "connected", enabled_capabilities: ["slack.channels.list"], owner: false },
+    ] })));
+
+    render(<ConnectSlackCard redirect={vi.fn()} />);
+    const workspace = await screen.findByRole("group", { name: "Acme workspace" });
+    expect(workspace).toBeInTheDocument();
+    expect(within(workspace).queryByRole("button", { name: /Upgrade/ })).not.toBeInTheDocument();
+    expect(within(workspace).queryByRole("button", { name: /Disconnect/ })).not.toBeInTheDocument();
   });
 });

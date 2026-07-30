@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from libs.connectors.slack import SlackAPIError, SlackActionExecutor, SlackRateLimitError
 from services.action_broker.rate_limits import SlackRatePolicy
@@ -24,6 +25,16 @@ class FakeHTTP:
         return self.responses.pop(0)
 
 
+class InvalidJSONResponse(Response):
+    def json(self):
+        raise ValueError("invalid json")
+
+
+class NetworkHTTP:
+    def request(self, method, url, **kwargs):
+        raise requests.ConnectionError("xoxb-secret must not escape")
+
+
 def context():
     return {"access_token": "xoxb-secret", "connection_id": "conn:1", "team_id": "T1"}
 
@@ -35,7 +46,7 @@ def test_targeted_read_filters_messages_and_rejects_shared_channel():
     result = SlackActionExecutor(http=http).read(
         "slack.conversation.read", {"channel_id": "C1", "is_ext_shared": False}, context()
     )
-    assert result == {"messages": [{"ts": "1.1", "text": "hello", "user": "U1", "thread_ts": None}]}
+    assert result == {"messages": [{"ts": "1.1", "text": "hello", "user": "U1", "thread_ts": None}], "next_cursor": None, "partial": False}
     with pytest.raises(ValueError, match="Slack Connect"):
         SlackActionExecutor(http=http).read(
             "slack.conversation.read", {"channel_id": "C2", "is_ext_shared": True}, context()
@@ -54,10 +65,12 @@ def test_public_and_private_channel_lists_request_only_their_authorized_type():
     executor = SlackActionExecutor(http=http)
 
     assert executor.read("slack.channels.list", {}, context()) == {
-        "channels": [{"id": "C1", "name": "general", "is_private": False}]
+        "channels": [{"id": "C1", "name": "general", "is_private": False}],
+        "next_cursor": None, "partial": False,
     }
     assert executor.read("slack.private_channels.list", {}, context()) == {
-        "channels": [{"id": "G1", "name": "leadership", "is_private": True}]
+        "channels": [{"id": "G1", "name": "leadership", "is_private": True}],
+        "next_cursor": None, "partial": False,
     }
     assert http.calls[0][2]["params"]["types"] == "public_channel"
     assert http.calls[1][2]["params"]["types"] == "private_channel"
@@ -115,6 +128,112 @@ def test_ok_false_and_rate_limit_are_typed_without_token_leakage():
         limited.read("slack.channels.list", {}, context())
     assert rate.value.retry_after == 7
     assert rate.value.connection_id == "conn:1"
+
+
+def test_user_list_filters_non_humans_and_exposes_no_email():
+    http = FakeHTTP([Response(payload={
+        "ok": True,
+        "members": [
+            {"id": "U1", "name": "maria.one", "profile": {"display_name": "María", "real_name": "María Uno", "email": "secret@example.com", "image_48": "https://avatars.slack-edge.com/u1.png"}},
+            {"id": "U2", "name": "maria.two", "profile": {"display_name": "María", "real_name": "María Dos"}},
+            {"id": "B1", "name": "bot", "is_bot": True, "profile": {}},
+            {"id": "U3", "deleted": True, "profile": {}},
+        ],
+        "response_metadata": {"next_cursor": "next"},
+    })])
+
+    result = SlackActionExecutor(http=http).read(
+        "slack.users.list", {"cursor": "start", "limit": 500}, context()
+    )
+
+    assert [user["id"] for user in result["users"]] == ["U1", "U2"]
+    assert result["users"][0]["display_name"] == result["users"][1]["display_name"]
+    assert all("email" not in user for user in result["users"])
+    assert result["next_cursor"] == "next"
+    assert result["partial"] is True
+    assert http.calls[0][2]["params"] == {"limit": 200, "cursor": "start"}
+
+
+def test_bounded_history_and_permalink_preserve_source_binding():
+    http = FakeHTTP([
+        Response(payload={"ok": True, "messages": [], "response_metadata": {"next_cursor": "more"}}),
+        Response(payload={"ok": True, "permalink": "https://acme.slack.com/archives/C1/p123"}),
+    ])
+    executor = SlackActionExecutor(http=http)
+    page = executor.read("slack.conversation.read", {
+        "channel_id": "C1", "oldest": "100.0", "latest": "200.0",
+        "cursor": "cursor-1", "limit": 999,
+    }, context())
+    source = executor.read("slack.message.permalink", {
+        "channel_id": "C1", "message_ts": "123.45",
+    }, context())
+
+    assert page == {"messages": [], "next_cursor": "more", "partial": True}
+    assert http.calls[0][2]["params"] == {
+        "channel": "C1", "limit": 100, "oldest": "100.0",
+        "latest": "200.0", "cursor": "cursor-1",
+    }
+    assert source == {
+        "channel_id": "C1", "message_ts": "123.45",
+        "permalink": "https://acme.slack.com/archives/C1/p123",
+    }
+
+
+def test_public_resolver_rejects_archived_private_and_shared_channels():
+    http = FakeHTTP([Response(payload={"ok": True, "channels": [
+        {"id": "C1", "name": "good", "is_private": False},
+        {"id": "C2", "name": "old", "is_archived": True},
+        {"id": "C3", "name": "private", "is_private": True},
+        {"id": "C4", "name": "connect", "is_ext_shared": True},
+    ]})])
+    result = SlackActionExecutor(http=http).read("slack.channels.list", {}, context())
+    assert [channel["id"] for channel in result["channels"]] == ["C1"]
+
+
+def test_direct_message_opens_selected_user_then_posts_exactly_once():
+    http = FakeHTTP([
+        Response(payload={"ok": True, "channel": {"id": "D1"}}),
+        Response(payload={"ok": True, "channel": "D1", "ts": "123.45"}),
+    ])
+    receipt = SlackActionExecutor(http=http).execute(
+        "slack.direct_message.send", {"user_id": "U2", "text": "Hola"}, context()
+    )
+    assert [call[1].rsplit("/", 1)[-1] for call in http.calls] == [
+        "conversations.open", "chat.postMessage"
+    ]
+    assert http.calls[0][2]["json"] == {"users": "U2"}
+    assert http.calls[1][2]["json"]["text"] == "Hola"
+    assert receipt["user_id"] == "U2"
+    assert receipt["channel_id"] == "D1"
+
+
+def test_dm_missing_scope_stops_before_post_and_public_send_remains_independent():
+    missing = FakeHTTP([Response(payload={
+        "ok": False, "error": "missing_scope", "needed": "im:write"
+    })])
+    with pytest.raises(SlackAPIError) as caught:
+        SlackActionExecutor(http=missing).execute(
+            "slack.direct_message.send", {"user_id": "U2", "text": "Hola"}, context()
+        )
+    assert caught.value.category == "scope"
+    assert len(missing.calls) == 1
+
+    public = FakeHTTP([Response(payload={"ok": True, "ts": "1.0"})])
+    assert SlackActionExecutor(http=public).execute(
+        "slack.message.send", {"channel_id": "C1", "text": "Hola"}, context()
+    )["message_ts"] == "1.0"
+
+
+def test_invalid_json_and_network_failures_are_typed_without_token_leakage():
+    with pytest.raises(SlackAPIError) as invalid:
+        SlackActionExecutor(http=FakeHTTP([InvalidJSONResponse()])).read(
+            "slack.users.list", {}, context()
+        )
+    assert invalid.value.code == "invalid_json"
+    with pytest.raises(Exception) as network:
+        SlackActionExecutor(http=NetworkHTTP()).read("slack.users.list", {}, context())
+    assert network.value.__class__.__name__ == "ProviderNetworkError"
+    assert "xoxb" not in str(network.value)
 
 
 def test_file_upload_rejects_untrusted_upload_host_before_bytes_leave():

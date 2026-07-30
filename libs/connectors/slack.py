@@ -25,11 +25,14 @@ SLACK_SCOPE_CATALOG = {
     "slack.channels.list": "channels:read",
     "slack.conversation.read": "channels:history",
     "slack.thread.read": "channels:history",
+    "slack.users.list": "users:read",
+    "slack.message.permalink": "channels:history",
     "slack.private_channels.list": "groups:read",
     "slack.private_conversation.read": "groups:history",
     "slack.private_thread.read": "groups:history",
     "slack.message.send": "chat:write",
     "slack.thread.reply": "chat:write",
+    "slack.direct_message.send": "im:write",
     "slack.reaction.add": "reactions:write",
     "slack.file.upload": "files:write",
 }
@@ -178,6 +181,8 @@ class SlackActionExecutor:
             "slack.channels.list": self._list_public_channels,
             "slack.conversation.read": self._read_conversation,
             "slack.thread.read": self._read_thread,
+            "slack.users.list": self._list_users,
+            "slack.message.permalink": self._message_permalink,
             "slack.private_channels.list": self._list_private_channels,
             "slack.private_conversation.read": self._read_conversation,
             "slack.private_thread.read": self._read_thread,
@@ -191,13 +196,14 @@ class SlackActionExecutor:
         routes = {
             "slack.message.send": self._send_message,
             "slack.thread.reply": self._reply_thread,
+            "slack.direct_message.send": self._send_direct_message,
             "slack.reaction.add": self._add_reaction,
             "slack.file.upload": self._upload_file,
         }
         handler = routes.get(capability_id)
         if handler is None:
             raise SlackAPIError(capability_id, "unsupported_capability", "validation")
-        channel_id = payload.get("channel_id")
+        channel_id = payload.get("channel_id") or payload.get("user_id")
         guard = (
             self.rate_policy.write_guard(
                 provider_context.get("connection_id"), channel_id
@@ -215,39 +221,93 @@ class SlackActionExecutor:
         return self._list_channels(payload, context, "private_channel")
 
     def _list_channels(self, payload, context, channel_type):
-        data = self._api("conversations.list", context, params={
+        params = {
             "limit": min(int(payload.get("limit", 100)), 200),
             "exclude_archived": "true",
             "types": channel_type,
-        })
+        }
+        _copy_page_params(payload, params, ("cursor",))
+        data = self._api("conversations.list", context, params=params)
         channels = []
         for channel in data.get("channels", []):
-            if not isinstance(channel, dict) or channel.get("is_ext_shared"):
+            if (
+                not isinstance(channel, dict)
+                or channel.get("is_archived") is True
+                or channel.get("is_ext_shared") is True
+                or (channel_type == "public_channel" and channel.get("is_private") is True)
+                or (channel_type == "private_channel" and channel.get("is_private") is not True)
+            ):
                 continue
             channels.append({
                 "id": channel.get("id"),
                 "name": channel.get("name"),
                 "is_private": bool(channel.get("is_private")),
             })
-        return {"channels": channels}
+        return _page(channels, "channels", data)
 
     def _read_conversation(self, payload, context):
         self._reject_shared(payload)
         channel_id = _required_str(payload, "channel_id")
-        data = self._api("conversations.history", context, params={
+        params = {
             "channel": channel_id,
             "limit": min(int(payload.get("limit", 50)), 100),
-        })
-        return {"messages": _filtered_messages(data.get("messages", []))}
+        }
+        _copy_page_params(payload, params, ("oldest", "latest", "cursor"))
+        data = self._api("conversations.history", context, params=params)
+        return _page(_filtered_messages(data.get("messages", [])), "messages", data)
 
     def _read_thread(self, payload, context):
         self._reject_shared(payload)
-        data = self._api("conversations.replies", context, params={
+        params = {
             "channel": _required_str(payload, "channel_id"),
             "ts": _required_str(payload, "thread_ts"),
             "limit": min(int(payload.get("limit", 50)), 100),
+        }
+        _copy_page_params(payload, params, ("oldest", "latest", "cursor"))
+        data = self._api("conversations.replies", context, params=params)
+        return _page(_filtered_messages(data.get("messages", [])), "messages", data)
+
+    def _list_users(self, payload, context):
+        params = {"limit": min(int(payload.get("limit", 100)), 200)}
+        _copy_page_params(payload, params, ("cursor",))
+        data = self._api("users.list", context, params=params)
+        users = []
+        for member in data.get("members", []):
+            if (
+                not isinstance(member, dict)
+                or member.get("deleted") is True
+                or member.get("is_bot") is True
+                or member.get("is_app_user") is True
+                or member.get("id") == "USLACKBOT"
+            ):
+                continue
+            profile = member.get("profile") if isinstance(member.get("profile"), dict) else {}
+            user = {
+                "id": member.get("id"),
+                "handle": member.get("name"),
+                "display_name": profile.get("display_name") or "",
+                "real_name": profile.get("real_name") or member.get("real_name") or "",
+            }
+            image = _safe_image_url(profile.get("image_48"))
+            if image:
+                user["image_url"] = image
+            if isinstance(user["id"], str) and user["id"]:
+                users.append(user)
+        return _page(users, "users", data)
+
+    def _message_permalink(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        message_ts = _required_str(payload, "message_ts")
+        data = self._api("chat.getPermalink", context, params={
+            "channel": channel_id, "message_ts": message_ts,
         })
-        return {"messages": _filtered_messages(data.get("messages", []))}
+        permalink = data.get("permalink")
+        if not isinstance(permalink, str) or not permalink.startswith("https://"):
+            raise SlackAPIError("chat.getPermalink", "invalid_permalink")
+        return {
+            "channel_id": channel_id, "message_ts": message_ts,
+            "permalink": permalink,
+        }
 
     def _send_message(self, payload, context):
         channel_id = _required_str(payload, "channel_id")
@@ -273,6 +333,24 @@ class SlackActionExecutor:
         return self._message_receipt(
             "slack.thread.reply", channel_id, data, context
         )
+
+    def _send_direct_message(self, payload, context):
+        user_id = _required_str(payload, "user_id")
+        opened = self._api("conversations.open", context, json={"users": user_id})
+        channel = opened.get("channel") if isinstance(opened.get("channel"), dict) else {}
+        channel_id = channel.get("id")
+        if not isinstance(channel_id, str) or not channel_id:
+            raise SlackAPIError("conversations.open", "missing_channel_id")
+        sent = self._api("chat.postMessage", context, json={
+            "channel": channel_id,
+            "text": _required_str(payload, "text"),
+            "unfurl_links": False, "unfurl_media": False,
+        })
+        receipt = self._message_receipt(
+            "slack.direct_message.send", channel_id, sent, context
+        )
+        receipt["user_id"] = user_id
+        return receipt
 
     def _add_reaction(self, payload, context):
         channel_id = _required_str(payload, "channel_id")
@@ -433,6 +511,29 @@ def _filtered_messages(messages):
         "user": message.get("user"),
         "thread_ts": message.get("thread_ts"),
     } for message in messages if isinstance(message, dict)]
+
+
+def _copy_page_params(source, target, names):
+    for name in names:
+        value = source.get(name)
+        if isinstance(value, str) and value:
+            target[name] = value
+
+
+def _page(items, field, data):
+    metadata = data.get("response_metadata")
+    cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+    cursor = cursor if isinstance(cursor, str) and cursor else None
+    return {field: items, "next_cursor": cursor, "partial": cursor is not None}
+
+
+def _safe_image_url(value):
+    if not isinstance(value, str):
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    return value
 
 
 def _resolve_host(host):

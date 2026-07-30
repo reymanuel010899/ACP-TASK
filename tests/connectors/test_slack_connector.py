@@ -68,6 +68,9 @@ def test_scope_catalog_keeps_private_channel_authority_explicit():
     assert catalog["slack.private_channels.list"] == "groups:read"
     assert catalog["slack.private_conversation.read"] == "groups:history"
     assert catalog["slack.private_thread.read"] == "groups:history"
+    assert catalog["slack.users.list"] == "users:read"
+    assert catalog["slack.message.permalink"] == "channels:history"
+    assert catalog["slack.direct_message.send"] == "im:write"
 
 
 def test_exchange_requires_bot_authority_and_keeps_workspace_metadata():

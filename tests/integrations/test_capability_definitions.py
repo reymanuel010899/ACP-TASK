@@ -119,3 +119,16 @@ def test_slack_private_capabilities_require_private_channel_scopes():
     assert definitions["slack.private_thread.read"].required_scopes == frozenset({
         "groups:history"
     })
+
+
+def test_slack_conversation_primitives_have_narrow_scopes_and_inputs():
+    definitions = {
+        definition.capability_id: definition for definition in slack_definitions()
+    }
+    assert definitions["slack.users.list"].required_scopes == frozenset({"users:read"})
+    assert definitions["slack.message.permalink"].required_scopes == frozenset({"channels:history"})
+    assert definitions["slack.direct_message.send"].required_scopes == frozenset({"im:write"})
+    assert definitions["slack.direct_message.send"].effect == "write"
+    assert definitions["slack.direct_message.send"].preview_fields == ("user_id", "text")
+    history = definitions["slack.conversation.read"].input_schema["properties"]
+    assert {"oldest", "latest", "cursor", "limit"}.issubset(history)

@@ -8,12 +8,15 @@ from services.oauth.repository import OAuthRepository
 
 class SessionRepository:
     def resolve(self, session_id, now, touch=True):
-        if session_id != "session-1":
+        principals = {"session-1": "user:alice", "session-2": "user:bob"}
+        if session_id not in principals:
             return None
-        return {"principal_id": "user:alice", "tenant_id": "org:acme"}
+        return {"principal_id": principals[session_id], "tenant_id": "org:acme"}
 
     def csrf_matches(self, session_id, token):
-        return session_id == "session-1" and token == "csrf-1"
+        return (session_id, token) in {
+            ("session-1", "csrf-1"), ("session-2", "csrf-2")
+        }
 
 
 class SlackConnector:
@@ -24,6 +27,9 @@ class SlackConnector:
             "slack.private_conversation.read": "groups:history",
             "slack.private_thread.read": "groups:history",
             "slack.message.send": "chat:write",
+            "slack.users.list": "users:read",
+            "slack.message.permalink": "channels:history",
+            "slack.direct_message.send": "im:write",
         }
 
     def authorization_url(self, state, code_challenge, scopes):
@@ -127,6 +133,41 @@ def test_private_channel_capabilities_request_only_private_bot_scopes(tmp_path):
     assert status == 200
     scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
     assert set(scopes.split(",")) == {"groups:read", "groups:history"}
+
+
+def test_people_and_dm_upgrade_requests_only_optional_bot_scopes(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"capabilities": [
+            "slack.users.list", "slack.direct_message.send"
+        ]},
+    )
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    assert set(scopes.split(",")) == {"users:read", "im:write"}
+
+
+def test_tenant_member_can_see_owner_installation_but_cannot_mutate_it(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = service.repository.upsert_installation(
+        tenant_id="org:acme", principal_id="user:alice", provider="slack",
+        app_id="A123", team_id="T123", credential_id="cred:1",
+        granted_scopes=["channels:read"],
+        enabled_capabilities=["slack.channels.list"], now_ts=1,
+    )
+
+    status, body = service.slack_status("session-2")
+    assert status == 200
+    assert body["connections"][0]["connection_id"] == connection["connection_id"]
+    assert body["connections"][0]["owner"] is False
+    assert service.initiate_slack("session-2", "csrf-2", {
+        "capabilities": ["slack.users.list"],
+        "target_connection_id": connection["connection_id"],
+        "intended_team_id": "T123",
+    })[0] == 404
+    assert service.disconnect_slack(
+        "session-2", "csrf-2", connection["connection_id"]
+    )[0] == 404
 
 
 def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):

@@ -124,6 +124,26 @@ class IntegrationConnectionRepository(object):
             rows = conn.execute(sql, params).fetchall()
         return [_record(row) for row in rows]
 
+    def list_for_tenant(self, tenant_id, provider=None, usable_only=True):
+        sql = """
+            select connection_id, tenant_id, owner_principal_id, provider,
+                   app_id, team_id, team_name, enterprise_id, bot_user_id,
+                   credential_id, credential_version, effective_scopes,
+                   enabled_capabilities, status
+            from integrations.connections
+            where tenant_id = %s
+        """
+        params = [tenant_id]
+        if provider:
+            sql += " and provider = %s"
+            params.append(provider)
+        if usable_only:
+            sql += " and status = 'connected'"
+        sql += " order by provider, team_id nulls first, connection_id"
+        with self.db.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_record(row) for row in rows]
+
 
 def _stable_connection_id(provider, app_id, team_id, owner_principal_id):
     identity = ":".join(

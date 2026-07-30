@@ -85,8 +85,8 @@ class OAuthService(object):
         tenant_id = self._tenant_id(current)
         if not tenant_id:
             return 409, {"error": "tenant membership is required"}
-        connections = self.repository.list_installations(
-            tenant_id, current["principal_id"], "slack"
+        connections = self.repository.list_tenant_installations(
+            tenant_id, "slack"
         )
         return 200, {"provider": "slack", "connections": [
             {
@@ -97,6 +97,7 @@ class OAuthService(object):
                 "bot_user_id": item["bot_user_id"],
                 "status": item["status"],
                 "enabled_capabilities": item["enabled_capabilities"],
+                "owner": item["principal_id"] == current["principal_id"],
             }
             for item in connections
         ]}
@@ -116,6 +117,13 @@ class OAuthService(object):
         tenant_id = self._tenant_id(current)
         if not tenant_id:
             return 409, {"error": "tenant membership is required"}
+        target_connection_id = body.get("target_connection_id")
+        if target_connection_id:
+            target = self.repository.get_installation(
+                target_connection_id, tenant_id
+            )
+            if target is None or target["principal_id"] != current["principal_id"]:
+                return 404, {"error": "Slack connection not found"}
         return_to = body.get("return_to", "/integrations")
         if not _safe_return_to(return_to):
             return 422, {"error": "unsafe return target"}
@@ -144,7 +152,7 @@ class OAuthService(object):
             tenant_id=tenant_id,
             app_id=self.slack_app_id,
             intended_team_id=body.get("intended_team_id"),
-            target_connection_id=body.get("target_connection_id"),
+            target_connection_id=target_connection_id,
         )
         return 200, {"authorization_url": self.slack_connector.authorization_url(
             state, None, scopes

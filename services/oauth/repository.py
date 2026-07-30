@@ -382,6 +382,26 @@ class OAuthRepository(object):
             rows = self._connection.execute(sql, params).fetchall()
         return [_installation(row) for row in rows]
 
+    def list_tenant_installations(self, tenant_id, provider=None, usable_only=True):
+        """List execution authority shared with verified tenant members.
+
+        Lifecycle mutations remain owner-scoped through ``principal_id`` in
+        callers; this projection is only for selecting a usable installation.
+        """
+        if not tenant_id:
+            return []
+        sql = "SELECT * FROM integration_connections WHERE tenant_id = ?"
+        params = [tenant_id]
+        if provider:
+            sql += " AND provider = ?"
+            params.append(provider)
+        if usable_only:
+            sql += " AND status = 'connected'"
+        sql += " ORDER BY provider, COALESCE(team_id, ''), connection_id"
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [_installation(row) for row in rows]
+
     def tombstone_installation(self, connection_id, tenant_id, now_ts):
         with self._lock:
             cursor = self._connection.execute(
