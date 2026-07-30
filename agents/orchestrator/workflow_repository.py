@@ -11,6 +11,11 @@ import uuid
 
 class WorkflowRepository(object):
     DEFAULT_CONTENT_TTL_SECONDS = 30 * 24 * 60 * 60
+    CONVERSATION_STATUSES = frozenset({
+        "interpreting", "resolving", "needs_input", "retrieving", "answering",
+        "ready", "awaiting_approval", "executing", "succeeded",
+        "retryable_failure", "unknown_outcome", "cancelled", "expired", "closed",
+    })
 
     def __init__(self, database_path, content_crypto=None):
         self.content_crypto = content_crypto
@@ -120,6 +125,39 @@ class WorkflowRepository(object):
                 FOREIGN KEY(workflow_revision_id, step_id)
                     REFERENCES workflow_steps(workflow_revision_id, step_id)
             );
+            CREATE TABLE IF NOT EXISTS concierge_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'interpreting',
+                state_json TEXT NOT NULL,
+                presentation_json TEXT,
+                presentation_hash TEXT,
+                workflow_run_id TEXT,
+                workflow_revision_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                content_expires_at INTEGER NOT NULL,
+                closed_at INTEGER,
+                UNIQUE(conversation_id, tenant_id, principal_id)
+            );
+            CREATE TABLE IF NOT EXISTS concierge_answers (
+                conversation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                answer_hash TEXT NOT NULL,
+                workflow_run_id TEXT,
+                workflow_revision_id TEXT,
+                applied_at INTEGER NOT NULL,
+                PRIMARY KEY(conversation_id, tenant_id, principal_id, idempotency_key),
+                FOREIGN KEY(conversation_id, tenant_id, principal_id)
+                    REFERENCES concierge_conversations(
+                        conversation_id, tenant_id, principal_id
+                    )
+            );
         """)
         self._ensure_step_column("input_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_step_column("output_json", "TEXT")
@@ -191,6 +229,33 @@ class WorkflowRepository(object):
             return default
         return self.content_crypto.open(
             stored, self._content_context(tenant_id, revision_id, step_id, field)
+        )
+
+    @staticmethod
+    def _conversation_content_context(tenant_id, conversation_id, field):
+        return {
+            "purpose": "concierge-conversation", "tenant_id": tenant_id,
+            "conversation_id": conversation_id, "field": field,
+        }
+
+    def _encode_conversation_content(self, value, tenant_id, conversation_id, field):
+        stored = value
+        if self.content_crypto is not None:
+            stored = self.content_crypto.seal(
+                value,
+                self._conversation_content_context(tenant_id, conversation_id, field),
+            )
+        return json.dumps(stored, sort_keys=True, separators=(",", ":"))
+
+    def _decode_conversation_content(self, raw, tenant_id, conversation_id, field, default):
+        if raw is None:
+            return default
+        stored = json.loads(raw)
+        if self.content_crypto is None:
+            return stored
+        return self.content_crypto.open(
+            stored,
+            self._conversation_content_context(tenant_id, conversation_id, field),
         )
 
     def create_run(self, tenant_id, user_principal_id, goal_hash, now_ts):
@@ -742,6 +807,285 @@ class WorkflowRepository(object):
                 (status, revision_id, step_id, tenant_id),
             )
         return cursor.rowcount == 1
+
+    # Native Concierge conversation state is intentionally separate from the
+    # agent-to-agent task envelope in conversation_state.py.
+    def create_conversation(
+        self, tenant_id, principal_id, now_ts, ttl_seconds=180,
+        conversation_id=None, locale=None,
+    ):
+        if not tenant_id or not principal_id:
+            raise ValueError("tenant_id and principal_id are required")
+        conversation_id = conversation_id or "conversation:%s" % uuid.uuid4().hex
+        now_ts = int(now_ts)
+        expires_at = now_ts + int(ttl_seconds)
+        state = {"locale": locale} if locale else {}
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO concierge_conversations(
+                    conversation_id, tenant_id, principal_id, status, state_json,
+                    created_at, updated_at, expires_at, content_expires_at
+                ) VALUES (?, ?, ?, 'interpreting', ?, ?, ?, ?, ?)""",
+                (conversation_id, tenant_id, principal_id,
+                 self._encode_conversation_content(
+                     state, tenant_id, conversation_id, "state"
+                 ), now_ts, now_ts, expires_at, expires_at),
+            )
+        return self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+
+    def get_conversation(
+        self, conversation_id, tenant_id, principal_id, now_ts,
+        include_terminal=False,
+    ):
+        """Return an owner-bound live conversation without existence leakage."""
+        now_ts = int(now_ts)
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM concierge_conversations
+                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                (conversation_id, tenant_id, principal_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] not in ("closed", "expired") and now_ts > row["expires_at"]:
+                self._connection.execute(
+                    """UPDATE concierge_conversations
+                       SET status = 'expired', state_json = ?, presentation_json = NULL,
+                           closed_at = ?, updated_at = ?
+                       WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                    (self._encode_conversation_content(
+                        {}, tenant_id, conversation_id, "state"
+                    ), now_ts, now_ts, conversation_id, tenant_id, principal_id),
+                )
+                row = self._connection.execute(
+                    """SELECT * FROM concierge_conversations
+                       WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                    (conversation_id, tenant_id, principal_id),
+                ).fetchone()
+            if row["status"] in ("closed", "expired") and not include_terminal:
+                return None
+        return self._conversation(row)
+
+    def _conversation(self, row):
+        result = {
+            "conversation_id": row["conversation_id"],
+            "tenant_id": row["tenant_id"],
+            "principal_id": row["principal_id"],
+            "status": row["status"],
+            "workflow_run_id": row["workflow_run_id"],
+            "workflow_revision_id": row["workflow_revision_id"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "expires_at": row["expires_at"], "closed_at": row["closed_at"],
+            "presentation_hash": row["presentation_hash"],
+        }
+        result.update(self._decode_conversation_content(
+            row["state_json"], row["tenant_id"], row["conversation_id"],
+            "state", {},
+        ))
+        result["presentation"] = self._decode_conversation_content(
+            row["presentation_json"], row["tenant_id"], row["conversation_id"],
+            "presentation", None,
+        )
+        return result
+
+    def update_conversation(
+        self, conversation_id, tenant_id, principal_id, changes, now_ts,
+        ttl_seconds=180,
+    ):
+        allowed = {
+            "status", "locale", "operation", "active_connection",
+            "active_channel", "active_person", "active_thread", "read_period",
+            "pending_draft", "blocking_need", "workflow_run_id",
+            "workflow_revision_id",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError("unsupported conversation fields: %s" % sorted(unknown))
+        now_ts = int(now_ts)
+        with self._lock:
+            current = self.get_conversation(
+                conversation_id, tenant_id, principal_id, now_ts
+            )
+            if current is None:
+                raise KeyError("conversation unavailable")
+            state = {
+                key: current.get(key) for key in allowed
+                if key not in ("status", "workflow_run_id", "workflow_revision_id")
+                and current.get(key) is not None
+            }
+            for key, value in changes.items():
+                if key not in ("status", "workflow_run_id", "workflow_revision_id"):
+                    if value is None:
+                        state.pop(key, None)
+                    else:
+                        state[key] = value
+            status = changes.get("status", current["status"])
+            if status not in self.CONVERSATION_STATUSES:
+                raise ValueError("invalid conversation status")
+            run_id = changes.get("workflow_run_id", current["workflow_run_id"])
+            revision_id = changes.get(
+                "workflow_revision_id", current["workflow_revision_id"]
+            )
+            self._connection.execute(
+                """UPDATE concierge_conversations SET status = ?, state_json = ?,
+                       workflow_run_id = ?, workflow_revision_id = ?, updated_at = ?,
+                       expires_at = ?, content_expires_at = ?
+                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                (status, self._encode_conversation_content(
+                    state, tenant_id, conversation_id, "state"
+                ), run_id, revision_id, now_ts, now_ts + int(ttl_seconds),
+                 now_ts + int(ttl_seconds), conversation_id, tenant_id, principal_id),
+            )
+        return self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+
+    def apply_conversation_answer(
+        self, conversation_id, tenant_id, principal_id, idempotency_key,
+        field_name, value, now_ts, workflow_run_id=None,
+        workflow_revision_id=None,
+    ):
+        if not idempotency_key or not field_name:
+            raise ValueError("idempotency_key and field_name are required")
+        answer_hash = hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        now_ts = int(now_ts)
+        with self._lock:
+            current = self.get_conversation(
+                conversation_id, tenant_id, principal_id, now_ts
+            )
+            if current is None:
+                raise KeyError("conversation unavailable")
+            prior = self._connection.execute(
+                """SELECT * FROM concierge_answers WHERE conversation_id = ?
+                   AND tenant_id = ? AND principal_id = ? AND idempotency_key = ?""",
+                (conversation_id, tenant_id, principal_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if prior["field_name"] != field_name or prior["answer_hash"] != answer_hash:
+                    raise ValueError("idempotency key was used for a different answer")
+                return self._conversation_answer_result(current, prior, True)
+            need = current.get("blocking_need")
+            if not isinstance(need, dict) or need.get("field") != field_name:
+                raise ValueError("answer does not match the active blocking need")
+            changes = {field_name: value, "blocking_need": None, "status": "interpreting"}
+            # Entity fields are top-level state slots; arbitrary clarification
+            # answers are retained under normalized known_inputs.
+            if field_name not in {
+                "locale", "operation", "active_connection", "active_channel",
+                "active_person", "active_thread", "read_period", "pending_draft",
+            }:
+                known = dict(current.get("known_inputs") or {})
+                known[field_name] = value
+                changes.pop(field_name)
+                changes["known_inputs"] = known
+            # update_conversation intentionally has a narrow public allowlist;
+            # known_inputs is written here as an internal normalized slot map.
+            state = {
+                key: current[key] for key in (
+                    "locale", "operation", "active_connection", "active_channel",
+                    "active_person", "active_thread", "read_period", "pending_draft",
+                    "known_inputs",
+                ) if current.get(key) is not None
+            }
+            state.update({k: v for k, v in changes.items() if k not in {
+                "status", "workflow_run_id", "workflow_revision_id", "blocking_need"
+            }})
+            state.pop("blocking_need", None)
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.execute(
+                    """INSERT INTO concierge_answers(
+                        conversation_id, tenant_id, principal_id, idempotency_key,
+                        field_name, answer_hash, workflow_run_id,
+                        workflow_revision_id, applied_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (conversation_id, tenant_id, principal_id, idempotency_key,
+                     field_name, answer_hash, workflow_run_id,
+                     workflow_revision_id, now_ts),
+                )
+                self._connection.execute(
+                    """UPDATE concierge_conversations SET status = 'interpreting',
+                           state_json = ?, workflow_run_id = COALESCE(?, workflow_run_id),
+                           workflow_revision_id = COALESCE(?, workflow_revision_id),
+                           updated_at = ?
+                       WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                    (self._encode_conversation_content(
+                        state, tenant_id, conversation_id, "state"
+                    ), workflow_run_id, workflow_revision_id, now_ts,
+                     conversation_id, tenant_id, principal_id),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+            row = self._connection.execute(
+                """SELECT * FROM concierge_answers WHERE conversation_id = ?
+                   AND tenant_id = ? AND principal_id = ? AND idempotency_key = ?""",
+                (conversation_id, tenant_id, principal_id, idempotency_key),
+            ).fetchone()
+            updated = self.get_conversation(
+                conversation_id, tenant_id, principal_id, now_ts
+            )
+        return self._conversation_answer_result(updated, row, False)
+
+    @staticmethod
+    def _conversation_answer_result(conversation, row, duplicate):
+        return {
+            "conversation": conversation, "duplicate": duplicate,
+            "workflow_run_id": row["workflow_run_id"],
+            "workflow_revision_id": row["workflow_revision_id"],
+        }
+
+    def store_conversation_presentation(
+        self, conversation_id, tenant_id, principal_id, presentation, now_ts,
+        content_ttl_seconds=180,
+    ):
+        current = self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+        if current is None:
+            raise KeyError("conversation unavailable")
+        raw = json.dumps(presentation, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._connection.execute(
+                """UPDATE concierge_conversations SET presentation_json = ?,
+                       presentation_hash = ?, updated_at = ?, content_expires_at = ?
+                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                (self._encode_conversation_content(
+                    presentation, tenant_id, conversation_id, "presentation"
+                ), digest, int(now_ts), int(now_ts) + int(content_ttl_seconds),
+                 conversation_id, tenant_id, principal_id),
+            )
+        return self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+
+    def close_conversation(self, conversation_id, tenant_id, principal_id, now_ts):
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE concierge_conversations SET status = 'closed', state_json = ?,
+                       presentation_json = NULL, closed_at = ?, updated_at = ?
+                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?
+                     AND status NOT IN ('closed', 'expired')""",
+                (self._encode_conversation_content(
+                    {}, tenant_id, conversation_id, "state"
+                ), int(now_ts), int(now_ts), conversation_id, tenant_id, principal_id),
+            )
+        return cursor.rowcount == 1
+
+    def purge_expired_conversation_content(self, now_ts):
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE concierge_conversations SET presentation_json = NULL
+                   WHERE content_expires_at < ? AND presentation_json IS NOT NULL""",
+                (int(now_ts),),
+            )
+        return cursor.rowcount
 
     def close(self):
         with self._lock:

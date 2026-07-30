@@ -28,3 +28,48 @@ class BlockingNeed(BaseModel):
     field: str
     question: str
     step_id: Optional[str] = None
+
+
+class GroundedCitation(BaseModel):
+    """Minimized provider evidence safe to retain with a presentation."""
+
+    citation_id: str
+    channel_id: str
+    message_ts: str
+    permalink: str
+    author_label: Optional[str] = None
+    occurred_at: Optional[str] = None
+    excerpt: Optional[str] = None
+    excerpt_hash: Optional[str] = None
+
+
+class ConversationPresentation(BaseModel):
+    locale: str
+    answer: str
+    citations: List[GroundedCitation] = Field(default_factory=list)
+    partial: bool = False
+    partial_reason: Optional[str] = None
+
+
+class ConciergeConversationState(BaseModel):
+    """Server-authoritative working set for one Concierge modal session."""
+
+    conversation_id: str
+    tenant_id: str
+    principal_id: str
+    status: str = "interpreting"
+    locale: Optional[str] = None
+    operation: Optional[str] = None
+    active_connection: Optional[Dict[str, Any]] = None
+    active_channel: Optional[Dict[str, Any]] = None
+    active_person: Optional[Dict[str, Any]] = None
+    active_thread: Optional[Dict[str, Any]] = None
+    read_period: Optional[Dict[str, Any]] = None
+    pending_draft: Optional[Dict[str, Any]] = None
+    workflow_run_id: Optional[str] = None
+    workflow_revision_id: Optional[str] = None
+    blocking_need: Optional[BlockingNeed] = None
+    presentation: Optional[ConversationPresentation] = None
+    created_at: int
+    updated_at: int
+    expires_at: int

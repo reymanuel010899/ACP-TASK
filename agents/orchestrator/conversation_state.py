@@ -476,3 +476,81 @@ class TenantIdentityResolver:
 
     def resolve_email(self, tenant_id, slack_connection_id, slack_user_id):
         return self.links.get((tenant_id, slack_connection_id, slack_user_id))
+
+
+class ConciergeConversationStore:
+    """Clock-bound facade for native, principal-scoped Concierge state.
+
+    This is deliberately not part of ``ConversationStateStore``: native turns
+    have no selected agent and must not manufacture collaboration envelopes.
+    """
+
+    DEFAULT_TTL_SECONDS = 180
+
+    def __init__(self, repository, clock=None, ttl_seconds=DEFAULT_TTL_SECONDS):
+        self.repository = repository
+        self.clock = clock or time.time
+        self.ttl_seconds = int(ttl_seconds)
+
+    def create(self, tenant_id, principal_id, conversation_id=None, locale=None):
+        return self.repository.create_conversation(
+            tenant_id, principal_id, int(self.clock()), self.ttl_seconds,
+            conversation_id=conversation_id, locale=locale,
+        )
+
+    def get(self, conversation_id, tenant_id, principal_id, include_terminal=False):
+        return self.repository.get_conversation(
+            conversation_id, tenant_id, principal_id, int(self.clock()),
+            include_terminal=include_terminal,
+        )
+
+    def update(self, conversation_id, tenant_id, principal_id, **changes):
+        return self.repository.update_conversation(
+            conversation_id, tenant_id, principal_id, changes,
+            int(self.clock()), self.ttl_seconds,
+        )
+
+    def record_need(self, conversation_id, tenant_id, principal_id, need):
+        if hasattr(need, "model_dump"):
+            need = need.model_dump()
+        elif hasattr(need, "dict"):
+            need = need.dict()
+        if not isinstance(need, dict) or not all(
+            isinstance(need.get(key), str) and need[key]
+            for key in ("kind", "field", "question")
+        ):
+            raise ValueError("blocking need requires kind, field and question")
+        return self.update(
+            conversation_id, tenant_id, principal_id,
+            status="needs_input", blocking_need=dict(need),
+        )
+
+    def answer(
+        self, conversation_id, tenant_id, principal_id, idempotency_key,
+        field_name, value, workflow_run_id=None, workflow_revision_id=None,
+    ):
+        return self.repository.apply_conversation_answer(
+            conversation_id, tenant_id, principal_id, idempotency_key,
+            field_name, value, int(self.clock()), workflow_run_id,
+            workflow_revision_id,
+        )
+
+    def present(self, conversation_id, tenant_id, principal_id, presentation):
+        if hasattr(presentation, "model_dump"):
+            presentation = presentation.model_dump()
+        elif hasattr(presentation, "dict"):
+            presentation = presentation.dict()
+        return self.repository.store_conversation_presentation(
+            conversation_id, tenant_id, principal_id, presentation,
+            int(self.clock()), self.ttl_seconds,
+        )
+
+    def close(self, conversation_id, tenant_id, principal_id):
+        return self.repository.close_conversation(
+            conversation_id, tenant_id, principal_id, int(self.clock())
+        )
+
+    def purge_expired_content(self):
+        return self.repository.purge_expired_conversation_content(
+            int(self.clock())
+        )
