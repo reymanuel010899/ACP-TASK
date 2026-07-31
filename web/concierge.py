@@ -36,6 +36,7 @@ from agents.orchestrator.brain import ClaudeBrain, GroqBrain, make_brain
 from agents.orchestrator.broker_client import ActionBrokerClient
 from agents.orchestrator.tools import OrchestratorTools
 from agents.orchestrator.workflow_repository import WorkflowRepository
+from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from libs.integrations.catalog import google_definitions, slack_definitions
 from services.oauth.repository import OAuthRepository
@@ -163,6 +164,26 @@ def _make_handler(agent, label, runner_url, registry_url=None,
             if self.path == "/healthz":
                 return self._send(200, {"status": "ok", "brain": label})
             path = self.path.split("?", 1)[0]
+            if path.startswith("/conversations/") and workflow_repository and session_repository:
+                conversation_id = _conversation_id_from_path(path)
+                if not _valid_conversation_id(conversation_id):
+                    return self._send(400, {"error": "invalid conversation ID"})
+                current = session_repository.resolve(
+                    session_cookie_value(self.headers.get("Cookie")), clock()
+                )
+                if current is None:
+                    return self._send(401, {"error": "authentication required"})
+                tenant_id = tenant_resolver(current["principal_id"]) if tenant_resolver else current.get("tenant_id")
+                store = getattr(dynamic_workflow_service, "conversation_store", None)
+                conversation = store.get(
+                    conversation_id, tenant_id, current["principal_id"]
+                ) if store and tenant_id else None
+                if conversation is None:
+                    return self._send(404, {
+                        "state": "expired", "conversationId": conversation_id,
+                        "recovery": {"action": "start_new_conversation"},
+                    })
+                return self._send(200, _conversation_response(conversation))
             if path.startswith("/workflows/") and workflow_repository and session_repository:
                 workflow_id = _workflow_id_from_path(path)
                 current = session_repository.resolve(
@@ -190,13 +211,46 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                 operation for operation in ("approve", "cancel", "retry")
                 if path.startswith("/workflows/") and path.endswith("/%s" % operation)
             ), None)
-            if path != "/concierge" and workflow_operation is None:
+            conversation_close = (
+                path.startswith("/conversations/") and path.endswith("/close")
+            )
+            if path != "/concierge" and workflow_operation is None and not conversation_close:
                 return self._send(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return self._send(400, {"error": "invalid JSON"})
+            if conversation_close:
+                if not session_repository or not dynamic_workflow_service:
+                    return self._send(503, {"error": "conversation service unavailable"})
+                session_id = session_cookie_value(self.headers.get("Cookie"))
+                current = session_repository.resolve(session_id, clock())
+                if current is None:
+                    return self._send(401, {"error": "authentication required"})
+                if not session_repository.csrf_matches(
+                    session_id, self.headers.get("X-CSRF-Token")
+                ):
+                    return self._send(403, {"error": "invalid CSRF token"})
+                tenant_id = tenant_resolver(current["principal_id"]) if tenant_resolver else current.get("tenant_id")
+                conversation_id = _conversation_id_from_path(path, "close")
+                if not _valid_conversation_id(conversation_id):
+                    return self._send(400, {"error": "invalid conversation ID"})
+                store = getattr(dynamic_workflow_service, "conversation_store", None)
+                owned = store.get(
+                    conversation_id, tenant_id, current["principal_id"],
+                    include_terminal=True,
+                ) if store and tenant_id else None
+                if owned is None:
+                    return self._send(404, {"error": "conversation not found"})
+                changed = bool(store and tenant_id and store.close(
+                    conversation_id, tenant_id, current["principal_id"]
+                ))
+                # Closing is idempotent and does not disclose foreign IDs.
+                return self._send(200, {
+                    "state": "expired", "conversationId": conversation_id,
+                    "closed": changed or True,
+                })
             if workflow_operation is not None:
                 if not workflow_repository or not session_repository:
                     return self._send(503, {"error": "workflow service unavailable"})
@@ -210,6 +264,25 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                     return self._send(403, {"error": "invalid CSRF token"})
                 if workflow_operation == "approve" and not isinstance(payload.get("approved"), bool):
                     return self._send(422, {"error": "approved must be boolean"})
+                if (
+                    workflow_operation == "approve"
+                    and payload.get("approved") is True
+                    and payload.get("conversationId")
+                    and payload.get("draftHash")
+                    and dynamic_workflow_service is not None
+                ):
+                    tenant_id = tenant_resolver(current["principal_id"]) if tenant_resolver else current.get("tenant_id")
+                    try:
+                        dynamic_workflow_service.approve_slack_draft(
+                            payload["conversationId"], tenant_id,
+                            current["principal_id"], payload["draftHash"],
+                        )
+                    except (KeyError, ValueError, PermissionError):
+                        return self._send(409, {"error": "workflow revision changed"})
+                    return self._send(200, {
+                        "state": "executing",
+                        "conversationId": payload["conversationId"],
+                    })
                 workflow_id = _workflow_id_from_path(path, workflow_operation)
                 run = workflow_repository.get_run_for_principal(
                     workflow_id, current["principal_id"]
@@ -237,6 +310,10 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                         workflow_id, revision["workflow_revision_id"], step_id,
                         run["tenant_id"],
                     )
+                    if not changed and payload.get("reconciledSafe") is True:
+                        changed = workflow_repository.retry_corrected_write(
+                            revision["workflow_revision_id"], step_id, run["tenant_id"]
+                        )
                     return self._send(
                         200 if changed else 409,
                         {"status": "queued"} if changed else {"error": "step is not safely retryable"},
@@ -288,9 +365,42 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                 current = session_repository.resolve(
                     session_cookie_value(self.headers.get("Cookie")), clock()
                 )
+            requested_conversation_id = payload.get("conversationId") or payload.get("conversation_id")
+            if requested_conversation_id and not _valid_conversation_id(requested_conversation_id):
+                return self._send(400, {"error": "invalid conversation ID"})
+            if _is_slack_turn(message, requested_conversation_id) and current is None:
+                return self._send(401, {"error": "authentication required"})
             if current and dynamic_workflow_service and tenant_resolver:
                 tenant_id = tenant_resolver(current["principal_id"])
+                if _is_slack_turn(message, requested_conversation_id) and not tenant_id:
+                    return self._send(409, {"error": "tenant membership is required"})
                 if tenant_id:
+                    conversation_id = requested_conversation_id
+                    if _is_slack_turn(message, conversation_id):
+                        try:
+                            turn = dynamic_workflow_service.coordinate_slack_turn(
+                                tenant_id, current["principal_id"], message,
+                                conversation_id=conversation_id,
+                            )
+                            return self._send(200, _turn_response(turn))
+                        except (KeyError, TimeoutError):
+                            return self._send(404, {
+                                "state": "expired", "conversationId": conversation_id,
+                                "recovery": {"action": "start_new_conversation"},
+                            })
+                        except PermissionError as exc:
+                            return self._send(409, _classified_recovery(exc, conversation_id))
+                        except ValueError:
+                            return self._send(422, {
+                                "state": "needs_input", "conversationId": conversation_id,
+                                "need": {"field": "request", "question": "Aclara tu solicitud de Slack."},
+                            })
+                        except Exception as exc:
+                            logger.warning("Slack conversation failed: %s", type(exc).__name__)
+                            return self._send(500, {
+                                "state": "retryable_failure", "conversationId": conversation_id,
+                                "recovery": {"action": "retry"},
+                            })
                     try:
                         intent = agent.brain.understand(message, context or None)
                         if intent.conversation_act in ("request", "clarification", "modify"):
@@ -319,7 +429,8 @@ def _make_handler(agent, label, runner_url, registry_url=None,
             try:
                 result = agent.handle_request(message, context=context or None)
             except Exception as exc:  # never leak a stack trace
-                return self._send(200, {"status": "failed", "reply": "Lo siento, ocurrió un problema.", "evidence": {"error": str(exc)}})
+                logger.warning("concierge request failed: %s", type(exc).__name__)
+                return self._send(200, {"status": "failed", "reply": "Lo siento, ocurrió un problema."})
             body = dataclasses.asdict(result) if dataclasses.is_dataclass(result) else {
                 "status": getattr(result, "status", None),
                 "reply": getattr(result, "reply", None),
@@ -336,6 +447,82 @@ def _workflow_id_from_path(path, operation=None):
     end = -len(suffix) if suffix else None
     encoded = path[len("/workflows/"):end].rstrip("/")
     return unquote(encoded)
+
+
+def _conversation_id_from_path(path, operation=None):
+    suffix = "/%s" % operation if operation else ""
+    end = -len(suffix) if suffix else None
+    encoded = path[len("/conversations/"):end].rstrip("/")
+    return unquote(encoded)
+
+
+def _is_slack_turn(message, conversation_id=None):
+    text = str(message or "").lower()
+    return bool(conversation_id or "slack" in text or "#" in text or any(
+        marker in text for marker in (
+            "manda un mensaje", "mándale", "mandale", "qué dijo", "que dijo",
+            "reply there", "send a direct message", "post in ",
+        )
+    ))
+
+
+def _valid_conversation_id(value):
+    return (
+        isinstance(value, str) and value.startswith("conversation:")
+        and 1 <= len(value) <= 160
+        and all(character.isalnum() or character in ":_-" for character in value)
+    )
+
+
+def _turn_response(turn):
+    state = turn.get("state", "interpreting")
+    response = {
+        "state": state,
+        "conversationId": turn.get("conversation_id") or turn.get("conversationId"),
+    }
+    if turn.get("need"):
+        response["need"] = turn["need"]
+    if turn.get("message"):
+        response["message"] = turn["message"]
+    return {key: value for key, value in response.items() if value is not None}
+
+
+def _conversation_response(conversation):
+    result = {
+        "state": conversation["status"],
+        "conversationId": conversation["conversation_id"],
+    }
+    if conversation.get("blocking_need"):
+        result["need"] = conversation["blocking_need"]
+    presentation = conversation.get("presentation")
+    if presentation:
+        result["answer"] = presentation.get("answer")
+        result["citations"] = presentation.get("citations", [])
+        result["partial"] = bool(presentation.get("partial"))
+    draft = conversation.get("pending_draft")
+    if draft:
+        result["draft"] = {
+            "draftHash": draft.get("draft_hash"),
+            "destination": draft.get("destination_label"),
+            "text": draft.get("text"),
+            "workflowId": draft.get("workflow_run_id"),
+            "revisionId": draft.get("workflow_revision_id"),
+        }
+    if conversation.get("workflow_run_id"):
+        result["workflow"] = {
+            "workflowId": conversation["workflow_run_id"],
+            "revisionId": conversation.get("workflow_revision_id"),
+        }
+    return result
+
+
+def _classified_recovery(exc, conversation_id=None):
+    code = str(exc).split(":", 1)[0]
+    action = "upgrade_scopes" if code == "missing_scope" else "reconnect"
+    return {
+        "state": "retryable_failure", "conversationId": conversation_id,
+        "error": {"code": code}, "recovery": {"action": action},
+    }
 
 
 def _tenant_resolver():
@@ -392,6 +579,7 @@ def main(argv=None):
         workflow_repository,
         rollout_version=os.environ.get("TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"),
         shadow_mode=os.environ.get("TESSERA_DYNAMIC_PLANNER_SHADOW", "true").lower() != "false",
+        conversation_store=ConciergeConversationStore(workflow_repository),
     )
     httpd = ThreadingHTTPServer(
         (args.host, args.port),
