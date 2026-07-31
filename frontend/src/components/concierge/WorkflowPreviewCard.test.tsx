@@ -39,3 +39,30 @@ it("renders completed Slack read output returned by workflow polling", async () 
 
   expect(await screen.findByText("#tessera-test")).toBeVisible();
 });
+
+it("shows the exact Slack payload and binds approval to its draft hash", async () => {
+  sessionStorage.setItem("tessera-csrf", "csrf");
+  const fetchMock = vi.fn().mockResolvedValue(Response.json({ status: "approved" }));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<WorkflowPreviewCard
+    workflow={{ workflowId: "w2", revisionId: "r3", revision: 3, outcome: "Enviar a #general", steps: [] }}
+    slackDraft={{ conversationId: "conversation:2", draftHash: "sha256:abc", destination: "#general", text: "Hola\nequipo" }}
+  />);
+
+  expect(screen.getByText("#general")).toBeVisible();
+  expect(screen.getByText(/Hola\s+equipo/)).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Confirmar y enviar" }));
+  expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toMatchObject({
+    conversationId: "conversation:2", draftHash: "sha256:abc", revisionId: "r3", revision: 3,
+  });
+});
+
+it("blocks approval for a superseded draft", () => {
+  render(<WorkflowPreviewCard
+    workflow={{ workflowId: "w2", revisionId: "r3", revision: 3, outcome: "Enviar", steps: [] }}
+    slackDraft={{ conversationId: "conversation:2", draftHash: "old", destination: "#general", text: "Anterior" }}
+    superseded
+  />);
+  expect(screen.getByRole("button", { name: "Confirmar y enviar" })).toBeDisabled();
+  expect(screen.getByText(/ya no es válida/)).toBeVisible();
+});

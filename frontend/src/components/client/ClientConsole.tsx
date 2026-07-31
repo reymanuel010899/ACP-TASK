@@ -8,12 +8,24 @@
 // never orchestrates itself — it just shows the concierge's replies.
 
 import { useEffect, useRef, useState } from "react";
-import WorkflowPreviewCard, { type WorkflowPreview } from "@/components/concierge/WorkflowPreviewCard";
+import WorkflowPreviewCard, { type SlackDraft, type WorkflowPreview } from "@/components/concierge/WorkflowPreviewCard";
+import SlackEvidenceCard, { type SlackCitation } from "@/components/concierge/SlackEvidenceCard";
+import { WEB_SESSION_CSRF_STORAGE_KEY } from "@/lib/agentSession";
 
 type Brain = "claude" | "groq" | "rule";
 type Reply = {
   status?: string;
+  state?: string;
   reply?: string;
+  message?: string;
+  answer?: string;
+  conversationId?: string;
+  need?: { field: string; question: string; options?: Array<Record<string, unknown>> };
+  citations?: SlackCitation[];
+  period?: { oldest?: string; latest?: string; label?: string };
+  partial?: boolean;
+  draft?: { draftHash: string; destination: string; text: string; workflowId: string; revisionId: string; revision?: number };
+  recovery?: { action?: string };
   evidence?: Record<string, unknown>;
   brain?: Brain;
   workflow?: WorkflowPreview;
@@ -23,10 +35,12 @@ type LogItem = { type: "user"; text: string } | { type: "concierge"; reply: Repl
 export const CHAT_INACTIVITY_MS = 3 * 60 * 1000;
 
 const EXAMPLES = [
-  "necesito enviar un paquete a Santiago",
-  "busco a alguien que me genere infraestructura terraform",
-  "necesito que hagan una tarea del marketplace",
+  "¿Qué dijo María en #nuevo-canal?",
+  "Manda un mensaje en #general",
+  "Send María a direct message saying hello",
 ];
+
+const POLLING_STATES = new Set(["interpreting", "resolving", "retrieving", "answering", "executing"]);
 
 const STATUS_LABEL: Record<string, { text: string; cls: string }> = {
   verified: { text: "VERIFIED", cls: "bg-[color-mix(in_srgb,var(--ag-green)_18%,transparent)] text-[var(--ag-green)]" },
@@ -49,11 +63,44 @@ export default function ClientConsole() {
   const [log, setLog] = useState<LogItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [brain, setBrain] = useState<Brain | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [supersededDrafts, setSupersededDrafts] = useState<Set<string>>(new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [log, loading]);
+
+  const latestReply = [...log].reverse().find((item): item is Extract<LogItem, { type: "concierge" }> => item.type === "concierge")?.reply;
+
+  useEffect(() => {
+    const state = latestReply?.state ?? latestReply?.status;
+    if (!conversationId || !state || !POLLING_STATES.has(state)) return;
+    let active = true;
+    async function poll() {
+      try {
+        const response = await fetch(`/api/client/conversations/${encodeURIComponent(conversationId!)}`, {
+          credentials: "same-origin", cache: "no-store",
+        });
+        if (!response.ok) return;
+        const next = await response.json() as Reply;
+        if (!active) return;
+        setLog((current) => {
+          const copy = [...current];
+          const index = copy.findLastIndex((item) => item.type === "concierge");
+          if (index >= 0) copy[index] = { type: "concierge", reply: next };
+          return copy;
+        });
+      } catch { /* Preserve durable state and retry on the next interval. */ }
+    }
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [conversationId, latestReply?.state, latestReply?.status]);
+
+  useEffect(() => {
+    const target = scrollRef.current?.querySelector<HTMLElement>("[data-latest-concierge] button, [data-latest-concierge] a");
+    target?.focus();
+  }, [log]);
 
   useEffect(() => {
     // A session becomes idle only after the concierge has answered and is
@@ -67,10 +114,30 @@ export default function ClientConsole() {
       setText("");
       setLog([]);
       setBrain(null);
+      const staleId = conversationId;
+      setConversationId(null);
+      if (staleId) void closeUpstream(staleId);
     }, CHAT_INACTIVITY_MS);
 
     return () => window.clearTimeout(timeout);
-  }, [open, loading, log]);
+  }, [open, loading, log, conversationId]);
+
+  async function closeUpstream(id: string) {
+    const csrf = sessionStorage.getItem(WEB_SESSION_CSRF_STORAGE_KEY);
+    if (!csrf) return;
+    try {
+      await fetch(`/api/client/conversations/${encodeURIComponent(id)}/close`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+        body: "{}",
+      });
+    } catch { /* Local close still clears authority from the UI. */ }
+  }
+
+  const closeConsole = () => {
+    if (conversationId) void closeUpstream(conversationId);
+    setConversationId(null); setLog([]); setText(""); setBrain(null); setOpen(false);
+  };
 
   const send = async (value?: string) => {
     const message = (value ?? text).trim();
@@ -88,10 +155,11 @@ export default function ClientConsole() {
       const res = await fetch("/api/client/request", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, history }),
+        body: JSON.stringify({ message, history, conversationId }),
       });
       const reply = (await res.json()) as Reply;
       if (reply.brain) setBrain(reply.brain);
+      if (reply.conversationId) setConversationId(reply.conversationId);
       setLog((l) => [...l, { type: "concierge", reply }]);
     } catch (err) {
       setLog((l) => [...l, { type: "concierge", reply: { status: "failed", reply: err instanceof Error ? err.message : String(err) } }]);
@@ -118,7 +186,7 @@ export default function ClientConsole() {
                 {brain === "claude" && <span className="text-[var(--ag-green)]"> · Claude Opus</span>}
               </div>
             </div>
-            <button onClick={() => setOpen(false)} className="text-[var(--ag-text-muted)] hover:text-[var(--ag-text)] text-[18px] leading-none px-[6px]" aria-label="Close">
+            <button onClick={closeConsole} className="text-[var(--ag-text-muted)] hover:text-[var(--ag-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--ag-purple)] text-[18px] leading-none px-[6px]" aria-label="Close concierge conversation">
               ×
             </button>
           </div>
@@ -144,7 +212,7 @@ export default function ClientConsole() {
               </div>
             )}
             {log.map((item, i) => (
-              <MessageBubble key={i} item={item} />
+              <MessageBubble key={i} item={item} latest={i === log.length - 1} send={send} setComposer={(value) => { setText(value); const hash = latestReply?.draft?.draftHash; if (hash) setSupersededDrafts(current => new Set(current).add(hash)); }} supersededDrafts={supersededDrafts} />
             ))}
             {loading && <div className="text-[11px] text-[var(--ag-text-muted)] italic self-start">el concierge está pensando…</div>}
           </div>
@@ -153,8 +221,8 @@ export default function ClientConsole() {
           <div className="box-border shrink-0 p-[10px_12px] flex flex-row gap-[8px] items-center [border-top:1px_solid_var(--ag-divider)] bg-[var(--ag-sidebar)]">
             <input
               value={text}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && send()}
+              onChange={(e) => { setText(e.target.value); const hash = latestReply?.draft?.draftHash; if (hash) setSupersededDrafts(current => new Set(current).add(hash)); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
               placeholder="¿Qué necesitas?"
               className="box-border [flex:1_1_0] min-w-0 p-[9px_11px] bg-[var(--ag2-input)] [border:1px_solid_var(--ag2-border)] rounded-[8px] text-[12px] text-[var(--ag-text)] outline-none focus:[border-color:#5D20DC] placeholder:text-[var(--ag-text-muted)]"
             />
@@ -187,7 +255,7 @@ export default function ClientConsole() {
   );
 }
 
-function MessageBubble({ item }: { item: LogItem }) {
+function MessageBubble({ item, latest, send, setComposer, supersededDrafts }: { item: LogItem; latest: boolean; send: (value?: string) => Promise<void>; setComposer: (value: string) => void; supersededDrafts: Set<string> }) {
   if (item.type === "user") {
     return (
       <div className="flex flex-col items-end gap-[3px] self-end max-w-[85%]">
@@ -197,15 +265,50 @@ function MessageBubble({ item }: { item: LogItem }) {
     );
   }
   const r = item.reply;
-  const badge = r.status ? STATUS_LABEL[r.status] : undefined;
+  const status = r.state ?? r.status;
+  const badge = status ? STATUS_LABEL[status] : undefined;
+  const draftWorkflow: WorkflowPreview | undefined = r.draft ? {
+    workflowId: r.draft.workflowId, revisionId: r.draft.revisionId,
+    revision: r.draft.revision ?? 1, outcome: `Enviar a ${r.draft.destination}`, steps: [],
+  } : undefined;
+  const slackDraft: SlackDraft | undefined = r.draft && r.conversationId ? {
+    conversationId: r.conversationId, draftHash: r.draft.draftHash,
+    destination: r.draft.destination, text: r.draft.text,
+  } : undefined;
   return (
-    <div className="flex flex-col items-start gap-[3px] self-start max-w-[90%]">
+    <div data-latest-concierge={latest || undefined} className="flex flex-col items-start gap-[3px] self-start w-full max-w-[94%]">
       <div className="box-border p-[10px_12px] rounded-[12px_12px_12px_2px] bg-[var(--ag-card)] [border:1px_solid_var(--ag-card-border)] text-[12px] leading-[1.55] text-[var(--ag-text)] flex flex-col gap-[7px]">
         {badge && <span className={`box-border self-start px-[8px] py-[2px] rounded-full text-[9px] font-semibold tracking-wide ${badge.cls}`}>{badge.text}</span>}
-        <div>{r.reply}</div>
+        {(r.need?.question || r.reply || r.message) && <div>{r.need?.question ?? r.reply ?? r.message}</div>}
+        {r.need?.options?.length ? <div className="flex flex-wrap gap-2" role="group" aria-label={r.need.question}>{r.need.options.map((option, index) => <CandidateButton key={candidateKey(option, index)} option={option} index={index} onSelect={send} />)}</div> : null}
+        {r.answer ? <SlackEvidenceCard answer={r.answer} citations={r.citations ?? []} period={r.period} partial={r.partial} /> : null}
+        {draftWorkflow && slackDraft ? <WorkflowPreviewCard workflow={draftWorkflow} slackDraft={slackDraft} superseded={supersededDrafts.has(slackDraft.draftHash)} onEdit={setComposer} /> : null}
         {r.workflow ? <WorkflowPreviewCard workflow={r.workflow} /> : null}
+        {status === "retryable_failure" && r.draft ? <p className="text-[11px] text-amber-300">El borrador se conserva. Corrige la conexión indicada y vuelve a intentarlo cuando Tessera lo permita.</p> : null}
+        {status === "unknown_outcome" ? <p className="text-[11px] text-amber-300">Slack puede haber recibido el mensaje. Tessera está conciliando el resultado y no permitirá un reintento ciego.</p> : null}
+        {status === "expired" ? <p className="text-[11px] text-[var(--ag-text-secondary)]">Esta conversación expiró. Tu próximo mensaje empezará sin destinos anteriores.</p> : null}
       </div>
       <span className="text-[10px] text-[var(--ag-text-muted)]">concierge</span>
     </div>
   );
+}
+
+function candidateLabel(option: Record<string, unknown>, index: number) {
+  const name = option.display_name ?? option.team_name ?? option.name ?? option.real_name ?? option.handle ?? option.team_id;
+  const handle = option.handle && option.handle !== name ? ` · @${String(option.handle)}` : "";
+  return `${String(name ?? `Opción ${index + 1}`)}${handle}`;
+}
+
+function candidateKey(option: Record<string, unknown>, index: number) {
+  return String(option.id ?? option.connection_id ?? option.team_id ?? index);
+}
+
+function CandidateButton({ option, index, onSelect }: { option: Record<string, unknown>; index: number; onSelect: (value?: string) => Promise<void> }) {
+  const label = candidateLabel(option, index);
+  return <button type="button" onClick={() => void onSelect(label)} className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-[var(--ag-card-border)] px-2.5 py-2 text-left text-[11px] text-[var(--ag-text)] hover:border-[var(--ag-purple)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ag-purple)]">
+    {/* Slack avatar URLs are dynamic and cannot be declared in Next Image remotePatterns. */}
+    {/* eslint-disable-next-line @next/next/no-img-element */}
+    {typeof option.image_url === "string" ? <img src={option.image_url} alt="" className="h-7 w-7 shrink-0 rounded-full object-cover" /> : null}
+    <span className="min-w-0 truncate">{label}</span>
+  </button>;
 }
