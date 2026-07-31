@@ -64,6 +64,87 @@ def test_service_persists_one_slack_need_and_rejects_expired_pronoun(tmp_path):
     assert "active_channel" not in expired
 
 
+def test_two_turn_http_service_path_materializes_the_preserved_exact_post(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "team_name": "Acme",
+                     "status": "connected", "credential_version": 1,
+                     "granted_scopes": ["chat:write"],
+                     "enabled_capabilities": ["slack.message.send"]}]
+    repository = WorkflowRepository(str(tmp_path / "w-two-turn.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    first = service.coordinate_slack_turn(
+        "org:1", "user:1", "Manda un mensaje en #general",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+    second = service.coordinate_slack_turn(
+        "org:1", "user:1", "Hola equipo",
+        conversation_id=first["conversation_id"],
+    )
+    advanced = service.advance_slack_turn(
+        first["conversation_id"], "org:1", "user:1", "Hola equipo", second
+    )
+    assert advanced["state"] == "awaiting_approval"
+    assert advanced["draft"]["destination_label"] == "#general"
+    assert advanced["draft"]["text"] == "Hola equipo"
+
+
+def test_named_channel_starts_brokered_resolution_and_resumes_exact_post(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "team_name": "Acme",
+                     "status": "connected", "credential_version": 1,
+                     "granted_scopes": ["channels:read", "chat:write"],
+                     "enabled_capabilities": ["slack.channels.list", "slack.message.send"]}]
+    repository = WorkflowRepository(str(tmp_path / "resolver.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    intake = service.coordinate_slack_turn(
+        "org:1", "user:1", "Manda en #general que Hola equipo"
+    )
+    resolving = service.advance_slack_turn(
+        intake["conversation_id"], "org:1", "user:1",
+        "Manda en #general que Hola equipo", intake,
+    )
+    assert resolving["state"] == "retrieving"
+    revision = repository.get_revision_by_id(
+        resolving["workflow"]["revisionId"], "org:1"
+    )
+    assert revision["steps"][0]["capability_id"] == "slack.channels.list"
+    assert repository.revision_authorization_mode(
+        revision["workflow_run_id"], revision["workflow_revision_id"],
+        "org:1", revision["plan_graph_hash"], 10,
+    ) == "requested_read"
+
+    claim = repository.claim_ready_step(
+        revision["workflow_run_id"], revision["workflow_revision_id"],
+        "org:1", "worker:1", 10, 30,
+    )
+    repository.persist_completion(
+        revision["workflow_revision_id"], "resolve-slack-channel", "org:1",
+        claim["attempt"], {"ok": True}, {}, 10,
+        output={"channels": [{"id": "C1", "name": "general"}]},
+    )
+    assert repository.sync_conversation_workflow_outcome(
+        revision["workflow_revision_id"], "org:1", {"status": "complete"}, 10
+    )
+    conversation = store.get(intake["conversation_id"], "org:1", "user:1")
+    assert conversation["status"] == "resolving"
+    resumed = service.resume_resolved_slack_turn(conversation)
+    assert resumed["state"] == "awaiting_approval"
+    assert resumed["draft"]["destination_label"] == "#general"
+    assert resumed["draft"]["text"] == "Hola equipo"
+
+
 def test_completed_read_presentation_is_generated_once_across_polls(tmp_path):
     class Connections:
         def list_installations(self, tenant, principal):

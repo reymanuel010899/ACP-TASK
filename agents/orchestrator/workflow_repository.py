@@ -1034,7 +1034,7 @@ class WorkflowRepository(object):
             "status", "locale", "operation", "active_connection",
             "active_channel", "active_person", "active_thread", "read_period",
             "pending_draft", "blocking_need", "workflow_run_id",
-            "workflow_revision_id",
+            "workflow_revision_id", "resolution_request",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -1222,6 +1222,135 @@ class WorkflowRepository(object):
                 (int(now_ts),),
             )
         return cursor.rowcount
+
+    def sync_conversation_workflow_outcome(self, revision_id, tenant_id,
+                                           outcome, now_ts):
+        """Project durable worker outcomes into the linked Concierge state."""
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT conversation_id, principal_id FROM concierge_conversations
+                   WHERE workflow_revision_id = ? AND tenant_id = ?
+                     AND status NOT IN ('closed', 'expired')""",
+                (revision_id, tenant_id),
+            ).fetchone()
+        if row is None:
+            return False
+        status = outcome.get("status")
+        mapped = {
+            "complete": "succeeded",
+            "retry_wait": "retryable_failure",
+            "retryable_failure": "retryable_failure",
+            "blocked_connection": "retryable_failure",
+            "execution_unknown": "unknown_outcome",
+            "paused_by_policy": "retryable_failure",
+            "needs_replan": "retryable_failure",
+        }.get(status)
+        if mapped is None:
+            return False
+        changes = {"status": mapped}
+        revision = self.get_revision_by_id(revision_id, tenant_id)
+        effects = {step.get("effect") for step in (revision or {}).get("steps", [])}
+        resolver_step = next((step for step in (revision or {}).get("steps", [])
+                              if step.get("capability_id") in {
+                                  "slack.channels.list", "slack.users.list"
+                              }), None)
+        current = self.get_conversation(
+            row["conversation_id"], tenant_id, row["principal_id"], now_ts
+        )
+        resolution_request = (current or {}).get("resolution_request") or {}
+        if status == "complete" and resolver_step and resolution_request:
+            from agents.orchestrator.slack_conversation import normalize_name
+            output = resolver_step.get("output") or {}
+            field = resolution_request.get("field")
+            key = "channels" if field == "channel" else "users"
+            candidates = list(output.get(key) or [])
+            wanted = normalize_name(resolution_request.get("query"))
+            if field == "channel":
+                matches = [item for item in candidates if (
+                    normalize_name(item.get("name")) == wanted
+                    and item.get("is_private") is not True
+                )]
+            else:
+                matches = [item for item in candidates if wanted in {
+                    normalize_name(item.get("display_name")),
+                    normalize_name(item.get("real_name")),
+                    normalize_name(item.get("handle")),
+                }]
+            if len(matches) == 1:
+                selected = matches[0]
+                entity = ({"id": selected["id"], "name": selected["name"]}
+                          if field == "channel" else {
+                              key: selected[key] for key in (
+                                  "id", "display_name", "real_name", "handle",
+                                  "image_url",
+                              ) if selected.get(key) is not None
+                          })
+                changes.update(status="resolving", blocking_need=None)
+                changes["active_channel" if field == "channel" else "active_person"] = entity
+            else:
+                safe_options = [{key: item[key] for key in (
+                    "id", "name", "display_name", "real_name", "handle", "image_url"
+                ) if item.get(key) is not None} for item in matches]
+                locale = resolution_request.get("locale", "es")
+                changes.update(status="needs_input", blocking_need={
+                    "kind": "selection" if safe_options else "missing",
+                    "field": field,
+                    "question": (("¿Qué canal público de Slack?" if field == "channel"
+                                  else "¿Qué persona de Slack?") if locale == "es" else
+                                 ("Which public Slack channel?" if field == "channel"
+                                  else "Which Slack person?")),
+                    "options": safe_options,
+                })
+            self.update_conversation(
+                row["conversation_id"], tenant_id, row["principal_id"], changes, now_ts
+            )
+            return True
+        if status == "complete" and effects == {"read"}:
+            changes["status"] = "ready"
+            outputs = [step.get("output") or {} for step in revision["steps"]]
+            evidence = next((item for item in reversed(outputs)
+                             if item.get("messages") is not None), {})
+            messages = list(evidence.get("messages") or [])
+            answer = evidence.get("answer") or "\n".join(
+                str(item.get("text") or "") for item in messages
+                if isinstance(item, dict) and item.get("text")
+            )
+            self.store_conversation_presentation(
+                row["conversation_id"], tenant_id, row["principal_id"], {
+                    "answer": answer or "No messages found.",
+                    "citations": list(evidence.get("citations") or []),
+                    "period": evidence.get("period"),
+                    "partial": bool(evidence.get("partial")),
+                    "partial_reason": evidence.get("partial_reason"),
+                }, now_ts,
+            )
+        if status == "complete" and effects == {"write"}:
+            changes["pending_draft"] = None
+            current = self.get_conversation(
+                row["conversation_id"], tenant_id, row["principal_id"], now_ts
+            )
+            locale = (current or {}).get("locale", "es")
+            self.store_conversation_presentation(
+                row["conversation_id"], tenant_id, row["principal_id"], {
+                    "locale": locale,
+                    "answer": "Mensaje enviado" if locale == "es" else "Message sent",
+                    "citations": [], "partial": False,
+                }, now_ts,
+            )
+        self.update_conversation(
+            row["conversation_id"], tenant_id, row["principal_id"],
+            changes, now_ts,
+        )
+        return True
+
+    def get_revision_by_id(self, revision_id, tenant_id):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT workflow_run_id FROM workflow_revisions
+                   WHERE workflow_revision_id = ? AND tenant_id = ?""",
+                (revision_id, tenant_id),
+            ).fetchone()
+        return self.get_revision(row["workflow_run_id"], revision_id, tenant_id) if row else None
 
     def close(self):
         with self._lock:

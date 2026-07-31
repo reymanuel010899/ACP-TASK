@@ -85,3 +85,38 @@ def test_model_like_ids_have_no_place_in_typed_turn_contract():
     assert "channel_id" not in turn.model_dump()
     assert "connection_id" not in turn.model_dump()
     assert "user_id" not in turn.model_dump()
+
+
+def test_blocking_message_answer_preserves_post_operation_and_channel():
+    result = SlackConversationCoordinator().coordinate(
+        "Hola equipo",
+        active_state={
+            "operation": "post", "locale": "es",
+            "active_connection": {"id": "conn:s", "label": "Acme"},
+            "active_channel": {"id": "C1", "name": "general"},
+            "blocking_need": {"kind": "missing", "field": "message_text",
+                              "question": "¿Qué mensaje?", "options": []},
+        },
+        installations=[{"connection_id": "conn:s", "status": "connected"}],
+    )
+    assert result.state == "resolving"
+    assert result.turn.operation == "post"
+    assert result.resolved["active_channel"]["id"] == "C1"
+    assert result.resolved["message_text"] == "Hola equipo"
+
+
+def test_blocking_person_selection_accepts_only_one_stored_candidate():
+    active = {
+        "operation": "dm", "locale": "es",
+        "active_connection": {"id": "conn:s", "label": "Acme"},
+        "blocking_need": {"kind": "selection", "field": "person",
+                          "question": "¿Cuál María?", "options": [
+            {"id": "U1", "display_name": "María", "handle": "maria.ops"},
+            {"id": "U2", "display_name": "María", "handle": "maria.sales"},
+        ]},
+    }
+    result = SlackConversationCoordinator().coordinate(
+        "María · @maria.sales", active_state=active,
+        installations=[{"connection_id": "conn:s", "status": "connected"}],
+    )
+    assert result.resolved["active_person"]["id"] == "U2"

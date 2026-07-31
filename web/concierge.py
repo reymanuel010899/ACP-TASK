@@ -183,6 +183,11 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                         "state": "expired", "conversationId": conversation_id,
                         "recovery": {"action": "start_new_conversation"},
                     })
+                if (conversation.get("status") == "resolving"
+                        and conversation.get("resolution_request")):
+                    return self._send(200, _turn_response(
+                        dynamic_workflow_service.resume_resolved_slack_turn(conversation)
+                    ))
                 return self._send(200, _conversation_response(conversation))
             if path.startswith("/workflows/") and workflow_repository and session_repository:
                 workflow_id = _workflow_id_from_path(path)
@@ -382,6 +387,10 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                                 tenant_id, current["principal_id"], message,
                                 conversation_id=conversation_id,
                             )
+                            turn = dynamic_workflow_service.advance_slack_turn(
+                                turn.get("conversation_id") or conversation_id,
+                                tenant_id, current["principal_id"], message, turn,
+                            )
                             return self._send(200, _turn_response(turn))
                         except (KeyError, TimeoutError):
                             return self._send(404, {
@@ -484,6 +493,17 @@ def _turn_response(turn):
         response["need"] = turn["need"]
     if turn.get("message"):
         response["message"] = turn["message"]
+    if turn.get("draft"):
+        draft = turn["draft"]
+        response["draft"] = {
+            "draftHash": draft.get("draft_hash"),
+            "destination": draft.get("destination_label"),
+            "text": draft.get("text"),
+            "workflowId": draft.get("workflow_run_id"),
+            "revisionId": draft.get("workflow_revision_id"),
+        }
+    if turn.get("workflow"):
+        response["workflow"] = turn["workflow"]
     return {key: value for key, value in response.items() if value is not None}
 
 
@@ -499,6 +519,10 @@ def _conversation_response(conversation):
         result["answer"] = presentation.get("answer")
         result["citations"] = presentation.get("citations", [])
         result["partial"] = bool(presentation.get("partial"))
+        if presentation.get("period") is not None:
+            result["period"] = presentation["period"]
+        if presentation.get("partial_reason"):
+            result["partialReason"] = presentation["partial_reason"]
     draft = conversation.get("pending_draft")
     if draft:
         result["draft"] = {

@@ -19,11 +19,15 @@ def test_needs_input_contract_has_one_question_and_opaque_conversation_id():
 def test_poll_contract_returns_grounded_answer_and_safe_exact_draft():
     completed = _conversation_response({
         "status": "ready", "conversation_id": "conversation:1",
-        "presentation": {"answer": "Resumen", "citations": [{"permalink": "https://slack/source"}], "partial": True},
+        "presentation": {"answer": "Resumen", "citations": [{"permalink": "https://slack/source"}], "partial": True,
+                         "period": {"oldest": "1", "latest": "2"},
+                         "partial_reason": "rate_limit"},
         "workflow_run_id": "workflow:1", "workflow_revision_id": "revision:1",
     })
     assert completed["answer"] == "Resumen"
     assert completed["citations"] == [{"permalink": "https://slack/source"}]
+    assert completed["period"] == {"oldest": "1", "latest": "2"}
+    assert completed["partialReason"] == "rate_limit"
     draft = _conversation_response({
         "status": "awaiting_approval", "conversation_id": "conversation:2",
         "pending_draft": {"draft_hash": "hash", "destination_label": "#general",

@@ -42,6 +42,10 @@ class DynamicWorkflowService:
                 conversation_id, tenant_id, principal_id
             )
         installations = self._tenant_installations(tenant_id, principal_id)
+        if channels is None and hasattr(self.connections, "list_slack_channels"):
+            channels = self.connections.list_slack_channels(tenant_id, principal_id)
+        if users is None and hasattr(self.connections, "list_slack_users"):
+            users = self.connections.list_slack_users(tenant_id, principal_id)
         result = self.slack_coordinator.coordinate(
             text, active_state=active, installations=installations,
             channels=channels, users=users,
@@ -81,7 +85,7 @@ class DynamicWorkflowService:
                 }
             }
             updates.update(status=result.state, locale=result.turn.locale,
-                           operation=result.turn.operation)
+                           operation=result.turn.operation, blocking_need=None)
             self.conversation_store.update(
                 conversation_id, tenant_id, principal_id, **updates
             )
@@ -91,6 +95,118 @@ class DynamicWorkflowService:
                 )
             payload["conversation_id"] = conversation_id
         return payload
+
+    def advance_slack_turn(self, conversation_id, tenant_id, principal_id,
+                           text, turn_payload):
+        """Compile a fully grounded turn; unresolved turns remain intake-only."""
+        need = turn_payload.get("need") or {}
+        turn = turn_payload.get("turn") or {}
+        query = turn.get("channel_name") if need.get("field") == "channel" else turn.get("person_name")
+        if turn_payload.get("state") == "needs_input" and query and need.get("field") in {"channel", "person"}:
+            return self._start_slack_entity_resolution(
+                conversation_id, tenant_id, principal_id, text, turn, need["field"], query
+            )
+        if turn_payload.get("state") != "resolving":
+            return turn_payload
+        resolved = turn_payload.get("resolved") or {}
+        operation = turn.get("operation")
+        if operation in {"post", "reply", "dm"}:
+            capability = {
+                "post": "slack.message.send",
+                "reply": "slack.thread.reply",
+                "dm": "slack.direct_message.send",
+            }[operation]
+            draft = self.materialize_slack_write(
+                conversation_id, tenant_id, principal_id, capability,
+                resolved.get("message_text") or turn.get("message_text"),
+            )
+            return {
+                "state": "awaiting_approval", "conversation_id": conversation_id,
+                "draft": draft,
+            }
+        if operation in {"read", "summarize"}:
+            workflow = self.plan(
+                tenant_id, principal_id, text,
+                {"slack_resolution": resolved},
+            )
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id, status="retrieving",
+                workflow_run_id=workflow["run"]["workflow_run_id"],
+                workflow_revision_id=workflow["revision"]["workflow_revision_id"],
+            )
+            return {
+                "state": "retrieving", "conversation_id": conversation_id,
+                "workflow": workflow["preview"],
+            }
+        return turn_payload
+
+    def _start_slack_entity_resolution(self, conversation_id, tenant_id,
+                                       principal_id, text, turn, field, query):
+        capability_id = "slack.channels.list" if field == "channel" else "slack.users.list"
+        conversation = self.conversation_store.get(conversation_id, tenant_id, principal_id)
+        connection_id = ((conversation or {}).get("active_connection") or {}).get("id")
+        connection = next((item for item in self._tenant_installations(tenant_id, principal_id)
+                           if item.get("connection_id") == connection_id), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(set(connection.get("granted_scopes") or ())):
+            required = sorted(definition.required_scopes)[0] if definition else "unknown"
+            raise PermissionError("missing_scope:%s" % required)
+        now = int(self.clock())
+        run = self.workflows.create_run(tenant_id, principal_id, _hash("resolve:%s" % field), now)
+        payload = {"limit": 200}
+        step = {
+            "step_id": "resolve-slack-%s" % field,
+            "capability_id": capability_id, "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload), "depends_on": [], "effect": "read",
+        }
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step]})
+        revision = self.workflows.create_revision(run["workflow_run_id"], tenant_id,
+                                                  graph_hash, [step], now)
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id, status="retrieving",
+            blocking_need=None, workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+            resolution_request={"field": field, "query": query,
+                                "text": text, "turn": turn,
+                                "locale": turn.get("locale", "es")},
+        )
+        return {"state": "retrieving", "conversation_id": conversation_id,
+                "workflow": {"workflowId": run["workflow_run_id"],
+                             "revisionId": revision["workflow_revision_id"]}}
+
+    def resume_resolved_slack_turn(self, conversation):
+        request = conversation.get("resolution_request") or {}
+        text = request.get("text") or "Slack conversational request"
+        channels = [conversation["active_channel"]] if conversation.get("active_channel") else []
+        users = [conversation["active_person"]] if conversation.get("active_person") else []
+        payload = self.coordinate_slack_turn(
+            conversation["tenant_id"], conversation["principal_id"], text,
+            conversation_id=conversation["conversation_id"], channels=channels, users=users,
+        )
+        result = self.advance_slack_turn(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"], text, payload,
+        )
+        current = self.conversation_store.get(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"],
+        )
+        if (current or {}).get("resolution_request") == request:
+            self.conversation_store.update(
+                conversation["conversation_id"], conversation["tenant_id"],
+                conversation["principal_id"], resolution_request=None,
+            )
+        return result
 
     def _disabled_slack_feature(self, operation):
         if operation in {"read", "summarize"} and not self.conversational_reads_enabled:
@@ -109,7 +225,13 @@ class DynamicWorkflowService:
         return self.connections.list_installations(tenant_id, principal_id)
 
     def plan(self, tenant_id, principal_id, goal, context=None):
-        installations = self.connections.list_installations(tenant_id, principal_id)
+        context = dict(context or {})
+        installations = (
+            self.connections.list_tenant_installations(tenant_id, "slack")
+            if context.get("slack_resolution") is not None
+            and hasattr(self.connections, "list_tenant_installations")
+            else self.connections.list_installations(tenant_id, principal_id)
+        )
         connection_labels = {
             item["connection_id"]: (
                 item.get("team_name") or item.get("provider_account")
@@ -134,7 +256,7 @@ class DynamicWorkflowService:
                 ))
         compiler = PlanCompiler(self.definitions, snapshots, self.rollout_version)
         compiled = DynamicPlanner(self.brain, compiler, self.shadow_mode).plan(
-            goal, {**(context or {}), "tenant_id": tenant_id}
+            goal, {**context, "tenant_id": tenant_id}
         )
         if compiled["tenant_id"] != tenant_id:
             raise ValueError("planner tenant binding changed")
@@ -317,6 +439,10 @@ class DynamicWorkflowService:
         if not draft or draft.get("draft_hash") != draft_hash:
             raise ValueError("draft binding changed")
         capability_id = draft.get("capability_id")
+        if not self.slack_writes_enabled:
+            raise PermissionError("feature_disabled:slack_writes")
+        if capability_id == "slack.direct_message.send" and not self.slack_dms_enabled:
+            raise PermissionError("feature_disabled:slack_dms")
         if capability_id == "slack.message.send":
             current_entity_version = _hash(conversation.get("active_channel") or {})
         elif capability_id == "slack.thread.reply":

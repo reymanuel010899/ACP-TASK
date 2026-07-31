@@ -71,3 +71,20 @@ def test_pagination_stops_at_budget_and_forwards_time_window():
     assert calls[0]["latest"] == "now"
     assert calls[1]["cursor"] == "next-1"
     assert evidence["partial_reason"] == "message_or_page_budget"
+
+
+def test_permalink_collection_never_exposes_uncited_presenter_evidence():
+    evidence = BoundedSlackRead(max_citations=2).collect(
+        lambda _params: {"messages": [
+            {"ts": "1", "user": "U1", "text": "one"},
+            {"ts": "2", "user": "U1", "text": "two"},
+            {"ts": "3", "user": "U1", "text": "uncited"},
+        ], "next_cursor": None},
+        "C1", "0", permalink=lambda channel, ts: {
+            "permalink": f"https://slack/{channel}/{ts}"
+        },
+    )
+    result = GroundedResultPresenter().present("summary", evidence, "en")
+    assert [item["text"] for item in evidence["messages"]] == ["one", "two"]
+    assert len(result["citations"]) == 2
+    assert "uncited" not in result["answer"]

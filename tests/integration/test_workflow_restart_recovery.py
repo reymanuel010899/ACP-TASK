@@ -51,3 +51,31 @@ def test_concierge_restart_preserves_tenant_bound_conversation_without_client_hi
     assert restarted_store.get(
         "conversation:restart", "org:other", "user:alice"
     ) is None
+
+
+def test_worker_terminal_projection_updates_the_durable_conversation(tmp_path):
+    repository = WorkflowRepository(str(tmp_path / "workflow.sqlite3"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    conversation = store.create("org:acme", "user:alice", "conversation:worker")
+    run = repository.create_run("org:acme", "user:alice", "goal", 10)
+    revision = repository.create_revision(run["workflow_run_id"], "org:acme", "graph", [{
+        "step_id": "send", "capability_id": "slack.message.send",
+        "capability_version": "1", "connection_id": "conn:s",
+        "descriptor_snapshot_hash": "d", "input_hash": "i",
+        "input": {"channel_id": "C1", "text": "Hola"},
+        "depends_on": [], "effect": "write",
+    }], 10)
+    store.update(
+        conversation["conversation_id"], "org:acme", "user:alice",
+        status="executing", pending_draft={"text": "Hola"},
+        workflow_run_id=run["workflow_run_id"],
+        workflow_revision_id=revision["workflow_revision_id"],
+    )
+
+    assert repository.sync_conversation_workflow_outcome(
+        revision["workflow_revision_id"], "org:acme", {"status": "complete"}, 11
+    )
+    completed = store.get("conversation:worker", "org:acme", "user:alice")
+    assert completed["status"] == "succeeded"
+    assert completed.get("pending_draft") is None
+    assert completed["presentation"]["answer"] == "Mensaje enviado"

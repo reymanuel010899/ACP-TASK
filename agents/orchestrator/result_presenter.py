@@ -53,7 +53,8 @@ class BoundedSlackRead:
         budget_partial = bool(cursor) or pages >= self.max_pages and provider_partial
         citations = []
         if permalink:
-            for message in messages[:self.max_citations]:
+            messages = messages[:self.max_citations]
+            for message in messages:
                 if not message.get("message_ts"):
                     continue
                 source = permalink(channel_id, message["message_ts"])
@@ -65,6 +66,7 @@ class BoundedSlackRead:
                 })
         return {
             "messages": messages, "citations": citations,
+            "citation_complete": bool(permalink),
             "period": {"oldest": oldest, "latest": latest},
             "partial": budget_partial or truncated,
             "partial_reason": (

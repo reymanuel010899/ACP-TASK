@@ -120,6 +120,12 @@ class SlackConversationCoordinator:
                 "active_thread", "read_period", "pending_draft",
             ) if active.get(key) is not None
         }
+        blocking_need = active.get("blocking_need")
+        if isinstance(blocking_need, dict):
+            turn, answered = self._answer_blocking_need(
+                text, turn, active, blocking_need
+            )
+            resolved.update(answered)
         if turn.operation == "unsupported":
             return self._need(turn, resolved, "operation")
         if turn.operation == "cancel":
@@ -185,6 +191,63 @@ class SlackConversationCoordinator:
         if turn.message_text:
             resolved["message_text"] = turn.message_text
         return SlackTurnResult(state="resolving", turn=turn, resolved=resolved)
+
+    @staticmethod
+    def _answer_blocking_need(text, parsed_turn, active, need):
+        field = need.get("field")
+        operation = active.get("operation") or parsed_turn.operation
+        locale = active.get("locale") or parsed_turn.locale
+        options = list(need.get("options") or [])
+        value = str(text or "").strip()
+        answered = {}
+        if field == "message_text":
+            if not value:
+                return parsed_turn, answered
+            return SlackTurn(
+                operation=operation, locale=locale, message_text=value,
+                refers_to_active_target=True,
+            ), answered
+        if field in {"workspace", "channel", "person"} and options:
+            normalized = normalize_name(value.replace("·", " "))
+            strong_matches = []
+            matches = []
+            for option in options:
+                if any(normalize_name(option.get(key)) in normalized
+                       for key in ("connection_id", "team_id", "id", "handle")
+                       if normalize_name(option.get(key))):
+                    strong_matches.append(option)
+                labels = [option.get(key) for key in (
+                    "connection_id", "team_name", "team_id", "id", "name",
+                    "display_name", "real_name", "handle",
+                )]
+                if any(normalize_name(label) and normalize_name(label) in normalized
+                       for label in labels):
+                    matches.append(option)
+            if len(strong_matches) == 1:
+                matches = strong_matches
+            if len(matches) != 1:
+                return parsed_turn, answered
+            selected = matches[0]
+            if field == "workspace":
+                answered["active_connection"] = {
+                    "id": selected["connection_id"],
+                    "label": selected.get("team_name") or selected.get("team_id"),
+                }
+            elif field == "channel":
+                answered["active_channel"] = {
+                    "id": selected["id"], "name": selected["name"],
+                }
+            else:
+                answered["active_person"] = {
+                    key: selected[key] for key in (
+                        "id", "display_name", "real_name", "handle", "image_url"
+                    ) if selected.get(key) is not None
+                }
+            return SlackTurn(
+                operation=operation, locale=locale,
+                refers_to_active_target=True,
+            ), answered
+        return parsed_turn, answered
 
     @staticmethod
     def _need(turn, resolved, field, candidates=None):

@@ -39,10 +39,16 @@ class WorkflowWorker:
         )
         for revision in list_revisions():
             try:
-                outcomes.append(self.executor.run_until_blocked(
+                outcome = self.executor.run_until_blocked(
                     revision["workflow_run_id"], revision["workflow_revision_id"],
                     revision["tenant_id"], self.worker_id,
-                ))
+                )
+                outcomes.append(outcome)
+                if hasattr(self.workflows, "sync_conversation_workflow_outcome"):
+                    self.workflows.sync_conversation_workflow_outcome(
+                        revision["workflow_revision_id"], revision["tenant_id"],
+                        outcome, int(time.time()),
+                    )
             except Exception as exc:
                 outcomes.append({
                     "status": "worker_error",
