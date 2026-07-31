@@ -23,6 +23,7 @@ node_modules/
 dump.rdb
 .env
 .env.*
+!.env.example
 
 # Local runtime databases and SQLite sidecars
 tessera-*.db

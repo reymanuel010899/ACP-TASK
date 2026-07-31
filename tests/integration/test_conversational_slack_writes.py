@@ -1,3 +1,5 @@
+import pytest
+
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
@@ -69,3 +71,47 @@ def test_missing_scope_retains_draft_and_safe_retry_dispatches_once(tmp_path):
         draft["workflow_run_id"], draft["workflow_revision_id"], "org:1", "worker"
     )["status"] == "complete"
     assert provider_calls == [{"channel_id": "C1", "text": "Hola"}]
+
+
+def test_writes_and_direct_messages_have_independent_rollout_gates(tmp_path):
+    workflows = WorkflowRepository(str(tmp_path / "workflows.db"))
+    store = ConciergeConversationStore(workflows, clock=lambda: 10)
+    store.create("org:1", "user:1", "conversation:flags")
+    store.update(
+        "conversation:flags", "org:1", "user:1",
+        active_connection={"id": "conn:s", "label": "Acme"},
+        active_channel={"id": "C1", "name": "general"},
+        active_person={"id": "U1", "display_name": "María"},
+    )
+
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{
+                "connection_id": "conn:s", "team_name": "Acme",
+                "status": "connected", "credential_version": 1,
+                "granted_scopes": ["chat:write", "im:write"],
+                "enabled_capabilities": ["slack.message.send", "slack.direct_message.send"],
+            }]
+
+    writes_off = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), workflows,
+        conversation_store=store, slack_writes_enabled=False,
+    )
+    with pytest.raises(PermissionError, match="feature_disabled:slack_writes"):
+        writes_off.materialize_slack_write(
+            "conversation:flags", "org:1", "user:1", "slack.message.send", "Hola"
+        )
+
+    dms_off = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), workflows,
+        conversation_store=store, slack_writes_enabled=True,
+        slack_dms_enabled=False,
+    )
+    channel_draft = dms_off.materialize_slack_write(
+        "conversation:flags", "org:1", "user:1", "slack.message.send", "Hola canal"
+    )
+    assert channel_draft["destination_label"] == "#general"
+    with pytest.raises(PermissionError, match="feature_disabled:slack_dms"):
+        dms_off.materialize_slack_write(
+            "conversation:flags", "org:1", "user:1", "slack.direct_message.send", "Hola María"
+        )

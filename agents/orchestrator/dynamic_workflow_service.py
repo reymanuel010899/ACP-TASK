@@ -16,7 +16,8 @@ def _hash(value):
 class DynamicWorkflowService:
     def __init__(self, brain, definitions, connection_repository, workflow_repository,
                  rollout_version="production-v1", shadow_mode=True, clock=None,
-                 conversation_store=None):
+                 conversation_store=None, conversational_reads_enabled=True,
+                 slack_writes_enabled=True, slack_dms_enabled=True):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -25,6 +26,9 @@ class DynamicWorkflowService:
         self.shadow_mode = bool(shadow_mode)
         self.clock = clock or time.time
         self.conversation_store = conversation_store
+        self.conversational_reads_enabled = bool(conversational_reads_enabled)
+        self.slack_writes_enabled = bool(slack_writes_enabled)
+        self.slack_dms_enabled = bool(slack_dms_enabled)
         self.slack_coordinator = SlackConversationCoordinator()
 
     def coordinate_slack_turn(
@@ -42,6 +46,15 @@ class DynamicWorkflowService:
             text, active_state=active, installations=installations,
             channels=channels, users=users,
         )
+        disabled_feature = self._disabled_slack_feature(result.turn.operation)
+        if disabled_feature:
+            return {
+                "state": "retryable_failure",
+                "error": {"code": "feature_disabled"},
+                "recovery": {
+                    "action": "contact_admin", "feature": disabled_feature,
+                },
+            }
         if conversation_id and active is None and result.turn.refers_to_active_target:
             return {
                 "state": "expired", "conversation_id": conversation_id,
@@ -78,6 +91,15 @@ class DynamicWorkflowService:
                 )
             payload["conversation_id"] = conversation_id
         return payload
+
+    def _disabled_slack_feature(self, operation):
+        if operation in {"read", "summarize"} and not self.conversational_reads_enabled:
+            return "slack_conversational_reads"
+        if operation in {"post", "reply", "dm"} and not self.slack_writes_enabled:
+            return "slack_writes"
+        if operation == "dm" and not self.slack_dms_enabled:
+            return "slack_dms"
+        return None
 
     def _tenant_installations(self, tenant_id, principal_id):
         if hasattr(self.connections, "list_tenant_installations"):
@@ -198,6 +220,10 @@ class DynamicWorkflowService:
             "slack.message.send", "slack.thread.reply", "slack.direct_message.send"
         }:
             raise ValueError("unsupported Slack write capability")
+        if not self.slack_writes_enabled:
+            raise PermissionError("feature_disabled:slack_writes")
+        if capability_id == "slack.direct_message.send" and not self.slack_dms_enabled:
+            raise PermissionError("feature_disabled:slack_dms")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("exact message text is required")
         conversation = self.conversation_store.get(

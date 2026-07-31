@@ -580,6 +580,15 @@ def main(argv=None):
         rollout_version=os.environ.get("TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"),
         shadow_mode=os.environ.get("TESSERA_DYNAMIC_PLANNER_SHADOW", "true").lower() != "false",
         conversation_store=ConciergeConversationStore(workflow_repository),
+        conversational_reads_enabled=os.environ.get(
+            "TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED", "false"
+        ).lower() == "true",
+        slack_writes_enabled=os.environ.get(
+            "TESSERA_SLACK_WRITES_ENABLED", "false"
+        ).lower() == "true",
+        slack_dms_enabled=os.environ.get(
+            "TESSERA_SLACK_DMS_ENABLED", "false"
+        ).lower() == "true",
     )
     httpd = ThreadingHTTPServer(
         (args.host, args.port),

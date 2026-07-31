@@ -159,4 +159,25 @@ the business model are explicitly open.
 ## Secure provider orchestration
 
 Tessera supports tenant-bound Google and Slack connections through its OAuth service, encrypted credential vault, action broker, signed receipts, and revisioned workflow engine. Dynamic workflows are compiled from the live capability catalog; provider combinations are not encoded as named scenarios. Keep Slack and dynamic execution disabled until the sandbox gates in [the Slack runbook](docs/operations/slack-integration-runbook.md) and [the orchestrator runbook](docs/operations/dynamic-orchestrator-runbook.md) pass.
+
+### Local HTTPS Slack Concierge
+
+Copy `.env.example` to `.env`, fill credentials only in the ignored local file,
+and register the exact HTTPS callback shown there in the Slack app. Start the
+session, OAuth, action-broker, Concierge, workflow-worker, and frontend
+services against the same local databases. Run the frontend with Next.js local
+HTTPS support:
+
+```bash
+cd frontend
+npm run dev -- --experimental-https --hostname localhost --port 3000
+```
+
+Open `https://localhost:3000`, accept the local development certificate, sign
+in, and reconnect Slack after adding scopes. The safe rollout order and manual
+F1–F4 sandbox script are documented in
+[`agents/orchestrator/README.md`](agents/orchestrator/README.md#7-conversational-slack).
+Keep all three conversational flags off until focused tests pass; enable reads,
+then writes, then DMs. Existing public-channel listing is independent of these
+flags.
 # ACP
