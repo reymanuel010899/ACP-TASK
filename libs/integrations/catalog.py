@@ -234,12 +234,118 @@ def slack_definitions():
         "slack.reaction.add": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
+    nullable_string = {"type": ["string", "null"]}
+    channel = {
+        "type": "object",
+        "required": ["id", "name", "is_private"],
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "is_private": {"type": "boolean"},
+        },
+        "additionalProperties": False,
+    }
+    message = {
+        "type": "object",
+        "required": ["ts", "text", "user", "thread_ts"],
+        "properties": {
+            "ts": nullable_string,
+            "text": {"type": "string"},
+            "user": nullable_string,
+            "thread_ts": nullable_string,
+        },
+        "additionalProperties": False,
+    }
+    user = {
+        "type": "object",
+        "required": ["id", "handle", "display_name", "real_name"],
+        "properties": {
+            "id": {"type": "string"},
+            "handle": nullable_string,
+            "display_name": {"type": "string"},
+            "real_name": {"type": "string"},
+            "image_url": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+
+    def page_output(field, item_schema):
+        return {
+            "type": "object",
+            "required": [field, "next_cursor", "partial"],
+            "properties": {
+                field: {"type": "array", "items": item_schema},
+                "next_cursor": nullable_string,
+                "partial": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        }
+
+    def receipt_output(capability_id, extra_properties=None):
+        properties = {
+            "provider": {"type": "string", "const": "slack"},
+            "capability_id": {"type": "string", "const": capability_id},
+            "provider_id": {"type": "string"},
+            "team_id": nullable_string,
+            "channel_id": {"type": "string"},
+        }
+        properties.update(extra_properties or {})
+        return {
+            "type": "object",
+            "required": list(properties),
+            "properties": properties,
+            "additionalProperties": False,
+        }
+
+    output_schemas = {
+        "slack.channels.list": page_output("channels", channel),
+        "slack.private_channels.list": page_output("channels", channel),
+        "slack.conversation.read": page_output("messages", message),
+        "slack.private_conversation.read": page_output("messages", message),
+        "slack.thread.read": page_output("messages", message),
+        "slack.private_thread.read": page_output("messages", message),
+        "slack.users.list": page_output("users", user),
+        "slack.message.permalink": {
+            "type": "object",
+            "required": ["channel_id", "message_ts", "permalink"],
+            "properties": {
+                "channel_id": {"type": "string"},
+                "message_ts": {"type": "string"},
+                "permalink": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "slack.message.send": receipt_output(
+            "slack.message.send", {"message_ts": {"type": "string"}}
+        ),
+        "slack.thread.reply": receipt_output(
+            "slack.thread.reply", {"message_ts": {"type": "string"}}
+        ),
+        "slack.direct_message.send": receipt_output(
+            "slack.direct_message.send", {
+                "message_ts": {"type": "string"},
+                "user_id": {"type": "string"},
+            },
+        ),
+        "slack.reaction.add": receipt_output(
+            "slack.reaction.add", {
+                "message_ts": {"type": "string"},
+                "reaction": {"type": "string"},
+            },
+        ),
+        "slack.file.upload": receipt_output(
+            "slack.file.upload", {
+                "provider_id": nullable_string,
+                "file_id": nullable_string,
+            },
+        ),
+    }
     return tuple(TrustedCapabilityDefinition(
         capability_id=capability_id,
         version="1.0.0",
         provider="slack",
         input_schema=schemas[capability_id],
-        output_schema={"type": "object", "additionalProperties": False},
+        output_schema=output_schemas[capability_id],
         required_scopes=frozenset({scope}),
         effect=effect,
         risk="medium" if effect == "write" else "low",

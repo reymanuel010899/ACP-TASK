@@ -292,19 +292,19 @@ class OAuthRepository(object):
                 self._connection.execute("BEGIN IMMEDIATE")
                 existing = self._connection.execute(
                     """
-                    SELECT tenant_id, principal_id FROM integration_connections
+                    SELECT connection_id, tenant_id, principal_id
+                    FROM integration_connections
                     WHERE connection_id = ?
                        OR (provider = 'slack' AND provider = ? AND app_id = ? AND team_id = ?)
                     """,
                     (resolved_id, provider, app_id, team_id),
                 ).fetchone()
-                if existing is not None and (
-                    existing["tenant_id"] != tenant_id
-                    or existing["principal_id"] != principal_id
-                ):
+                if existing is not None and existing["tenant_id"] != tenant_id:
                     raise ConnectionConflict(
-                        "provider installation belongs to another tenant or owner"
+                        "provider installation belongs to another tenant"
                     )
+                if existing is not None:
+                    resolved_id = existing["connection_id"]
                 self._connection.execute(
                     """
                     INSERT INTO integration_connections(
@@ -314,6 +314,8 @@ class OAuthRepository(object):
                         status, created_at, updated_at, disconnected_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, NULL)
                     ON CONFLICT(connection_id) DO UPDATE SET
+                        principal_id = excluded.principal_id,
+                        team_name = excluded.team_name,
                         credential_id = excluded.credential_id,
                         credential_version = excluded.credential_version,
                         granted_scopes = excluded.granted_scopes,

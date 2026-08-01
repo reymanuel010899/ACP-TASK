@@ -28,13 +28,32 @@ def test_worker_schedules_requested_reads_but_not_unapproved_writes():
     assert calls == [("read-run", "read-rev", "org:1", "worker:1")]
 
 
-def test_worker_projects_terminal_outcome_to_linked_conversation():
+def test_worker_enqueues_then_projects_terminal_outcome():
     class Repository:
+        events = []
         def list_runnable_revisions(self):
             return [{"workflow_run_id": "w", "workflow_revision_id": "r",
                      "tenant_id": "org:1"}]
+        def recover_unprojected_conversation_outcomes(self, now):
+            return 0
+        def enqueue_workflow_conversation_outcome(self, revision, tenant, outcome, now):
+            self.events.append({
+                "event_id": "event:1", "tenant_id": tenant,
+                "aggregate_type": "conversation", "aggregate_id": "conversation:1",
+                "aggregate_version": 1, "event_type": "workflow.outcome",
+                "payload": {"revision_id": revision, "outcome": outcome},
+            })
+        def claim_outbox_event(self, worker, now, visibility):
+            return self.events.pop(0) if self.events else None
         def sync_conversation_workflow_outcome(self, revision, tenant, outcome, now):
             self.synced = (revision, tenant, outcome)
+            return True
+        def advance_projection_watermark(self, tenant, kind, aggregate, version, event, now):
+            self.watermark = (tenant, kind, aggregate, version, event)
+            return True
+        def complete_outbox_event(self, event, tenant, worker, now):
+            self.completed = (event, tenant, worker)
+            return True
     repository = Repository()
     class Executor:
         def run_until_blocked(self, *args):
@@ -43,3 +62,7 @@ def test_worker_projects_terminal_outcome_to_linked_conversation():
     assert repository.synced == (
         "r", "org:1", {"status": "execution_unknown", "step_id": "send"}
     )
+    assert repository.watermark[:4] == (
+        "org:1", "conversation", "conversation:1", 1
+    )
+    assert repository.completed == ("event:1", "org:1", "worker:1")

@@ -123,6 +123,15 @@ def test_ok_false_and_rate_limit_are_typed_without_token_leakage():
         missing.execute("slack.message.send", {"channel_id": "C1", "text": "x"}, context())
     assert "xoxb" not in str(caught.value)
 
+    membership = SlackActionExecutor(http=FakeHTTP([
+        Response(payload={"ok": False, "error": "not_in_channel"}),
+    ]))
+    with pytest.raises(SlackAPIError) as denied:
+        membership.execute(
+            "slack.message.send", {"channel_id": "C1", "text": "x"}, context(),
+        )
+    assert denied.value.category == "membership"
+
     limited = SlackActionExecutor(http=FakeHTTP([Response(status=429, headers={"Retry-After": "7"})]))
     with pytest.raises(SlackRateLimitError) as rate:
         limited.read("slack.channels.list", {}, context())

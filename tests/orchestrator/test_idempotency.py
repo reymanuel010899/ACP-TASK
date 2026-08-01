@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.reconciliation import reconcile_unknown_action
 from libs.connectors.base import ProviderAuthority, ProviderNetworkError
@@ -27,7 +29,12 @@ class Vault:
 
 
 class Executor:
+    def __init__(self, fail=None):
+        self.fail = fail
+
     def execute(self, *_args):
+        if self.fail:
+            raise self.fail
         return {"provider_id": "evt-1"}
 
     def read(self, *_args):
@@ -51,12 +58,12 @@ class Connector:
         }
 
 
-def _broker(repository, vault):
+def _broker(repository, vault, executor=None):
     return ActionBroker(
         repository,
         object(),
         vault,
-        Executor(),
+        executor or Executor(),
         Clock(),
         identity_verifier=lambda _url, _principal: True,
         agent_url_resolver=lambda _principal: "https://agent.example/a2a",
@@ -146,8 +153,11 @@ def test_concurrent_requests_claim_once(tmp_path):
 def test_unknown_outcome_reconciles_without_duplicate(tmp_path):
     repository = ActionRepository(str(tmp_path / "actions.sqlite"))
     payload, proposal, binding, lease = _approved(repository)
-    vault = Vault(ProviderNetworkError("timeout after dispatch"))
-    broker = _broker(repository, vault)
+    vault = Vault()
+    broker = _broker(
+        repository, vault,
+        Executor(ProviderNetworkError("timeout after dispatch")),
+    )
     assert broker.execute(lease, binding, payload) == (
         202,
         {"status": "execution_unknown"},
@@ -167,3 +177,94 @@ def test_unknown_outcome_reconciles_without_duplicate(tmp_path):
     assert resolved["status"] == "completed"
     assert repository.get(proposal["proposal_id"])["status"] == "completed"
     assert vault.calls == 1
+
+
+def test_dynamic_retry_scopes_idempotency_by_attempt_with_stable_effect_id(
+    tmp_path,
+):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    common = {
+        "user_principal_id": "user:alice",
+        "agent_principal_id": "agent:orchestrator",
+        "credential_id": "credential:slack",
+        "capability_id": "slack.message.send",
+        "payload": {"channel_id": "C1", "text": "hello"},
+        "expires_at": NOW + 300,
+        "proposal_id": "proposal:revision:1:send",
+        "idempotency_key": "workflow:revision:1:send",
+        "workflow_revision_id": "revision:1",
+        "step_id": "send",
+        "plan_graph_hash": "graph:1",
+        "connection_id": "conn:1",
+    }
+    first = repository.create_proposal(attempt=1, **common)
+    assert repository.decide(
+        first["proposal_id"], first["version"], "user:alice", True, NOW,
+    )
+    first_binding = {
+        key: first[key] for key in (
+            "proposal_id", "version", "user_principal_id",
+            "agent_principal_id", "credential_id", "capability_id",
+            "payload_hash", "idempotency_key", "workflow_revision_id",
+            "step_id", "plan_graph_hash", "connection_id", "attempt",
+        )
+    }
+    assert repository.consume_approval(first_binding, NOW) is not None
+    assert repository.fail_execution(
+        first["proposal_id"], first["version"], "safe rejection", NOW,
+        unknown=False,
+    )
+
+    second = repository.create_proposal(attempt=2, **common)
+
+    assert second["proposal_id"] == first["proposal_id"]
+    assert second["version"] == first["version"] + 1
+    assert second["attempt"] == 2
+    assert second["idempotency_key"] != first["idempotency_key"]
+    assert first["idempotency_key"].endswith(":attempt:1")
+    assert second["idempotency_key"].endswith(":attempt:2")
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_dynamic_retry_is_blocked_while_prior_attempt_is_dispatched_or_unknown(
+    tmp_path, unknown,
+):
+    repository = ActionRepository(str(tmp_path / ("actions-%s.sqlite" % unknown)))
+    common = {
+        "user_principal_id": "user:alice",
+        "agent_principal_id": "agent:orchestrator",
+        "credential_id": "credential:slack",
+        "capability_id": "slack.message.send",
+        "payload": {"channel_id": "C1", "text": "hello"},
+        "expires_at": NOW + 300,
+        "proposal_id": "proposal:revision:1:send",
+        "idempotency_key": "workflow:revision:1:send",
+        "workflow_revision_id": "revision:1",
+        "step_id": "send",
+        "plan_graph_hash": "graph:1",
+        "connection_id": "conn:1",
+    }
+    first = repository.create_proposal(attempt=1, **common)
+    assert repository.decide(
+        first["proposal_id"], first["version"], "user:alice", True, NOW,
+    )
+    binding = {
+        key: first[key] for key in (
+            "proposal_id", "version", "user_principal_id",
+            "agent_principal_id", "credential_id", "capability_id",
+            "payload_hash", "idempotency_key", "workflow_revision_id",
+            "step_id", "plan_graph_hash", "connection_id", "attempt",
+        )
+    }
+    assert repository.consume_approval(binding, NOW) is not None
+    assert repository.mark_dispatched(
+        first["proposal_id"], first["version"], NOW,
+    )
+    if unknown:
+        assert repository.fail_execution(
+            first["proposal_id"], first["version"], "timeout", NOW,
+            unknown=True,
+        )
+
+    with pytest.raises(ValueError, match="prior attempt"):
+        repository.create_proposal(attempt=2, **common)

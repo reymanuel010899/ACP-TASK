@@ -1,0 +1,10 @@
+{"id":"tune-thread-context","input":"Reply there: approved for release","context":"The deployment thread in #engineering is selected.","operations":["slack.thread.reply"],"slots":{"thread":"selected deployment thread","message":"approved for release"}}
+{"id":"tune-permalink-context","input":"Give me the Slack link for that post","context":"The selected post says the migration finished successfully.","operations":["slack.message.permalink"],"slots":{"message":"selected post"}}
+{"id":"tune-reaction-context","input":"Ponle ojos a ese mensaje","context":"Está seleccionado el mensaje visible sobre mantenimiento.","operations":["slack.reaction.add"],"slots":{"message":"mensaje seleccionado","reaction":"ojos"}}
+{"id":"tune-reaction-ambiguous","input":"React to that message","context":"A visible incident message is selected; no reaction was specified.","operations":["slack.reaction.add"],"slots":{"message":"selected incident message"},"blocker":"reaction"}
+{"id":"tune-summary-period","input":"Resume #ventas de ayer","context":"","operations":["slack.conversation.summarize"],"slots":{"channel":"ventas","period":"ayer"}}
+{"id":"tune-compound-channels","input":"Summarize #support and post in #managers: Support recap ready","context":"","operations":["slack.conversation.summarize","slack.message.send"],"indexed_slots":{"0.channel":"support","1.channel":"managers","1.message":"Support recap ready"}}
+{"id":"tune-unsupported-search","input":"Search every Slack message about renewals","context":"","operations":[],"blocker":"operation"}
+{"id":"tune-dm-missing-person","input":"Manda por DM: quedó aprobado","context":"No Slack person is selected.","operations":["slack.direct_message.send"],"slots":{"message":"quedó aprobado"},"blocker":"person"}
+{"id":"tune-channel-correction","input":"No, mejor #anuncios","context":"The pending message is Hola equipo and its prior destination was #general.","operations":["slack.message.send"],"slots":{"channel":"anuncios","message":"Hola equipo"}}
+{"id":"tune-list-typo","input":"shwo public slak channles","context":"","operations":["slack.channels.list"],"slots":{}}

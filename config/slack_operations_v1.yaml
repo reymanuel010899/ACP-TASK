@@ -1,0 +1,359 @@
+{
+  "manifest_version": "slack.operations.v1",
+  "provider": "slack",
+  "operations": [
+    {
+      "operation_id": "slack.connection.status",
+      "operation_kind": "local",
+      "availability": "supported",
+      "aliases": ["slack status", "is slack connected", "estado de slack", "slack está conectado"],
+      "slots": [],
+      "capability_recipe": [],
+      "authority_profile": "none",
+      "family_flag": "slack_connection_status",
+      "prerequisites": ["tenant_context"],
+      "recovery": {"unavailable": "explain_installation_state"},
+      "presentation": {"kind": "connection_status", "label": "Slack connection"}
+    },
+    {
+      "operation_id": "slack.channels.list",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["list channels", "show channels", "listar canales", "ver canales"],
+      "slots": [],
+      "capability_recipe": [
+        {
+          "step_id": "list_channels",
+          "capability_id": "slack.channels.list",
+          "capability_version": "1.0.0",
+          "input_bindings": {},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_channel_discovery",
+      "prerequisites": ["connected_installation"],
+      "recovery": {"unavailable": "explain_installation_or_family_requirement"},
+      "presentation": {"kind": "channel_list", "label": "Public channels"}
+    },
+    {
+      "operation_id": "slack.private_channels.list",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["list private channels", "listar canales privados"],
+      "slots": [],
+      "capability_recipe": [
+        {
+          "step_id": "list_private_channels",
+          "capability_id": "slack.private_channels.list",
+          "capability_version": "1.0.0",
+          "input_bindings": {},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_private_reads",
+      "prerequisites": ["connected_installation", "private_channel_membership"],
+      "recovery": {"unavailable": "explain_private_channel_membership"},
+      "presentation": {"kind": "channel_list", "label": "Private channels"}
+    },
+    {
+      "operation_id": "slack.conversation.read",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["read channel", "show messages", "leer canal", "ver mensajes"],
+      "slots": [
+        {"name": "channel", "entity_kind": "slack.channel", "required": true},
+        {"name": "limit", "entity_kind": "scalar.integer", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_conversation",
+          "capability_id": "slack.conversation.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "channel.id", "limit": "limit"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_conversation_reads",
+      "prerequisites": ["connected_installation", "channel_membership_if_private"],
+      "recovery": {"missing_slot": "clarify_channel", "unavailable": "explain_channel_access"},
+      "presentation": {"kind": "message_list", "label": "Channel messages"}
+    },
+    {
+      "operation_id": "slack.conversation.summarize",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["summarize channel", "channel summary", "resumir canal", "resumen del canal"],
+      "slots": [
+        {"name": "channel", "entity_kind": "slack.channel", "required": true},
+        {"name": "period", "entity_kind": "time.period", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_for_summary",
+          "capability_id": "slack.conversation.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "channel.id", "oldest": "period.start", "latest": "period.end"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_conversation_reads",
+      "prerequisites": ["connected_installation", "channel_membership_if_private"],
+      "recovery": {"missing_slot": "clarify_channel", "unavailable": "explain_channel_access"},
+      "presentation": {"kind": "grounded_summary", "label": "Channel summary"}
+    },
+    {
+      "operation_id": "slack.users.list",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["list slack users", "find slack user", "listar usuarios de slack", "buscar persona en slack"],
+      "slots": [
+        {"name": "limit", "entity_kind": "scalar.integer", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "list_users",
+          "capability_id": "slack.users.list",
+          "capability_version": "1.0.0",
+          "input_bindings": {"limit": "limit"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_user_discovery",
+      "prerequisites": ["connected_installation"],
+      "recovery": {"unavailable": "explain_user_directory_requirement"},
+      "presentation": {"kind": "user_list", "label": "Slack users"}
+    },
+    {
+      "operation_id": "slack.thread.read",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["read thread", "show thread replies", "leer hilo", "ver respuestas del hilo"],
+      "slots": [
+        {"name": "thread", "entity_kind": "slack.thread", "required": true},
+        {"name": "limit", "entity_kind": "scalar.integer", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_thread",
+          "capability_id": "slack.thread.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "thread.channel_id", "thread_ts": "thread.message_ts", "limit": "limit"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_conversation_reads",
+      "prerequisites": ["connected_installation", "thread_membership"],
+      "recovery": {"missing_slot": "clarify_thread", "unavailable": "explain_thread_access"},
+      "presentation": {"kind": "message_list", "label": "Thread replies"}
+    },
+    {
+      "operation_id": "slack.message.permalink",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["get message link", "copy slack link", "obtener enlace del mensaje", "copiar enlace de slack"],
+      "slots": [
+        {"name": "message", "entity_kind": "slack.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "get_permalink",
+          "capability_id": "slack.message.permalink",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "message.channel_id", "message_ts": "message.message_ts"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_conversation_reads",
+      "prerequisites": ["connected_installation", "message_visible_to_requester"],
+      "recovery": {"missing_slot": "clarify_message", "unavailable": "explain_message_access"},
+      "presentation": {"kind": "permalink", "label": "Slack message link"}
+    },
+    {
+      "operation_id": "slack.private_conversation.read",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["read private channel", "leer canal privado"],
+      "slots": [
+        {"name": "channel", "entity_kind": "slack.channel", "required": true},
+        {"name": "limit", "entity_kind": "scalar.integer", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_private_conversation",
+          "capability_id": "slack.private_conversation.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "channel.id", "limit": "limit"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_private_reads",
+      "prerequisites": ["connected_installation", "private_channel_membership"],
+      "recovery": {"missing_slot": "clarify_private_channel", "unavailable": "explain_private_channel_membership"},
+      "presentation": {"kind": "message_list", "label": "Private channel messages"}
+    },
+    {
+      "operation_id": "slack.private_thread.read",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["read private thread", "leer hilo privado"],
+      "slots": [
+        {"name": "thread", "entity_kind": "slack.thread", "required": true},
+        {"name": "limit", "entity_kind": "scalar.integer", "required": false}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_private_thread",
+          "capability_id": "slack.private_thread.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "thread.channel_id", "thread_ts": "thread.message_ts", "limit": "limit"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_private_reads",
+      "prerequisites": ["connected_installation", "private_channel_membership", "thread_membership"],
+      "recovery": {"missing_slot": "clarify_thread", "unavailable": "explain_private_channel_membership"},
+      "presentation": {"kind": "message_list", "label": "Private thread replies"}
+    },
+    {
+      "operation_id": "slack.message.send",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["post message", "send to channel", "publicar mensaje", "enviar al canal"],
+      "slots": [
+        {"name": "channel", "entity_kind": "slack.channel", "required": true},
+        {"name": "message", "entity_kind": "content.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "send_message",
+          "capability_id": "slack.message.send",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "channel.id", "text": "message"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_messaging",
+      "prerequisites": ["connected_installation", "channel_membership_if_private"],
+      "recovery": {"missing_slot": "clarify_channel_or_message", "unavailable": "explain_channel_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Send message"}
+    },
+    {
+      "operation_id": "slack.thread.reply",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["reply in thread", "respond to thread", "responder hilo", "contestar en hilo"],
+      "slots": [
+        {"name": "thread", "entity_kind": "slack.thread", "required": true},
+        {"name": "message", "entity_kind": "content.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "reply_thread",
+          "capability_id": "slack.thread.reply",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "thread.channel_id", "thread_ts": "thread.message_ts", "text": "message"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_messaging",
+      "prerequisites": ["connected_installation", "thread_membership"],
+      "recovery": {"missing_slot": "clarify_thread_or_message", "unavailable": "explain_thread_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Reply in thread"}
+    },
+    {
+      "operation_id": "slack.direct_message.send",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["send direct message", "message user", "enviar mensaje directo", "mandar dm", "manda por dm", "mensaje privado"],
+      "slots": [
+        {"name": "person", "entity_kind": "slack.user", "required": true},
+        {"name": "message", "entity_kind": "content.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "send_direct_message",
+          "capability_id": "slack.direct_message.send",
+          "capability_version": "1.0.0",
+          "input_bindings": {"user_id": "person.id", "text": "message"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_direct_messages",
+      "prerequisites": ["connected_installation", "direct_messaging_enabled"],
+      "recovery": {"missing_slot": "clarify_person_or_message", "unavailable": "explain_direct_message_requirement"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Send direct message"}
+    },
+    {
+      "operation_id": "slack.reaction.add",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["add reaction", "react to message", "agregar reacción", "reaccionar al mensaje", "ponle reacción", "ponle reaccion"],
+      "slots": [
+        {"name": "message", "entity_kind": "slack.message", "required": true},
+        {"name": "reaction", "entity_kind": "slack.reaction", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "add_reaction",
+          "capability_id": "slack.reaction.add",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "message.channel_id", "message_ts": "message.message_ts", "reaction": "reaction"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_reactions",
+      "prerequisites": ["connected_installation", "message_visible_to_requester"],
+      "recovery": {"missing_slot": "clarify_message_or_reaction", "unavailable": "explain_message_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Add reaction"}
+    }
+  ],
+  "method_coverage": {
+    "supported": [
+      {"method": "conversations.list", "family": "conversation_reads", "state": "runtime", "prerequisites": ["connected_installation"]},
+      {"method": "conversations.history", "family": "conversation_reads", "state": "runtime", "prerequisites": ["connected_installation", "channel_membership_if_private"]},
+      {"method": "conversations.replies", "family": "conversation_reads", "state": "runtime", "prerequisites": ["connected_installation", "thread_membership"]},
+      {"method": "users.list", "family": "user_discovery", "state": "runtime", "prerequisites": ["connected_installation"]},
+      {"method": "chat.getPermalink", "family": "conversation_reads", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
+      {"method": "chat.postMessage", "family": "messaging", "state": "runtime", "prerequisites": ["connected_installation", "target_membership"]}
+    ],
+    "conditional": [
+      {"method": "conversations.open", "family": "direct_messages", "state": "runtime", "prerequisites": ["direct_messaging_enabled"]},
+      {"method": "reactions.add", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
+      {"method": "reactions.remove", "family": "reactions", "state": "planned", "prerequisites": ["message_visible_to_requester", "exact_effect_descriptor"]},
+      {"method": "pins.add", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "pins.remove", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "bookmarks.add", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "bookmarks.edit", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "bookmarks.remove", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "conversations.create", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
+      {"method": "conversations.rename", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
+      {"method": "conversations.archive", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
+      {"method": "search.messages", "family": "search", "state": "planned", "prerequisites": ["separate_user_authority_profile", "search_product_eligibility"]},
+      {"method": "files.getUploadURLExternal", "family": "files", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "exact_effect_descriptor"]},
+      {"method": "files.completeUploadExternal", "family": "files", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "exact_effect_descriptor"]},
+      {"method": "canvases.create", "family": "canvases", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "product_availability", "exact_effect_descriptor"]},
+      {"method": "canvases.edit", "family": "canvases", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "provider_proven_canvas_access", "reinforced_approval"]},
+      {"method": "canvases.delete", "family": "canvases", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "provider_proven_canvas_access", "reinforced_approval"]},
+      {"method": "chat.update", "family": "message_mutation", "state": "dormant", "prerequisites": ["provider_proven_message_ownership", "reinforced_approval"]},
+      {"method": "chat.delete", "family": "message_mutation", "state": "dormant", "prerequisites": ["provider_proven_message_ownership", "reinforced_approval"]}
+    ],
+    "excluded": [
+      {"method": "admin.*", "family": "enterprise_administration", "state": "dormant", "prerequisites": ["enterprise_admin_authority_profile", "reinforced_approval"], "reason": "Enterprise administration is outside the bot V1 execution profile"},
+      {"method": "chat.postEphemeral", "family": "ephemeral_messaging", "state": "dormant", "prerequisites": ["separately_reviewed_visibility_semantics"], "reason": "ephemeral delivery has no durable requester-verifiable receipt"},
+      {"method": "workflows.*", "family": "workflow_administration", "state": "dormant", "prerequisites": ["separately_reviewed_workflow_authority"], "reason": "Slack workflow administration is outside the V1 product contract"}
+    ]
+  }
+}

@@ -27,10 +27,39 @@ def _matches_approved_template(template, resolved):
     return template == resolved
 
 
+def _raise_for_broker_failure(status, body, effect):
+    if status == 202:
+        raise AmbiguousStepError("provider outcome requires reconciliation")
+    if status >= 500:
+        if effect == "write" and body.get("outcome_certainty") != "safe":
+            raise AmbiguousStepError(
+                "provider write outcome requires reconciliation"
+            )
+        raise RetryableStepError(
+            "provider is temporarily unavailable", body.get("retry_after")
+        )
+    if status == 429:
+        raise RetryableStepError(
+            "provider is rate limited", body.get("retry_after")
+        )
+    category = body.get("category")
+    if category in {"scope", "membership", "permission", "validation", "provider"}:
+        raise CorrectableStepError(
+            "%s:%s" % (category, body.get("error") or "provider_rejected")
+        )
+    if status == 422:
+        raise CorrectableStepError(
+            body.get("error") or "broker rejected the request schema"
+        )
+    raise PermissionError(
+        body.get("error") or "broker rejected the live authorization"
+    )
+
+
 class WorkflowBrokerDispatcher:
     def __init__(self, actions, broker, connections, workflows,
                  agent_principal_id="agent:orchestrator", clock=None, ttl=300,
-                 rollout_version="production-v1"):
+                 rollout_version="production-v1", policy_evaluator=None):
         self.actions = actions
         self.broker = broker
         self.connections = connections
@@ -39,6 +68,7 @@ class WorkflowBrokerDispatcher:
         self.clock = clock or time.time
         self.ttl = int(ttl)
         self.rollout_version = rollout_version
+        self.policy_evaluator = policy_evaluator
 
     def __call__(self, step, claim):
         run = self.workflows.get_run(step["workflow_run_id"], step["tenant_id"])
@@ -73,6 +103,11 @@ class WorkflowBrokerDispatcher:
         if not _matches_approved_template(step.get("approved_input", step["input"]), step["input"]):
             raise PermissionError("resolved effect no longer matches the approved graph")
         task_id = "%s:%s" % (claim["workflow_revision_id"], step["step_id"])
+        approval_expires_at = now + self.ttl if step["effect"] == "write" else None
+        approval_payload_hash = (
+            canonical_payload_hash(step["input"])
+            if step["effect"] == "write" else None
+        )
         binding = {
             "user_principal_id": run["user_principal_id"],
             "agent_principal_id": self.agent_principal_id,
@@ -81,10 +116,20 @@ class WorkflowBrokerDispatcher:
             "capability_id": step["capability_id"],
             "connection_id": step["connection_id"],
             "tenant_id": step["tenant_id"],
+            "authority_profile": connection.get("authority_profile", "bot"),
+            "credential_version": connection["credential_version"],
+            "capability_version": step["capability_version"],
+            "descriptor_snapshot_hash": step["descriptor_snapshot_hash"],
+            "effect": step["effect"],
             "workflow_revision_id": claim["workflow_revision_id"],
             "step_id": step["step_id"],
             "plan_graph_hash": revision["plan_graph_hash"],
             "attempt": claim["attempt"],
+            "approval_payload_hash": approval_payload_hash,
+            "approval_expires_at": approval_expires_at,
+            "payload_hash": approval_payload_hash,
+            "slack_connect": step.get("slack_connect", False),
+            "data_egress": step.get("data_egress", False),
             "team_id": connection.get("team_id"),
             "bot_user_id": connection.get("bot_user_id"),
             "connection_snapshot": {
@@ -93,13 +138,21 @@ class WorkflowBrokerDispatcher:
                 "credential_version": connection["credential_version"],
                 "effective_scopes": connection.get("granted_scopes", []),
                 "health": "healthy", "rollout_version": self.rollout_version,
+                "authority_profile": connection.get("authority_profile", "bot"),
             },
         }
+        if self.policy_evaluator is not None:
+            decision = self.policy_evaluator.evaluate(binding, connection, now)
+            if not decision["allowed"]:
+                raise PermissionError(
+                    "dynamic policy denied: %s" % decision["reason"]
+                )
+            binding["policy_decision"] = decision
         if step["effect"] == "write":
             proposal = self.actions.create_proposal(
                 run["user_principal_id"], self.agent_principal_id,
                 connection["credential_id"], step["capability_id"], step["input"],
-                now + self.ttl,
+                approval_expires_at,
                 proposal_id="proposal:%s" % task_id,
                 idempotency_key="workflow:%s:%s" % (claim["workflow_revision_id"], step["step_id"]),
                 workflow_revision_id=claim["workflow_revision_id"], step_id=step["step_id"],
@@ -124,20 +177,8 @@ class WorkflowBrokerDispatcher:
             connection_id=step["connection_id"], attempt=claim["attempt"],
         )
         status, body = self.broker.execute(lease, binding, step["input"])
-        if status == 202:
-            raise AmbiguousStepError("provider outcome requires reconciliation")
-        if status >= 500 and step["effect"] == "write":
-            raise AmbiguousStepError("provider write outcome requires reconciliation")
-        if status >= 500:
-            raise RetryableStepError(
-                "provider is temporarily unavailable", body.get("retry_after")
-            )
-        if status == 429:
-            raise RetryableStepError(
-                "provider is rate limited", body.get("retry_after")
-            )
         if status != 200:
-            raise PermissionError(body.get("error") or "broker rejected the live authorization")
+            _raise_for_broker_failure(status, body, step["effect"])
         return {
             "receipt": body.get("receipt", {}),
             "output": body.get("receipt", {}),

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from agents.orchestrator.approval import requires_action_approval
 from libs.connectors.base import ProviderError, ProviderNetworkError
+from libs.connectors.slack import SlackAPIError, SlackRateLimitError
 from libs.integrations.catalog import (
     CapabilityUnavailable,
     ConnectionCapabilitySnapshot,
@@ -24,18 +25,82 @@ from vault.managed_oauth_crypto import ManagedOAuthError
 
 BROKER_IDENTITY = "service:credential-broker"
 
+_FORBIDDEN_RECEIPT_KEYS = frozenset({
+    "access_token", "refresh_token", "authorization", "token",
+})
+_MAX_RECEIPT_DEPTH = 8
+_MAX_RECEIPT_ITEMS = 1_000
+_MAX_RECEIPT_SERIALIZED_BYTES = 64 * 1_024
+
 
 def _safe_receipt(value):
     if is_dataclass(value):
         value = asdict(value)
     if not isinstance(value, dict):
         raise ValueError("provider result must be a filtered object or receipt")
-    forbidden = {
-        "access_token", "refresh_token", "authorization", "token",
-    }
-    if any(str(key).lower() in forbidden for key in value):
-        raise ValueError("provider result contains forbidden authority material")
+
+    item_count = [0]
+
+    def inspect(node, depth):
+        if depth > _MAX_RECEIPT_DEPTH:
+            raise ValueError("provider result exceeds receipt depth limit")
+        if isinstance(node, dict):
+            item_count[0] += len(node)
+            if item_count[0] > _MAX_RECEIPT_ITEMS:
+                raise ValueError("provider result exceeds receipt item limit")
+            for key, nested in node.items():
+                if str(key).casefold() in _FORBIDDEN_RECEIPT_KEYS:
+                    raise ValueError(
+                        "provider result contains forbidden authority material"
+                    )
+                inspect(nested, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            item_count[0] += len(node)
+            if item_count[0] > _MAX_RECEIPT_ITEMS:
+                raise ValueError("provider result exceeds receipt item limit")
+            for nested in node:
+                inspect(nested, depth + 1)
+
+    inspect(value, 0)
+    try:
+        serialized = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("provider result must be JSON-safe") from exc
+    if len(serialized) > _MAX_RECEIPT_SERIALIZED_BYTES:
+        raise ValueError("provider result exceeds receipt size limit")
     return value
+
+
+def _safe_provider_error(exc):
+    body = {"error": "provider operation failed safely", "outcome_certainty": "safe"}
+    if isinstance(exc, SlackRateLimitError):
+        body["error"] = "rate_limited"
+        body["category"] = "rate_limit"
+        body["retry_after"] = int(exc.retry_after)
+        return 429, body
+    if isinstance(exc, SlackAPIError):
+        body["error"] = exc.code
+        body["category"] = exc.category
+        statuses = {
+            "auth": 403,
+            "scope": 403,
+            "permission": 403,
+            "membership": 403,
+            "validation": 422,
+            "provider": 409,
+            "transient": 503,
+        }
+        return statuses.get(exc.category, 409), body
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is not None:
+        body["retry_after"] = int(retry_after)
+    if isinstance(exc, PermissionError):
+        return 403, body
+    if isinstance(exc, ProviderNetworkError):
+        return 503, body
+    return 502, body
 
 
 class ActionBroker(object):
@@ -57,6 +122,8 @@ class ActionBroker(object):
         rollout_version="production-v1",
         credential_rotators=None,
         dispatch_policy=None,
+        policy_evaluator=None,
+        connection_resolver=None,
     ):
         self.actions = action_repository
         self.sessions = session_repository
@@ -74,6 +141,8 @@ class ActionBroker(object):
         self.rollout_version = rollout_version
         self.credential_rotators = credential_rotators or {}
         self.dispatch_policy = dispatch_policy or (lambda _binding: True)
+        self.policy_evaluator = policy_evaluator
+        self.connection_resolver = connection_resolver
 
     def decide(self, session_id, csrf_token, proposal_id, body):
         current = self.sessions.resolve(session_id, self.clock(), touch=True)
@@ -136,6 +205,7 @@ class ActionBroker(object):
             return 403, {
                 "error": "credential is not active for this user and capability"
             }
+        dynamic = binding.get("workflow_revision_id") not in (None, "legacy")
         if self.credential_connector is None and self.runtime_registry is None:
             return 503, {"error": "credential refresh is not configured"}
         proposal = None
@@ -165,6 +235,25 @@ class ActionBroker(object):
                 return 202, {"status": existing["status"]}
             if canonical_hash(payload) != existing["payload_hash"]:
                 return 403, {"error": "payload does not match approved proposal"}
+        if dynamic:
+            if self.policy_evaluator is None or self.connection_resolver is None:
+                return 403, {
+                    "error": "dynamic policy decision is stale or denied"
+                }
+            live_connection = self.connection_resolver(
+                binding.get("connection_id"), binding.get("tenant_id")
+            )
+            current_decision = self.policy_evaluator.evaluate(
+                binding, live_connection, self.clock()
+            )
+            if (
+                not current_decision["allowed"]
+                or binding.get("policy_decision") != current_decision
+            ):
+                return 403, {
+                    "error": "dynamic policy decision is stale or denied"
+                }
+        if side_effecting:
             proposal = self.actions.consume_approval(binding, self.clock())
             if proposal is None:
                 return 403, {"error": "exact action approval is required"}
@@ -174,11 +263,7 @@ class ActionBroker(object):
                     proposal["proposal_id"], proposal["version"]
                 )
             return 403, {"error": "capability lease was already consumed"}
-        if proposal is not None:
-            self.actions.mark_dispatched(
-                proposal["proposal_id"], proposal["version"], self.clock()
-            )
-
+        provider_dispatch_started = False
         try:
             connector = (
                 runtime_binding.connector
@@ -203,6 +288,7 @@ class ActionBroker(object):
                 )
 
             def provider_operation(refresh_token):
+                nonlocal provider_dispatch_started
                 if provider == "slack":
                     try:
                         document = json.loads(refresh_token.decode("utf-8"))
@@ -237,6 +323,13 @@ class ActionBroker(object):
                     "bot_user_id": binding.get("bot_user_id"),
                 }
                 if side_effecting:
+                    if proposal is None or not self.actions.mark_dispatched(
+                        proposal["proposal_id"], proposal["version"], self.clock()
+                    ):
+                        raise PermissionError(
+                            "provider dispatch claim is no longer valid"
+                        )
+                    provider_dispatch_started = True
                     value = executor.execute(capability_id, payload, context)
                 else:
                     value = executor.read(capability_id, payload, context)
@@ -255,7 +348,11 @@ class ActionBroker(object):
             UnicodeDecodeError,
             ValueError,
         ) as exc:
-            outcome_unknown = bool(side_effecting and isinstance(exc, ProviderError))
+            outcome_unknown = bool(
+                side_effecting
+                and provider_dispatch_started
+                and isinstance(exc, ProviderNetworkError)
+            )
             if proposal is not None:
                 self.actions.fail_execution(
                     proposal["proposal_id"],
@@ -266,11 +363,7 @@ class ActionBroker(object):
                 )
             if outcome_unknown:
                 return 202, {"status": "execution_unknown"}
-            body = {"error": "provider operation failed safely"}
-            retry_after = getattr(exc, "retry_after", None)
-            if retry_after is not None:
-                body["retry_after"] = int(retry_after)
-            return 502, body
+            return _safe_provider_error(exc)
 
         if side_effecting and proposal is not None and self.attestor is not None:
             response = self._evidence_response(binding, payload, receipt)
@@ -383,7 +476,6 @@ def oauth_connection_authorizer(repository, provider="google"):
             return bool(
                 connection
                 and connection.get("status") == "connected"
-                and connection.get("principal_id") == binding.get("user_principal_id")
                 and connection.get("credential_id") == binding.get("credential_id")
                 and binding.get("capability_id") in connection.get("enabled_capabilities", ())
             )

@@ -38,6 +38,7 @@ from agents.orchestrator.tools import OrchestratorTools
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
+from agents.orchestrator.slack_conversation import normalize_name
 from libs.integrations.catalog import google_definitions, slack_definitions
 from services.oauth.repository import OAuthRepository
 from services.session.app import session_cookie_value
@@ -343,6 +344,7 @@ def _make_handler(agent, label, runner_url, registry_url=None,
             # Conversation memory: the client sends prior turns so the brain can
             # accumulate details across messages instead of restarting each time.
             history = payload.get("history")
+            turns = []
             if isinstance(history, list) and history:
                 turns = [
                     {
@@ -371,25 +373,28 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                     session_cookie_value(self.headers.get("Cookie")), clock()
                 )
             requested_conversation_id = payload.get("conversationId") or payload.get("conversation_id")
+            slack_message = _slack_turn_text(
+                message, turns, requested_conversation_id
+            )
             if requested_conversation_id and not _valid_conversation_id(requested_conversation_id):
                 return self._send(400, {"error": "invalid conversation ID"})
-            if _is_slack_turn(message, requested_conversation_id) and current is None:
+            if _is_slack_turn(slack_message, requested_conversation_id) and current is None:
                 return self._send(401, {"error": "authentication required"})
             if current and dynamic_workflow_service and tenant_resolver:
                 tenant_id = tenant_resolver(current["principal_id"])
-                if _is_slack_turn(message, requested_conversation_id) and not tenant_id:
+                if _is_slack_turn(slack_message, requested_conversation_id) and not tenant_id:
                     return self._send(409, {"error": "tenant membership is required"})
                 if tenant_id:
                     conversation_id = requested_conversation_id
-                    if _is_slack_turn(message, conversation_id):
+                    if _is_slack_turn(slack_message, conversation_id):
                         try:
                             turn = dynamic_workflow_service.coordinate_slack_turn(
-                                tenant_id, current["principal_id"], message,
+                                tenant_id, current["principal_id"], slack_message,
                                 conversation_id=conversation_id,
                             )
                             turn = dynamic_workflow_service.advance_slack_turn(
                                 turn.get("conversation_id") or conversation_id,
-                                tenant_id, current["principal_id"], message, turn,
+                                tenant_id, current["principal_id"], slack_message, turn,
                             )
                             return self._send(200, _turn_response(turn))
                         except (KeyError, TimeoutError):
@@ -466,13 +471,27 @@ def _conversation_id_from_path(path, operation=None):
 
 
 def _is_slack_turn(message, conversation_id=None):
-    text = str(message or "").lower()
+    text = normalize_name(message)
     return bool(conversation_id or "slack" in text or "#" in text or any(
         marker in text for marker in (
             "manda un mensaje", "mándale", "mandale", "qué dijo", "que dijo",
+            "envia un mensaje", "enviar un mensaje", "canal ", "channel ",
             "reply there", "send a direct message", "post in ",
         )
     ))
+
+
+def _slack_turn_text(message, history=None, conversation_id=None):
+    """Recover one typed Slack intake from user-authored conversational context."""
+    if conversation_id:
+        return str(message or "")
+    user_turns = [
+        item.get("text", "") for item in (history or [])
+        if isinstance(item, dict) and item.get("role") == "user"
+        and isinstance(item.get("text"), str)
+    ][-6:]
+    combined = " ".join(user_turns + [str(message or "")]).strip()
+    return combined if _is_slack_turn(combined) else str(message or "")
 
 
 def _valid_conversation_id(value):
@@ -508,6 +527,19 @@ def _turn_response(turn):
 
 
 def _conversation_response(conversation):
+    if (conversation.get("status") == "resolving"
+            and not conversation.get("resolution_request")
+            and not conversation.get("workflow_revision_id")):
+        locale = conversation.get("locale", "es")
+        return {
+            "state": "needs_input",
+            "conversationId": conversation["conversation_id"],
+            "need": {
+                "kind": "missing", "field": "operation", "options": [],
+                "question": ("¿Qué quieres hacer en Slack?" if locale == "es"
+                             else "What would you like to do in Slack?"),
+            },
+        }
     result = {
         "state": conversation["status"],
         "conversationId": conversation["conversation_id"],
@@ -556,7 +588,9 @@ def _tenant_resolver():
         mapping = {}
     if not isinstance(mapping, dict):
         mapping = {}
-    return lambda principal_id: mapping.get(principal_id)
+    local_tenant = os.environ.get("TESSERA_LOCAL_TENANT_ID")
+    local_tenant = local_tenant if isinstance(local_tenant, str) and local_tenant else None
+    return lambda principal_id: mapping.get(principal_id) or local_tenant
 
 
 def main(argv=None):

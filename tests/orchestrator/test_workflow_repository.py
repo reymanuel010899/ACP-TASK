@@ -30,6 +30,116 @@ def _create(repository):
     return run, revision
 
 
+def test_outbox_append_is_deduplicated_and_ordered_per_aggregate(tmp_path):
+    repository = _repository(tmp_path)
+
+    first = repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {"status": "complete"}, "revision:1:complete", 10,
+    )
+    duplicate = repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {"status": "complete"}, "revision:1:complete", 11,
+    )
+    second = repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {"status": "retry_wait"}, "revision:2:retry", 12,
+    )
+
+    assert duplicate == first
+    assert first["aggregate_version"] == 1
+    assert second["aggregate_version"] == 2
+    first_claim = repository.claim_outbox_event("worker:a", 12, 5)
+    assert first_claim["event_id"] == first["event_id"]
+    assert repository.claim_outbox_event("worker:b", 12, 5) is None
+    assert repository.complete_outbox_event(
+        first_claim["event_id"], "org:acme", "worker:a", 13
+    )
+    assert repository.claim_outbox_event("worker:b", 13, 5)["event_id"] == second["event_id"]
+
+
+def test_outbox_claim_has_one_winner_and_expired_claim_recovers(tmp_path):
+    repository = _repository(tmp_path)
+    repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {"status": "complete"}, "event:1", 10,
+    )
+    claims = []
+
+    def claim(worker):
+        claims.append(repository.claim_outbox_event(worker, 11, 5))
+
+    threads = [threading.Thread(target=claim, args=("worker:a",)),
+               threading.Thread(target=claim, args=("worker:b",))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    winners = [claim for claim in claims if claim]
+    assert len(winners) == 1
+    recovered = repository.claim_outbox_event("worker:c", 17, 5)
+    assert recovered["event_id"] == winners[0]["event_id"]
+    assert recovered["attempts"] == 2
+
+
+def test_outbox_failure_retries_then_dead_letters_poison_event(tmp_path):
+    repository = _repository(tmp_path)
+    event = repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {"status": "complete"}, "poison", 10,
+        max_attempts=2,
+    )
+    first = repository.claim_outbox_event("worker:a", 10, 5)
+    assert repository.fail_outbox_event(
+        event["event_id"], "org:acme", "worker:a", 10, "boom", 3
+    ) == "retry"
+    assert repository.claim_outbox_event("worker:b", 12, 5) is None
+    second = repository.claim_outbox_event("worker:b", 13, 5)
+    assert second["attempts"] == 2
+    assert repository.fail_outbox_event(
+        event["event_id"], "org:acme", "worker:b", 13, "boom again", 3
+    ) == "dead_letter"
+    assert repository.claim_outbox_event("worker:c", 20, 5) is None
+
+
+def test_projection_watermark_rejects_stale_versions(tmp_path):
+    repository = _repository(tmp_path)
+
+    assert repository.advance_projection_watermark(
+        "org:acme", "conversation", "conversation:1", 2, "event:2", 10
+    )
+    assert not repository.advance_projection_watermark(
+        "org:acme", "conversation", "conversation:1", 1, "event:1", 11
+    )
+    assert not repository.advance_projection_watermark(
+        "org:acme", "conversation", "conversation:1", 2, "event:2", 12
+    )
+    assert repository.get_projection_watermark(
+        "org:acme", "conversation", "conversation:1"
+    )["projected_version"] == 2
+
+
+def test_completed_outbox_retention_purge_is_tenant_scoped(tmp_path):
+    repository = _repository(tmp_path)
+    acme = repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:1",
+        "workflow.outcome", {}, "acme", 1,
+    )
+    other = repository.append_outbox_event(
+        "org:other", "conversation", "conversation:1",
+        "workflow.outcome", {}, "other", 1,
+    )
+    for tenant, event in (("org:acme", acme), ("org:other", other)):
+        claim = repository.claim_outbox_event("worker", 2, 5, tenant_id=tenant)
+        assert repository.complete_outbox_event(
+            claim["event_id"], tenant, "worker", 3
+        )
+
+    assert repository.purge_completed_outbox("org:acme", 4) == 1
+    assert repository.get_outbox_event(other["event_id"], "org:other") is not None
+
+
 def test_revision_and_step_bindings_are_immutable(tmp_path):
     repository = _repository(tmp_path)
     run, revision = _create(repository)
@@ -88,6 +198,91 @@ def test_replan_does_not_reuse_prior_revision_approval(tmp_path):
     assert not repository.is_revision_approved(
         run["workflow_run_id"], second["workflow_revision_id"],
         "org:acme", "graph-hash-v2"
+    )
+
+
+def test_superseded_revision_is_not_authorized_after_a_running_step_was_claimed(
+    tmp_path,
+):
+    repository = _repository(tmp_path)
+    run, first = _create(repository)
+    repository.record_approval(
+        run["workflow_run_id"], first["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "user:alice", 12,
+    )
+    claim = repository.claim_ready_step(
+        run["workflow_run_id"], first["workflow_revision_id"],
+        "org:acme", "worker-a", 13, 60,
+    )
+    assert claim is not None
+
+    second = repository.create_revision(
+        run["workflow_run_id"], "org:acme", "graph-hash-v2", [{
+            "step_id": "step-1",
+            "capability_id": "slack.message.send",
+            "capability_version": "1.0.0",
+            "connection_id": "conn:1",
+            "descriptor_snapshot_hash": "descriptor-2",
+            "input_hash": "input-2",
+            "depends_on": [],
+            "effect": "write",
+        }], 14,
+    )
+
+    assert repository.get_run(
+        run["workflow_run_id"], "org:acme"
+    )["current_revision_id"] == second["workflow_revision_id"]
+    assert repository.get_revision(
+        run["workflow_run_id"], first["workflow_revision_id"], "org:acme"
+    )["status"] == "superseded"
+    assert not repository.is_step_authorized(
+        run["workflow_run_id"], first["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "write", 15,
+    )
+
+
+def test_completed_current_revision_passes_the_executor_authorization_gate(
+    tmp_path,
+):
+    repository = _repository(tmp_path)
+    run, revision = _create(repository)
+    repository.record_approval(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "user:alice", 12,
+    )
+    claim = repository.claim_ready_step(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "worker-a", 13, 60,
+    )
+    repository.persist_completion(
+        revision["workflow_revision_id"], "step-1", "org:acme",
+        claim["attempt"], {"provider_id": "123.45"},
+        {"attestation_id": "attestation:1"}, 14,
+    )
+
+    assert repository.get_revision(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme"
+    )["status"] == "completed"
+    assert repository.is_step_authorized(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "write", 15,
+    )
+
+
+def test_cancelled_current_revision_is_not_authorized(tmp_path):
+    repository = _repository(tmp_path)
+    run, revision = _create(repository)
+    repository.record_approval(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "user:alice", 12,
+    )
+    assert repository.cancel_revision(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme"
+    )
+
+    assert not repository.is_step_authorized(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "graph-hash-v1", "write", 13,
     )
 
 

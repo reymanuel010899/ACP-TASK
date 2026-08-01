@@ -26,8 +26,14 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import requests
 
-from pydantic import BaseModel, Field
-from agents.orchestrator.workflow_models import WorkflowPlanDraft
+from pydantic import BaseModel, Field, ValidationError
+from agents.orchestrator.workflow_models import (
+    SlackInterpretation,
+    SlackInterpretationBlocker,
+    SlackInterpretationSlot,
+    SlackOperationCandidate,
+    WorkflowPlanDraft,
+)
 from agents.orchestrator.slack_conversation import interpret_slack_turn
 
 #: Exact Claude model ID used by :class:`ClaudeBrain`. No date suffix.
@@ -132,6 +138,59 @@ _PLAN_SYSTEM = (
     "of guessing. The compiler will independently reject invalid authority."
 )
 
+_SLACK_UNDERSTAND_SYSTEM = (
+    "Interpret the user's Slack request using only the supplied visible "
+    "operation projection. Operations are language candidates, not executable "
+    "capabilities. You may propose several ordered operations and dependencies. "
+    "Choose an operation only when it can satisfy the requested outcome exactly; "
+    "never approximate an unavailable search, mutation, artifact, administration, "
+    "or other absent operation by combining visible discovery or read operations. "
+    "When no visible operation exactly matches, return no operations and one "
+    "blocker with kind=unsupported_operation, field=operation, and a concise "
+    "question or limitation in the user's language. "
+    "For every proposed operation, inspect its declared slots and emit every "
+    "human reference or literal that the user stated explicitly, including a "
+    "descriptive message/thread reference even when it still needs provider "
+    "grounding. Do not omit an explicit slot merely because it is unresolved. "
+    "Preserve explicit time expressions such as today, yesterday, this week, "
+    "or their Spanish equivalents as period slot values. "
+    "Use corrections when the latest turn replaces an earlier value, and carry "
+    "forward an unchanged value from supplied conversation context with "
+    "provenance=conversation. "
+    "A correction fragment may omit the operation verb; recover the pending "
+    "operation and unchanged slots from supplied conversation context. "
+    "When there is more than one operation, set operation_index on every slot "
+    "and correction so repeated names such as channel remain attached to the "
+    "right ordered operation. "
+    "Use only human references in slots. Never emit provider IDs, Slack IDs, "
+    "connection or credential IDs, scopes, approvals, tokens, capability IDs, "
+    "recipes, or claims of authority. Ask at most one precise clarification. "
+    "Return only the requested JSON object."
+)
+
+_SLACK_JSON_HINT = (
+    "\nKeys: operations (array of {operation_id, confidence}), slots (array "
+    "of {name, value, provenance: current_turn|conversation|default, "
+    "operation_index: optional zero-based integer}), corrections (array of "
+    "{slot, replacement, provenance: current_turn|conversation, "
+    "operation_index: optional zero-based integer}), dependencies (array of {operation_index, "
+    "depends_on_index}), blockers (array of {kind, field, question}), locale "
+    "(es|en|mixed), confidence (0..1). No extra keys."
+)
+
+_RULE_SLACK_OPERATION_IDS = {
+    "status": "slack.connection.status",
+    "list_channels": "slack.channels.list",
+    "list_private_channels": "slack.private_channels.list",
+    "read": "slack.conversation.read",
+    "summarize": "slack.conversation.summarize",
+    "post": "slack.message.send",
+    "reply": "slack.thread.reply",
+    "dm": "slack.direct_message.send",
+}
+
+_SLACK_MIN_CONFIDENCE = 0.65
+
 
 def message_text(message):
     # type: (object) -> str
@@ -186,6 +245,12 @@ class Brain(Protocol):
 
     def converse(self, nl_request: str, context: Optional[dict]) -> str:
         """Respond naturally to a non-operational conversational turn."""
+        ...
+
+    def understand_slack(
+        self, nl_request: str, context: Optional[dict]
+    ) -> SlackInterpretation:
+        """Propose authority-free Slack operations and human slot values."""
         ...
 
 
@@ -300,6 +365,317 @@ def _offline_conversation_reply(nl_request, context):
     return "Te escucho. ¿Qué quieres resolver?"
 
 
+def _slack_locale(nl_request):
+    locale = interpret_slack_turn(nl_request).locale
+    return locale if locale in ("es", "en") else "mixed"
+
+
+def _slack_clarification(nl_request, reason="interpretation"):
+    locale = _slack_locale(nl_request)
+    question = (
+        "¿Qué quieres hacer en Slack y sobre qué canal, persona o mensaje?"
+        if locale == "es"
+        else "What should I do in Slack, and which channel, person, or message?"
+    )
+    return SlackInterpretation(
+        blockers=[SlackInterpretationBlocker(
+            kind="clarification", field=reason, question=question,
+        )],
+        locale=locale,
+        confidence=0.0,
+    )
+
+
+def _visible_slack_projection(context):
+    raw_projection = (context or {}).get("slack_operation_projection") or ()
+    visible = []
+    for item in raw_projection:
+        if not isinstance(item, dict):
+            continue
+        operation_id = item.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id.startswith("slack."):
+            continue
+        slots = []
+        for slot in item.get("slots") or ():
+            if not isinstance(slot, dict):
+                continue
+            if not isinstance(slot.get("name"), str):
+                continue
+            slots.append({
+                "name": slot["name"],
+                "entity_kind": str(slot.get("entity_kind") or ""),
+                "required": slot.get("required") is True,
+            })
+        visible.append({
+            "operation_id": operation_id,
+            "operation_kind": str(item.get("operation_kind") or ""),
+            "availability": str(item.get("availability") or ""),
+            "aliases": [
+                str(alias) for alias in (item.get("aliases") or ())
+                if isinstance(alias, str)
+            ],
+            "slots": slots,
+        })
+    return visible
+
+
+def _slack_conversation_text(context):
+    turns = []
+    for turn in (context or {}).get("conversation") or ():
+        if not isinstance(turn, dict):
+            continue
+        role, text = turn.get("role"), turn.get("text")
+        if role in ("user", "concierge") and isinstance(text, str):
+            turns.append({"role": role, "text": text[:2_000]})
+    return turns[-10:]
+
+
+def _slack_contract_examples(projection):
+    """Small schema examples; filtered so they never advertise hidden operations."""
+    visible = {item["operation_id"] for item in projection}
+    examples = []
+    if {"slack.thread.reply"}.issubset(visible):
+        examples.append({
+            "input": "Reply there: approved",
+            "conversation": "A visible launch thread is already selected.",
+            "output": {
+                "operations": [{
+                    "operation_id": "slack.thread.reply", "confidence": 0.96,
+                }],
+                "slots": [
+                    {
+                        "name": "thread", "value": "selected launch thread",
+                        "provenance": "conversation", "operation_index": 0,
+                    },
+                    {
+                        "name": "message", "value": "approved",
+                        "provenance": "current_turn", "operation_index": 0,
+                    },
+                ],
+                "corrections": [], "dependencies": [], "blockers": [],
+                "locale": "en", "confidence": 0.94,
+            },
+        })
+    if {
+        "slack.conversation.summarize", "slack.message.send",
+    }.issubset(visible):
+        examples.append({
+            "input": "Resume #ventas de ayer y publica en #lideres: Resumen listo",
+            "conversation": "",
+            "output": {
+                "operations": [
+                    {
+                        "operation_id": "slack.conversation.summarize",
+                        "confidence": 0.96,
+                    },
+                    {
+                        "operation_id": "slack.message.send", "confidence": 0.96,
+                    },
+                ],
+                "slots": [
+                    {
+                        "name": "channel", "value": "ventas",
+                        "provenance": "current_turn", "operation_index": 0,
+                    },
+                    {
+                        "name": "period", "value": "ayer",
+                        "provenance": "current_turn", "operation_index": 0,
+                    },
+                    {
+                        "name": "channel", "value": "lideres",
+                        "provenance": "current_turn", "operation_index": 1,
+                    },
+                    {
+                        "name": "message", "value": "Resumen listo",
+                        "provenance": "current_turn", "operation_index": 1,
+                    },
+                ],
+                "corrections": [],
+                "dependencies": [{"operation_index": 1, "depends_on_index": 0}],
+                "blockers": [], "locale": "es", "confidence": 0.94,
+            },
+        })
+    if {"slack.direct_message.send"}.issubset(visible):
+        examples.append({
+            "input": "Manda por DM: quedó aprobado",
+            "conversation": "No Slack person is selected.",
+            "output": {
+                "operations": [{
+                    "operation_id": "slack.direct_message.send",
+                    "confidence": 0.96,
+                }],
+                "slots": [{
+                    "name": "message", "value": "quedó aprobado",
+                    "provenance": "current_turn", "operation_index": 0,
+                }],
+                "corrections": [], "dependencies": [],
+                "blockers": [{
+                    "kind": "missing_slot", "field": "person",
+                    "question": "¿A qué persona de Slack?",
+                }],
+                "locale": "es", "confidence": 0.9,
+            },
+        })
+    if {"slack.message.send"}.issubset(visible):
+        examples.append({
+            "input": "No, mejor #anuncios",
+            "conversation": (
+                "A pending Slack post says Hola equipo and currently targets #general."
+            ),
+            "output": {
+                "operations": [{
+                    "operation_id": "slack.message.send", "confidence": 0.96,
+                }],
+                "slots": [{
+                    "name": "message", "value": "Hola equipo",
+                    "provenance": "conversation", "operation_index": 0,
+                }],
+                "corrections": [{
+                    "slot": "channel", "replacement": "anuncios",
+                    "provenance": "current_turn", "operation_index": 0,
+                }],
+                "dependencies": [], "blockers": [],
+                "locale": "es", "confidence": 0.94,
+            },
+        })
+    if {"slack.reaction.add"}.issubset(visible):
+        examples.append({
+            "input": "Ponle ojos a ese mensaje",
+            "conversation": "A visible maintenance message is selected.",
+            "output": {
+                "operations": [{
+                    "operation_id": "slack.reaction.add", "confidence": 0.96,
+                }],
+                "slots": [
+                    {
+                        "name": "message", "value": "selected maintenance message",
+                        "provenance": "conversation", "operation_index": 0,
+                    },
+                    {
+                        "name": "reaction", "value": "eyes",
+                        "provenance": "current_turn", "operation_index": 0,
+                    },
+                ],
+                "corrections": [], "dependencies": [], "blockers": [],
+                "locale": "es", "confidence": 0.94,
+            },
+        })
+    examples.append({
+        "input": "Search every Slack message about renewals",
+        "conversation": "",
+        "output": {
+            "operations": [], "slots": [], "corrections": [],
+            "dependencies": [],
+            "blockers": [{
+                "kind": "unsupported_operation", "field": "operation",
+                "question": "Workspace-wide search is not available.",
+            }],
+            "locale": "en", "confidence": 0.95,
+        },
+    })
+    return examples
+
+
+def _ground_slack_interpretation(value, projection, nl_request):
+    visible = {item["operation_id"]: item for item in projection}
+    if not visible:
+        return _slack_clarification(nl_request, "operation_availability")
+    if not value.operations:
+        if value.blockers:
+            value.blockers = value.blockers[:1]
+            return value
+        return _slack_clarification(nl_request, "operation")
+    if any(item.confidence < _SLACK_MIN_CONFIDENCE for item in value.operations):
+        return _slack_clarification(nl_request, "operation")
+    if any(item.operation_id not in visible for item in value.operations):
+        return _slack_clarification(nl_request, "operation")
+    allowed_by_operation = [
+        {slot["name"] for slot in visible[candidate.operation_id]["slots"]}
+        for candidate in value.operations
+    ]
+    allowed_slots = set().union(*allowed_by_operation)
+    if any(
+        slot.name not in (
+            allowed_by_operation[slot.operation_index]
+            if slot.operation_index is not None else allowed_slots
+        )
+        for slot in value.slots
+    ) or any(
+        correction.slot not in (
+            allowed_by_operation[correction.operation_index]
+            if correction.operation_index is not None else allowed_slots
+        )
+        for correction in value.corrections
+    ):
+        return _slack_clarification(nl_request, "slot")
+    if len(value.blockers) > 1:
+        value.blockers = value.blockers[:1]
+    if not value.blockers:
+        missing = next((
+            (operation_index, slot["name"])
+            for operation_index, candidate in enumerate(value.operations)
+            for slot in visible[candidate.operation_id]["slots"]
+            if slot["required"] and not any(
+                candidate_slot.name == slot["name"]
+                and candidate_slot.operation_index in (None, operation_index)
+                for candidate_slot in value.slots
+            )
+        ), None)
+        if missing:
+            _operation_index, missing_name = missing
+            question = (
+                "¿Qué %s debo usar?" % missing_name
+                if value.locale == "es"
+                else "Which %s should I use?" % missing_name
+            )
+            value.blockers = [SlackInterpretationBlocker(
+                kind="missing_slot", field=missing_name, question=question,
+            )]
+        elif value.confidence < _SLACK_MIN_CONFIDENCE:
+            value.blockers = [SlackInterpretationBlocker(
+                kind="clarification", field="details",
+                question=(
+                    "¿Qué detalle debo confirmar antes de continuar?"
+                    if value.locale == "es"
+                    else "Which detail should I confirm before continuing?"
+                ),
+            )]
+    return value
+
+
+def _rule_slack_interpretation(nl_request, context=None):
+    projection = _visible_slack_projection(context)
+    visible = {item["operation_id"]: item for item in projection}
+    parsed = interpret_slack_turn(
+        nl_request, (context or {}).get("active_conversation")
+    )
+    operation_id = _RULE_SLACK_OPERATION_IDS.get(parsed.operation)
+    if operation_id not in visible:
+        return _slack_clarification(nl_request, "operation")
+    allowed_slots = {slot["name"] for slot in visible[operation_id]["slots"]}
+    slots = []
+    for name, value, provenance in (
+        ("channel", parsed.channel_name, "current_turn"),
+        ("person", parsed.person_name, "current_turn"),
+        ("message", parsed.message_text, "current_turn"),
+        ("period", "last_%s_days" % parsed.period_days if parsed.period_days else None,
+         "default"),
+    ):
+        if name in allowed_slots and value is not None:
+            slots.append(SlackInterpretationSlot(
+                name=name, value=value, provenance=provenance,
+            ))
+    result = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id=operation_id, confidence=0.9,
+        )],
+        slots=slots,
+        locale=parsed.locale,
+        confidence=0.9,
+    )
+    return _ground_slack_interpretation(result, projection, nl_request)
+
+
 # -- Claude-backed brain ---------------------------------------------------
 
 
@@ -387,11 +763,7 @@ class ClaudeBrain:
         return response.parsed_output.model_dump()
 
     def understand_slack(self, nl_request, context=None):
-        # Entity IDs are intentionally absent from this contract. A provider
-        # projection is resolved later by deterministic application code.
-        return interpret_slack_turn(
-            nl_request, (context or {}).get("active_conversation")
-        )
+        return _rule_slack_interpretation(nl_request, context)
 
     def run_tool_loop(self, prompt, tools, system, max_iterations):
         # type: (str, list, str, int) -> tuple
@@ -690,9 +1062,7 @@ class RuleBrain:
         return _ground_intent(intent, context)
 
     def understand_slack(self, nl_request, context=None):
-        return interpret_slack_turn(
-            nl_request, (context or {}).get("active_conversation")
-        )
+        return _rule_slack_interpretation(nl_request, context)
 
     def compose_reply(self, state: dict) -> str:
         state = state or {}
@@ -802,6 +1172,30 @@ class GroqBrain:
             user_message=str(data.get("user_message") or ""),
         )
         return _ground_intent(intent, context)
+
+    def understand_slack(self, nl_request, context=None):
+        projection = _visible_slack_projection(context)
+        payload = json.dumps({
+            "latest_user_message": nl_request or "",
+            "conversation": _slack_conversation_text(context),
+            "slack_operation_projection": projection,
+            "contract_examples": _slack_contract_examples(projection),
+        }, ensure_ascii=False, sort_keys=True)
+        try:
+            raw = self._chat(
+                _SLACK_UNDERSTAND_SYSTEM + _SLACK_JSON_HINT,
+                payload,
+                json_mode=True,
+            )
+        except (requests.RequestException, ValueError, KeyError):
+            return _rule_slack_interpretation(nl_request, context)
+        try:
+            interpretation = SlackInterpretation.model_validate_json(raw)
+        except (ValidationError, ValueError, TypeError):
+            return _slack_clarification(nl_request, "interpretation")
+        return _ground_slack_interpretation(
+            interpretation, projection, nl_request
+        )
 
     def compose_reply(self, state: dict) -> str:
         user = "Estado de la orquestación:\n" + json.dumps(state or {}, ensure_ascii=False, sort_keys=True)

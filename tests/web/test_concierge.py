@@ -1,6 +1,66 @@
 from web.concierge import (
-    _classified_recovery, _conversation_response, _turn_response,
+    _classified_recovery, _conversation_response, _is_slack_turn,
+    _slack_turn_text, _tenant_resolver, _turn_response,
 )
+
+
+def test_explicit_local_tenant_fallback_survives_principal_rotation(monkeypatch):
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+
+    assert _tenant_resolver()("new-principal") == "org:local"
+
+
+def test_natural_channel_message_is_routed_to_typed_slack_conversation():
+    assert _is_slack_turn("envía un mensaje al canal tessera-test")
+    assert _is_slack_turn("quiero publicar en el canal general")
+
+
+def test_slack_followup_recovers_channel_and_message_from_user_history():
+    history = [
+        {"role": "user", "text": "quiero enviar algo por Slack"},
+        {"role": "concierge", "text": "¿En qué canal?"},
+        {"role": "user", "text": "en el canal tessera-test"},
+        {"role": "concierge", "text": "¿Cuál mensaje?"},
+        {"role": "user", "text": "que diga estoy aquí, ¿quién es?"},
+    ]
+
+    recovered = _slack_turn_text("sí, mándalo", history, None)
+
+    assert _is_slack_turn(recovered)
+    assert "canal tessera-test" in recovered
+    assert "que diga estoy aquí" in recovered
+
+
+def test_slack_history_preserves_exact_quoted_message_through_confirmation():
+    from agents.orchestrator.slack_conversation import interpret_slack_turn
+
+    history = [
+        {"role": "user", "text": "quiero enviar un mensaje por Slack"},
+        {"role": "user", "text": "en el canal tessera-test"},
+        {"role": "user", "text": 'mándame el mensaje que diga "estoy aquí, ¿quién es?"'},
+    ]
+
+    recovered = _slack_turn_text("sí, mándalo", history, None)
+    turn = interpret_slack_turn(recovered)
+
+    assert turn.operation == "post"
+    assert turn.channel_name == "tessera-test"
+    assert turn.message_text == "estoy aquí, ¿quién es?"
+
+
+def test_orphan_resolving_conversation_becomes_actionable_need():
+    from web.concierge import _conversation_response
+
+    response = _conversation_response({
+        "conversation_id": "conversation:orphan",
+        "status": "resolving",
+        "workflow_run_id": None,
+        "workflow_revision_id": None,
+    })
+
+    assert response["state"] == "needs_input"
+    assert response["need"]["field"] == "operation"
 
 
 def test_needs_input_contract_has_one_question_and_opaque_conversation_id():

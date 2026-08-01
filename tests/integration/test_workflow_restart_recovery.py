@@ -1,6 +1,7 @@
 from agents.orchestrator.workflow_executor import WorkflowExecutor
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from agents.orchestrator.conversation_state import ConciergeConversationStore
+from services.workflow_worker.app import WorkflowWorker
 
 
 def test_restart_continues_after_completed_step_without_repeating_it(tmp_path):
@@ -79,3 +80,51 @@ def test_worker_terminal_projection_updates_the_durable_conversation(tmp_path):
     assert completed["status"] == "succeeded"
     assert completed.get("pending_draft") is None
     assert completed["presentation"]["answer"] == "Mensaje enviado"
+
+
+def test_worker_restart_enqueues_completed_linked_revision_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("services.workflow_worker.app.time.time", lambda: 12)
+    database = str(tmp_path / "workflow.sqlite3")
+    repository = WorkflowRepository(database)
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    conversation = store.create("org:acme", "user:alice", "conversation:outbox")
+    run = repository.create_run("org:acme", "user:alice", "goal", 10)
+    revision = repository.create_revision(run["workflow_run_id"], "org:acme", "graph", [{
+        "step_id": "read", "capability_id": "slack.channels.list",
+        "capability_version": "1", "connection_id": "conn:s",
+        "descriptor_snapshot_hash": "d", "input_hash": "i", "input": {},
+        "depends_on": [], "effect": "read",
+    }], 10)
+    repository.authorize_requested_read(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "graph", "user:alice", 10,
+    )
+    store.update(
+        conversation["conversation_id"], "org:acme", "user:alice",
+        status="executing", workflow_run_id=run["workflow_run_id"],
+        workflow_revision_id=revision["workflow_revision_id"],
+    )
+    claim = repository.claim_ready_step(
+        run["workflow_run_id"], revision["workflow_revision_id"],
+        "org:acme", "worker:crashed", 11, 60,
+    )
+    repository.persist_completion(
+        revision["workflow_revision_id"], "read", "org:acme",
+        claim["attempt"], {"provider_id": "read:1"}, None, 11,
+        output={"channels": [{"id": "C1", "name": "general"}]},
+    )
+    repository.close()
+
+    restarted = WorkflowRepository(database)
+    worker = WorkflowWorker(restarted, object(), "worker:restarted")
+    worker.run_once()
+    worker.run_once()
+
+    projected = ConciergeConversationStore(restarted, clock=lambda: 12).get(
+        "conversation:outbox", "org:acme", "user:alice"
+    )
+    assert projected["status"] == "ready"
+    assert projected["presentation"]["answer"] == "Tienes 1 canales públicos: #general"
+    assert restarted.count_outbox_events(
+        "org:acme", "revision:%s:complete" % revision["workflow_revision_id"]
+    ) == 1

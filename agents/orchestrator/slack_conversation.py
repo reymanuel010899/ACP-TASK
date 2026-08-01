@@ -7,6 +7,23 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+_OPERATION_ID_TO_TURN = {
+    "slack.connection.status": "status",
+    "slack.channels.list": "list_channels",
+    "slack.private_channels.list": "list_private_channels",
+    "slack.conversation.read": "read",
+    "slack.conversation.summarize": "summarize",
+    "slack.thread.read": "read",
+    "slack.private_conversation.read": "read",
+    "slack.private_thread.read": "read",
+    "slack.message.permalink": "read",
+    "slack.message.send": "post",
+    "slack.thread.reply": "reply",
+    "slack.direct_message.send": "dm",
+    "slack.reaction.add": "reaction",
+}
+
+
 class SlackTurn(BaseModel):
     operation: str
     locale: str
@@ -22,6 +39,7 @@ class SlackTurnResult(BaseModel):
     turn: SlackTurn
     resolved: Dict[str, Any] = Field(default_factory=dict)
     need: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
 
 
 def normalize_name(value):
@@ -37,10 +55,33 @@ def interpret_slack_turn(text, active_state=None):
     plain = normalize_name(text)
     locale = "es" if any(word in plain.split() for word in (
         "que", "dijo", "manda", "mandale", "mensaje", "canal", "responde",
-        "respondele", "ahi", "cancelar", "cancela",
+        "respondele", "ahi", "cancelar", "cancela", "tengo", "canales",
+        "publicos", "lista", "muestra",
+        "acceso", "tienes", "conectado", "conectada",
     )) else "en"
-    if any(marker in plain for marker in ("cancel", "cancela", "olvida eso")):
+    words = set(plain.split())
+    channel_words = {"canal", "canales", "channel", "channels"}
+    listing_words = {
+        "lista", "listar", "muestra", "tengo", "tenemos", "cuanto", "cuantos",
+        "saber", "list", "show", "have", "many",
+    }
+    asks_for_channels = bool(words & channel_words) and bool(words & listing_words)
+    public_channels = asks_for_channels and bool(words & {"publico", "publicos", "public"})
+    private_channels = asks_for_channels and bool(words & {"privado", "privados", "private"})
+    asks_connection_status = "slack" in plain and any(
+        marker in plain for marker in (
+            "acceso a slack", "access to slack", "tienes acceso",
+            "have access", "slack conectado", "slack connected",
+        )
+    )
+    if asks_connection_status:
+        operation = "status"
+    elif any(marker in plain for marker in ("cancel", "cancela", "olvida eso")):
         operation = "cancel"
+    elif private_channels:
+        operation = "list_private_channels"
+    elif public_channels:
+        operation = "list_channels"
     elif any(marker in plain for marker in (
         "direct message", " dm ", "send a message to", "mandale", "manda a",
     )):
@@ -50,7 +91,7 @@ def interpret_slack_turn(text, active_state=None):
     )):
         operation = "reply"
     elif any(marker in plain for marker in (
-        "send", "post", "manda", "publica", "escribe",
+        "send", "post", "manda", "publica", "escribe", "enviar", "envia",
     )):
         operation = "post"
     elif any(marker in plain for marker in ("summar", "resume", "resumen")):
@@ -66,6 +107,13 @@ def interpret_slack_turn(text, active_state=None):
     match = re.search(r"#([\wÀ-ÿ.-]+)", text, re.UNICODE)
     if match:
         channel = match.group(1).rstrip(".")
+    else:
+        match = re.search(
+            r"(?:canal|channel)\s+#?([\wÀ-ÿ.-]+)", text,
+            re.IGNORECASE | re.UNICODE,
+        )
+        if match:
+            channel = match.group(1).rstrip(".")
 
     person = None
     patterns = (
@@ -83,6 +131,8 @@ def interpret_slack_turn(text, active_state=None):
     message = None
     if operation in ("post", "reply", "dm"):
         message_patterns = (
+            r"(?:mensaje\s+)?(?:que\s+)?diga\s+[\"“]([^\"”]+)[\"”]",
+            r"[\"“]([^\"”]+)[\"”]",
             r"(?:\bque\b|\bdiciendo\b)\s+(.+)$",
             r"(?:\bthat\b|\bsaying\b)\s+(.+)$",
             r"(?:#[\wÀ-ÿ.-]+)\s*:\s*(.+)$",
@@ -110,16 +160,54 @@ class SlackConversationCoordinator:
 
     def coordinate(
         self, text, active_state=None, installations=None, channels=None,
-        users=None,
+        users=None, interpretation=None,
     ):
         active = dict(active_state or {})
-        turn = interpret_slack_turn(text, active)
+        turn = (
+            self._turn_from_interpretation(interpretation, active)
+            if interpretation is not None else interpret_slack_turn(text, active)
+        )
         resolved = {
             key: active[key] for key in (
                 "active_connection", "active_channel", "active_person",
                 "active_thread", "read_period", "pending_draft",
             ) if active.get(key) is not None
         }
+        if turn.message_text is None:
+            pending = resolved.get("pending_draft") or {}
+            if isinstance(pending.get("text"), str) and pending["text"]:
+                turn = turn.model_copy(update={"message_text": pending["text"]})
+        if turn.operation == "status":
+            usable = [
+                item for item in (installations or [])
+                if item.get("status") == "connected"
+            ]
+            if not usable:
+                message = (
+                    "No. Slack no está conectado."
+                    if turn.locale == "es"
+                    else "No. Slack is not connected."
+                )
+            else:
+                labels = [
+                    item.get("team_name") or item.get("team_id")
+                    for item in usable
+                    if item.get("team_name") or item.get("team_id")
+                ]
+                workspace = ", ".join(labels)
+                if turn.locale == "es":
+                    message = (
+                        "Sí. Tengo acceso a Slack"
+                        + (" mediante el workspace %s." % workspace if workspace else ".")
+                    )
+                else:
+                    message = (
+                        "Yes. I have access to Slack"
+                        + (" through the %s workspace." % workspace if workspace else ".")
+                    )
+            return SlackTurnResult(
+                state="completed", turn=turn, resolved={}, message=message
+            )
         blocking_need = active.get("blocking_need")
         if isinstance(blocking_need, dict):
             turn, answered = self._answer_blocking_need(
@@ -193,6 +281,40 @@ class SlackConversationCoordinator:
         return SlackTurnResult(state="resolving", turn=turn, resolved=resolved)
 
     @staticmethod
+    def _turn_from_interpretation(interpretation, active):
+        operations = list(getattr(interpretation, "operations", ()) or ())
+        operation_id = operations[0].operation_id if operations else None
+        operation = _OPERATION_ID_TO_TURN.get(operation_id)
+        if operation is None:
+            operation = active.get("operation") or "unsupported"
+        values = {}
+        for slot in getattr(interpretation, "slots", ()) or ():
+            if getattr(slot, "operation_index", None) in (None, 0):
+                values[slot.name] = slot.value
+        for correction in getattr(interpretation, "corrections", ()) or ():
+            if getattr(correction, "operation_index", None) in (None, 0):
+                values[correction.slot] = correction.replacement
+        locale = getattr(interpretation, "locale", None) or active.get("locale") or "en"
+        if locale == "mixed":
+            locale = active.get("locale") if active.get("locale") in ("es", "en") else "es"
+        period = values.get("period")
+        period_days = None
+        if isinstance(period, int):
+            period_days = period
+        elif isinstance(period, str):
+            match = re.search(r"(\d+)", period)
+            period_days = int(match.group(1)) if match else None
+        return SlackTurn(
+            operation=operation,
+            locale=locale,
+            channel_name=str(values["channel"]) if values.get("channel") else None,
+            person_name=str(values["person"]) if values.get("person") else None,
+            message_text=str(values["message"]) if values.get("message") else None,
+            refers_to_active_target=bool(active),
+            period_days=period_days,
+        )
+
+    @staticmethod
     def _answer_blocking_need(text, parsed_turn, active, need):
         field = need.get("field")
         operation = active.get("operation") or parsed_turn.operation
@@ -201,12 +323,18 @@ class SlackConversationCoordinator:
         value = str(text or "").strip()
         answered = {}
         if field == "message_text":
+            if isinstance(parsed_turn.message_text, str) and parsed_turn.message_text.strip():
+                value = parsed_turn.message_text.strip()
             if not value:
                 return parsed_turn, answered
             return SlackTurn(
                 operation=operation, locale=locale, message_text=value,
                 refers_to_active_target=True,
             ), answered
+        if field == "operation" and parsed_turn.operation not in {
+            "unsupported", "clarify"
+        }:
+            return parsed_turn, answered
         if field in {"workspace", "channel", "person"} and options:
             normalized = normalize_name(value.replace("·", " "))
             strong_matches = []

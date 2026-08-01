@@ -1,12 +1,73 @@
+import copy
 import json
+
+import pytest
 
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator import tools as orchestrator_tools
 from libs.connectors.base import ProviderAuthority
-from services.action_broker.app import ActionBroker
+from services.action_broker.app import (
+    ActionBroker,
+    _safe_receipt,
+    oauth_connection_authorizer,
+)
 
 
 NOW = 1_700_000_000
+
+
+def test_safe_receipt_preserves_safe_nested_provider_data():
+    receipt = {
+        "provider": "slack",
+        "messages": [{"text": "safe", "metadata": {"page": 1}}],
+    }
+    original = copy.deepcopy(receipt)
+
+    assert _safe_receipt(receipt) is receipt
+    assert receipt == original
+
+
+@pytest.mark.parametrize("receipt", [
+    {"metadata": {"access_token": "xoxb-secret"}},
+    {"items": [{"details": {"Refresh_Token": "sealed-secret"}}]},
+    {"items": [[{"AUTHORIZATION": "Bearer secret"}]]},
+    {"result": {"token": "secret"}},
+])
+def test_safe_receipt_rejects_authority_material_at_any_depth(receipt):
+    with pytest.raises(ValueError, match="forbidden authority material"):
+        _safe_receipt(receipt)
+
+
+def test_safe_receipt_rejects_excessive_depth_items_and_serialized_size():
+    too_deep = {"leaf": "value"}
+    for _ in range(10):
+        too_deep = {"nested": too_deep}
+
+    with pytest.raises(ValueError, match="depth limit"):
+        _safe_receipt(too_deep)
+    with pytest.raises(ValueError, match="item limit"):
+        _safe_receipt({"items": list(range(1001))})
+    with pytest.raises(ValueError, match="size limit"):
+        _safe_receipt({"value": "x" * 70_000})
+
+
+def test_tenant_bound_installation_authorizes_verified_member_execution():
+    class Connections:
+        def get_installation(self, connection_id, tenant_id):
+            assert (connection_id, tenant_id) == ("conn:slack", "org:local")
+            return {
+                "principal_id": "user:owner",
+                "credential_id": "credential:slack",
+                "status": "connected",
+                "enabled_capabilities": ["slack.channels.list"],
+            }
+
+    assert oauth_connection_authorizer(Connections())({
+        "connection_id": "conn:slack", "tenant_id": "org:local",
+        "user_principal_id": "user:member",
+        "credential_id": "credential:slack",
+        "capability_id": "slack.channels.list",
+    })
 
 
 class Clock(object):

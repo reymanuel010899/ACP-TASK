@@ -192,6 +192,13 @@ class OAuthService(object):
         tenant_id = self._tenant_id(current)
         if not tenant_id or tenant_id != transaction.get("tenant_id"):
             return 409, {"error": "tenant binding changed"}
+        previous_installation = next((
+            item for item in self.repository.list_tenant_installations(
+                tenant_id, "slack", usable_only=False
+            )
+            if item.get("app_id") == self.slack_app_id
+            and item.get("team_id") == team_id
+        ), None)
         existing = None
         target_id = transaction.get("target_connection_id")
         if target_id:
@@ -262,9 +269,14 @@ class OAuthService(object):
                 credential_id, current["principal_id"]
             )
             return 409, {"error": "Slack workspace is already connected"}
-        if existing and existing["credential_id"] != credential_id:
+        if (
+            previous_installation
+            and previous_installation.get("credential_id")
+            and previous_installation["credential_id"] != credential_id
+        ):
             self.vault_service.delete_managed_oauth_credential(
-                existing["credential_id"], current["principal_id"]
+                previous_installation["credential_id"],
+                previous_installation["principal_id"],
             )
         del authority, document
         return 200, {
@@ -743,10 +755,14 @@ def _configured_tenant_resolver():
         ) from exc
     if not isinstance(mapping, dict):
         raise RuntimeError("TESSERA_PRINCIPAL_TENANTS_JSON must be a JSON object")
+    local_tenant = os.environ.get("TESSERA_LOCAL_TENANT_ID")
+    local_tenant = (
+        local_tenant if isinstance(local_tenant, str) and local_tenant else None
+    )
 
     def resolve(principal_id):
         value = mapping.get(principal_id)
-        return value if isinstance(value, str) and value else None
+        return value if isinstance(value, str) and value else local_tenant
 
     return resolve
 

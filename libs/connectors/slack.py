@@ -439,7 +439,7 @@ class SlackActionExecutor:
                 "missing_scope": "scope",
                 "invalid_auth": "auth",
                 "token_revoked": "auth",
-                "not_in_channel": "permission",
+                "not_in_channel": "membership",
                 "channel_not_found": "validation",
             }
             raise SlackAPIError(method, code, categories.get(code, "provider"))

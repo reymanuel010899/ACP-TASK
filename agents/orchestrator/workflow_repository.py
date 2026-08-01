@@ -160,6 +160,47 @@ class WorkflowRepository(object):
                         conversation_id, tenant_id, principal_id
                     )
             );
+            CREATE TABLE IF NOT EXISTS workflow_outbox (
+                event_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                aggregate_version INTEGER NOT NULL CHECK(aggregate_version > 0),
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'claimed', 'completed', 'dead_letter')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                max_attempts INTEGER NOT NULL DEFAULT 5 CHECK(max_attempts > 0),
+                available_at INTEGER NOT NULL,
+                claimed_by TEXT,
+                claim_expires_at INTEGER,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                dead_lettered_at INTEGER,
+                UNIQUE(tenant_id, dedupe_key),
+                UNIQUE(tenant_id, aggregate_type, aggregate_id, aggregate_version)
+            );
+            CREATE INDEX IF NOT EXISTS workflow_outbox_claimable
+                ON workflow_outbox(status, available_at, created_at);
+            CREATE INDEX IF NOT EXISTS workflow_outbox_aggregate_order
+                ON workflow_outbox(
+                    tenant_id, aggregate_type, aggregate_id, aggregate_version
+                );
+            CREATE TABLE IF NOT EXISTS workflow_projection_watermarks (
+                tenant_id TEXT NOT NULL,
+                projection_name TEXT NOT NULL,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                projected_version INTEGER NOT NULL CHECK(projected_version > 0),
+                last_event_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(
+                    tenant_id, projection_name, aggregate_type, aggregate_id
+                )
+            );
         """)
         self._ensure_step_column("input_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_step_column("output_json", "TEXT")
@@ -558,9 +599,38 @@ class WorkflowRepository(object):
         self, workflow_run_id, revision_id, tenant_id, graph_hash, effect,
         now_ts=None,
     ):
-        mode = self.revision_authorization_mode(
-            workflow_run_id, revision_id, tenant_id, graph_hash, now_ts
-        )
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT approval.authorization_mode, approval.expires_at,
+                          revision.status AS revision_status,
+                          run.current_revision_id
+                   FROM workflow_approvals AS approval
+                   JOIN workflow_revisions AS revision
+                     ON revision.workflow_revision_id = approval.workflow_revision_id
+                    AND revision.workflow_run_id = approval.workflow_run_id
+                    AND revision.tenant_id = approval.tenant_id
+                   JOIN workflow_runs AS run
+                     ON run.workflow_run_id = revision.workflow_run_id
+                    AND run.tenant_id = revision.tenant_id
+                   WHERE approval.workflow_run_id = ?
+                     AND approval.workflow_revision_id = ?
+                     AND approval.tenant_id = ?
+                     AND approval.plan_graph_hash = ?""",
+                (workflow_run_id, revision_id, tenant_id, graph_hash),
+            ).fetchone()
+        if row is None or row["current_revision_id"] != revision_id:
+            return False
+        if row["revision_status"] not in (
+            "approved", "authorized", "executing", "in_progress", "completed",
+        ):
+            return False
+        if (
+            now_ts is not None
+            and row["expires_at"] is not None
+            and row["expires_at"] < int(now_ts)
+        ):
+            return False
+        mode = row["authorization_mode"]
         return mode == "explicit_write" or (
             mode == "requested_read" and effect == "read"
         )
@@ -1308,6 +1378,36 @@ class WorkflowRepository(object):
         if status == "complete" and effects == {"read"}:
             changes["status"] = "ready"
             outputs = [step.get("output") or {} for step in revision["steps"]]
+            channels = next((list(item.get("channels") or []) for item in reversed(outputs)
+                             if item.get("channels") is not None), None)
+            if channels is not None:
+                names = ["#%s" % item["name"] for item in channels
+                         if isinstance(item, dict) and item.get("name")]
+                current = self.get_conversation(
+                    row["conversation_id"], tenant_id, row["principal_id"], now_ts
+                )
+                locale = (current or {}).get("locale", "es")
+                private = (current or {}).get("operation") == "list_private_channels"
+                kind_es = "privados" if private else "públicos"
+                kind_en = "private" if private else "public"
+                answer = ((("Tienes %d canales %s: " % (len(names), kind_es)) if locale == "es"
+                           else "You have %d %s channels: " % (len(names), kind_en)) + ", ".join(names)
+                          if names else
+                          (("No encontré canales %s." % kind_es) if locale == "es"
+                           else "I found no %s channels." % kind_en))
+                self.store_conversation_presentation(
+                    row["conversation_id"], tenant_id, row["principal_id"], {
+                        "answer": answer, "citations": [], "partial": bool(
+                            next((item.get("partial") for item in outputs
+                                  if item.get("channels") is not None), False)
+                        ),
+                    }, now_ts,
+                )
+                self.update_conversation(
+                    row["conversation_id"], tenant_id, row["principal_id"],
+                    changes, now_ts,
+                )
+                return True
             evidence = next((item for item in reversed(outputs)
                              if item.get("messages") is not None), {})
             messages = list(evidence.get("messages") or [])
@@ -1342,6 +1442,261 @@ class WorkflowRepository(object):
             changes, now_ts,
         )
         return True
+
+    def append_outbox_event(
+        self, tenant_id, aggregate_type, aggregate_id, event_type, payload,
+        dedupe_key, now_ts, max_attempts=5, available_at=None,
+    ):
+        """Append one immutable event, assigning aggregate order atomically."""
+        if not all((tenant_id, aggregate_type, aggregate_id, event_type, dedupe_key)):
+            raise ValueError("outbox tenant, aggregate, event type and dedupe key are required")
+        now_ts = int(now_ts)
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                prior = self._connection.execute(
+                    "SELECT * FROM workflow_outbox WHERE tenant_id = ? AND dedupe_key = ?",
+                    (tenant_id, dedupe_key),
+                ).fetchone()
+                if prior is not None:
+                    if (
+                        prior["aggregate_type"] != aggregate_type
+                        or prior["aggregate_id"] != aggregate_id
+                        or prior["event_type"] != event_type
+                        or prior["payload_json"] != payload_json
+                    ):
+                        raise ValueError("outbox dedupe key was reused for another event")
+                    self._connection.execute("COMMIT")
+                    return self._outbox_event(prior)
+                row = self._connection.execute(
+                    "SELECT COALESCE(MAX(aggregate_version), 0) AS version "
+                    "FROM workflow_outbox WHERE tenant_id = ? AND aggregate_type = ? "
+                    "AND aggregate_id = ?",
+                    (tenant_id, aggregate_type, aggregate_id),
+                ).fetchone()
+                version = int(row["version"]) + 1
+                event_id = "outbox:%s" % uuid.uuid4().hex
+                self._connection.execute(
+                    """INSERT INTO workflow_outbox(
+                        event_id, tenant_id, aggregate_type, aggregate_id,
+                        aggregate_version, event_type, payload_json, dedupe_key,
+                        max_attempts, available_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (event_id, tenant_id, aggregate_type, aggregate_id, version,
+                     event_type, payload_json, dedupe_key, int(max_attempts),
+                     int(now_ts if available_at is None else available_at), now_ts),
+                )
+                event = self._connection.execute(
+                    "SELECT * FROM workflow_outbox WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self._outbox_event(event)
+
+    @staticmethod
+    def _outbox_event(row):
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def get_outbox_event(self, event_id, tenant_id):
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM workflow_outbox WHERE event_id = ? AND tenant_id = ?",
+                (event_id, tenant_id),
+            ).fetchone()
+        return self._outbox_event(row) if row else None
+
+    def count_outbox_events(self, tenant_id, dedupe_key):
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS total FROM workflow_outbox "
+                "WHERE tenant_id = ? AND dedupe_key = ?",
+                (tenant_id, dedupe_key),
+            ).fetchone()
+        return int(row["total"])
+
+    def claim_outbox_event(
+        self, worker_id, now_ts, visibility_timeout=30, tenant_id=None,
+    ):
+        """Claim the oldest available event without overtaking its aggregate."""
+        now_ts = int(now_ts)
+        tenant_clause = " AND o.tenant_id = ?" if tenant_id else ""
+        params = [now_ts, now_ts]
+        if tenant_id:
+            params.append(tenant_id)
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    """SELECT o.* FROM workflow_outbox o
+                       WHERE ((o.status = 'pending' AND o.available_at <= ?)
+                          OR (o.status = 'claimed' AND o.claim_expires_at <= ?))
+                    """ + tenant_clause + """
+                       AND NOT EXISTS (
+                           SELECT 1 FROM workflow_outbox earlier
+                           WHERE earlier.tenant_id = o.tenant_id
+                             AND earlier.aggregate_type = o.aggregate_type
+                             AND earlier.aggregate_id = o.aggregate_id
+                             AND earlier.aggregate_version < o.aggregate_version
+                             AND earlier.status != 'completed'
+                       )
+                       ORDER BY o.created_at, o.event_id LIMIT 1""",
+                    tuple(params),
+                ).fetchone()
+                if row is None:
+                    self._connection.execute("COMMIT")
+                    return None
+                cursor = self._connection.execute(
+                    """UPDATE workflow_outbox SET status = 'claimed', claimed_by = ?,
+                           claim_expires_at = ?, attempts = attempts + 1
+                       WHERE event_id = ? AND tenant_id = ?
+                         AND ((status = 'pending' AND available_at <= ?)
+                           OR (status = 'claimed' AND claim_expires_at <= ?))""",
+                    (worker_id, now_ts + int(visibility_timeout), row["event_id"],
+                     row["tenant_id"], now_ts, now_ts),
+                )
+                if cursor.rowcount != 1:
+                    self._connection.execute("ROLLBACK")
+                    return None
+                claimed = self._connection.execute(
+                    "SELECT * FROM workflow_outbox WHERE event_id = ?",
+                    (row["event_id"],),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self._outbox_event(claimed)
+
+    def complete_outbox_event(self, event_id, tenant_id, worker_id, now_ts):
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT status, claimed_by FROM workflow_outbox "
+                "WHERE event_id = ? AND tenant_id = ?", (event_id, tenant_id),
+            ).fetchone()
+            if current is None:
+                return False
+            if current["status"] == "completed":
+                return True
+            cursor = self._connection.execute(
+                """UPDATE workflow_outbox SET status = 'completed', completed_at = ?,
+                       claimed_by = NULL, claim_expires_at = NULL
+                   WHERE event_id = ? AND tenant_id = ? AND status = 'claimed'
+                     AND claimed_by = ?""",
+                (int(now_ts), event_id, tenant_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def fail_outbox_event(
+        self, event_id, tenant_id, worker_id, now_ts, error, retry_delay,
+    ):
+        now_ts = int(now_ts)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT attempts, max_attempts FROM workflow_outbox "
+                "WHERE event_id = ? AND tenant_id = ? AND status = 'claimed' "
+                "AND claimed_by = ?", (event_id, tenant_id, worker_id),
+            ).fetchone()
+            if row is None:
+                return False
+            dead = int(row["attempts"]) >= int(row["max_attempts"])
+            status = "dead_letter" if dead else "pending"
+            self._connection.execute(
+                """UPDATE workflow_outbox SET status = ?, available_at = ?,
+                       claimed_by = NULL, claim_expires_at = NULL, last_error = ?,
+                       dead_lettered_at = ? WHERE event_id = ? AND tenant_id = ?""",
+                (status, now_ts + int(retry_delay), str(error)[:1000],
+                 now_ts if dead else None, event_id, tenant_id),
+            )
+        return "dead_letter" if dead else "retry"
+
+    def get_projection_watermark(
+        self, tenant_id, aggregate_type, aggregate_id,
+        projection_name="conversation",
+    ):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM workflow_projection_watermarks
+                   WHERE tenant_id = ? AND projection_name = ?
+                     AND aggregate_type = ? AND aggregate_id = ?""",
+                (tenant_id, projection_name, aggregate_type, aggregate_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def advance_projection_watermark(
+        self, tenant_id, aggregate_type, aggregate_id, projected_version,
+        event_id, now_ts, projection_name="conversation",
+    ):
+        with self._lock:
+            cursor = self._connection.execute(
+                """INSERT INTO workflow_projection_watermarks(
+                       tenant_id, projection_name, aggregate_type, aggregate_id,
+                       projected_version, last_event_id, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, projection_name, aggregate_type, aggregate_id)
+                   DO UPDATE SET projected_version = excluded.projected_version,
+                       last_event_id = excluded.last_event_id,
+                       updated_at = excluded.updated_at
+                   WHERE workflow_projection_watermarks.projected_version
+                         < excluded.projected_version""",
+                (tenant_id, projection_name, aggregate_type, aggregate_id,
+                 int(projected_version), event_id, int(now_ts)),
+            )
+        return cursor.rowcount == 1
+
+    def purge_completed_outbox(self, tenant_id, completed_before):
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM workflow_outbox WHERE tenant_id = ? "
+                "AND status = 'completed' AND completed_at < ?",
+                (tenant_id, int(completed_before)),
+            )
+        return cursor.rowcount
+
+    def enqueue_workflow_conversation_outcome(
+        self, revision_id, tenant_id, outcome, now_ts,
+    ):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT conversation_id FROM concierge_conversations
+                   WHERE workflow_revision_id = ? AND tenant_id = ?
+                     AND status NOT IN ('closed', 'expired')""",
+                (revision_id, tenant_id),
+            ).fetchone()
+        if row is None:
+            return None
+        status = str((outcome or {}).get("status") or "unknown")
+        return self.append_outbox_event(
+            tenant_id, "conversation", row["conversation_id"],
+            "workflow.outcome", {"revision_id": revision_id, "outcome": outcome},
+            "revision:%s:%s" % (revision_id, status), now_ts,
+        )
+
+    def recover_unprojected_conversation_outcomes(self, now_ts):
+        """Self-heal a crash after durable completion but before outbox append."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT c.workflow_revision_id, c.tenant_id
+                   FROM concierge_conversations c
+                   JOIN workflow_revisions r
+                     ON r.workflow_revision_id = c.workflow_revision_id
+                    AND r.tenant_id = c.tenant_id
+                   WHERE c.status NOT IN ('closed', 'expired', 'succeeded', 'ready')
+                     AND r.status = 'completed'"""
+            ).fetchall()
+        created = 0
+        for row in rows:
+            event = self.enqueue_workflow_conversation_outcome(
+                row["workflow_revision_id"], row["tenant_id"],
+                {"status": "complete"}, now_ts,
+            )
+            if event is not None:
+                created += 1
+        return created
 
     def get_revision_by_id(self, revision_id, tenant_id):
         with self._lock:

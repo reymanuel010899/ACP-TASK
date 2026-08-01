@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import jsonschema
 import pytest
 
 from libs.integrations.catalog import (
@@ -132,3 +133,47 @@ def test_slack_conversation_primitives_have_narrow_scopes_and_inputs():
     assert definitions["slack.direct_message.send"].preview_fields == ("user_id", "text")
     history = definitions["slack.conversation.read"].input_schema["properties"]
     assert {"oldest", "latest", "cursor", "limit"}.issubset(history)
+
+
+def test_slack_capabilities_declare_allowlisted_output_fields():
+    definitions = {
+        definition.capability_id: definition for definition in slack_definitions()
+    }
+    expected_fields = {
+        "slack.channels.list": {"channels", "next_cursor", "partial"},
+        "slack.private_channels.list": {"channels", "next_cursor", "partial"},
+        "slack.conversation.read": {"messages", "next_cursor", "partial"},
+        "slack.private_conversation.read": {"messages", "next_cursor", "partial"},
+        "slack.thread.read": {"messages", "next_cursor", "partial"},
+        "slack.private_thread.read": {"messages", "next_cursor", "partial"},
+        "slack.users.list": {"users", "next_cursor", "partial"},
+        "slack.message.permalink": {"channel_id", "message_ts", "permalink"},
+        "slack.message.send": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts",
+        },
+        "slack.thread.reply": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts",
+        },
+        "slack.direct_message.send": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts", "user_id",
+        },
+        "slack.reaction.add": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts", "reaction",
+        },
+        "slack.file.upload": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "file_id",
+        },
+    }
+
+    assert set(definitions) == set(expected_fields)
+    for capability_id, fields in expected_fields.items():
+        schema = definitions[capability_id].output_schema
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        assert set(schema["properties"]) == fields
+        jsonschema.Draft202012Validator.check_schema(schema)

@@ -7,6 +7,7 @@ import requests
 
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.attestation import ExecutionAttestor
+from agents.orchestrator.policy import PolicyEvaluator
 from libs.aws_kms import AWSKMSClient
 from libs.config import ConfigurationError, get_google_oauth_config, get_slack_oauth_config
 from libs.connectors.google import (
@@ -138,6 +139,12 @@ def build_broker():
             vault_service, slack_connector
         )
     runtime_registry = ProviderRuntimeRegistry(runtimes)
+    rollout_version = os.environ.get(
+        "TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"
+    )
+    policy_evaluator = PolicyEvaluator(
+        runtime_registry.definitions(), rollout_version
+    )
 
     def dispatch_policy(binding):
         if binding.get("workflow_revision_id") not in (None, "legacy"):
@@ -167,9 +174,9 @@ def build_broker():
         ),
         evidence_submitter=_evidence_submitter(),
         runtime_registry=runtime_registry,
-        rollout_version=os.environ.get(
-            "TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"
-        ),
+        rollout_version=rollout_version,
         credential_rotators=credential_rotators,
         dispatch_policy=dispatch_policy,
+        policy_evaluator=policy_evaluator,
+        connection_resolver=oauth_repository.get_installation,
     )

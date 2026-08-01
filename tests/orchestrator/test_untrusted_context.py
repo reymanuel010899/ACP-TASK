@@ -35,13 +35,21 @@ def test_slack_output_cannot_become_google_recipient_without_confirmation():
     definitions = [
         TrustedCapabilityDefinition(
             capability_id="slack.search", version="1.0.0", provider="slack",
-            input_schema={"type": "object"}, output_schema={"type": "object"},
+            input_schema={"type": "object"}, output_schema={
+                "type": "object",
+                "properties": {"email": {"type": "string"}},
+                "additionalProperties": False,
+            },
             required_scopes=frozenset({"search:read"}), effect="read", risk="low",
             retry_policy="safe", preview_fields=(), verifier=None,
         ),
         TrustedCapabilityDefinition(
             capability_id="gmail.send", version="1.0.0", provider="google",
-            input_schema={"type": "object", "additionalProperties": True},
+            input_schema={
+                "type": "object",
+                "properties": {"to": {"type": "string"}},
+                "additionalProperties": False,
+            },
             output_schema={"type": "object"}, required_scopes=frozenset({"gmail.send"}),
             effect="write", risk="medium", retry_policy="reconcile",
             preview_fields=("to",), verifier="google.receipt",
@@ -83,7 +91,11 @@ def test_typed_google_body_accepts_declared_dependency_reference():
     )
     source = TrustedCapabilityDefinition(
         capability_id="summary.read", version="1.0.0", provider="google",
-        input_schema={"type": "object"}, output_schema={"type": "object"},
+        input_schema={"type": "object"}, output_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "additionalProperties": False,
+        },
         required_scopes=frozenset({"summary:read"}), effect="read", risk="low",
         retry_policy="safe", preview_fields=(), verifier=None,
     )

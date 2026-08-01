@@ -6,6 +6,9 @@ import time
 
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
 from agents.orchestrator.slack_conversation import SlackConversationCoordinator
+from agents.orchestrator.slack_operations import (
+    load_slack_operations,
+)
 from libs.integrations.catalog import ConnectionCapabilitySnapshot
 
 
@@ -17,7 +20,8 @@ class DynamicWorkflowService:
     def __init__(self, brain, definitions, connection_repository, workflow_repository,
                  rollout_version="production-v1", shadow_mode=True, clock=None,
                  conversation_store=None, conversational_reads_enabled=True,
-                 slack_writes_enabled=True, slack_dms_enabled=True):
+                 slack_writes_enabled=True, slack_dms_enabled=True,
+                 slack_policy_visible=None, slack_family_flags=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -29,7 +33,16 @@ class DynamicWorkflowService:
         self.conversational_reads_enabled = bool(conversational_reads_enabled)
         self.slack_writes_enabled = bool(slack_writes_enabled)
         self.slack_dms_enabled = bool(slack_dms_enabled)
+        self.slack_policy_visible = slack_policy_visible
+        self.slack_family_flags = dict(slack_family_flags or {})
         self.slack_coordinator = SlackConversationCoordinator()
+        slack_definitions = tuple(
+            item for item in self.definitions if item.provider == "slack"
+        )
+        self.slack_operation_registry = (
+            load_slack_operations(slack_definitions)
+            if slack_definitions else None
+        )
 
     def coordinate_slack_turn(
         self, tenant_id, principal_id, text, conversation_id=None,
@@ -46,9 +59,24 @@ class DynamicWorkflowService:
             channels = self.connections.list_slack_channels(tenant_id, principal_id)
         if users is None and hasattr(self.connections, "list_slack_users"):
             users = self.connections.list_slack_users(tenant_id, principal_id)
+        interpretation = None
+        projection = ()
+        if self.slack_operation_registry is not None and hasattr(
+            self.brain, "understand_slack"
+        ):
+            projection = self._slack_operation_projection(installations)
+            interpretation = self.brain.understand_slack(text, {
+                "slack_operation_projection": projection,
+                "active_conversation": active or {},
+            })
+            limitation = self._interpretation_limitation(
+                text, interpretation, installations, projection
+            )
+            if limitation is not None:
+                return limitation
         result = self.slack_coordinator.coordinate(
             text, active_state=active, installations=installations,
-            channels=channels, users=users,
+            channels=channels, users=users, interpretation=interpretation,
         )
         disabled_feature = self._disabled_slack_feature(result.turn.operation)
         if disabled_feature:
@@ -70,6 +98,11 @@ class DynamicWorkflowService:
                 ),
             }
         payload = result.model_dump()
+        if interpretation is not None:
+            proposal = interpretation.model_dump()
+            payload["slack_interpretation"] = proposal
+            payload["compound_operations"] = proposal["operations"]
+            payload["dependencies"] = proposal["dependencies"]
         if self.conversation_store is not None:
             if active is None:
                 active = self.conversation_store.create(
@@ -84,7 +117,8 @@ class DynamicWorkflowService:
                     "active_thread", "read_period", "pending_draft",
                 }
             }
-            updates.update(status=result.state, locale=result.turn.locale,
+            persisted_status = "succeeded" if result.state == "completed" else result.state
+            updates.update(status=persisted_status, locale=result.turn.locale,
                            operation=result.turn.operation, blocking_need=None)
             self.conversation_store.update(
                 conversation_id, tenant_id, principal_id, **updates
@@ -108,6 +142,14 @@ class DynamicWorkflowService:
             )
         if turn_payload.get("state") != "resolving":
             return turn_payload
+        if len(turn_payload.get("compound_operations") or ()) > 1:
+            return {
+                "state": "retryable_failure", "conversation_id": conversation_id,
+                "error": {"code": "compound_execution_unavailable"},
+                "recovery": {"action": "wait_for_compound_rollout"},
+                "compound_operations": turn_payload["compound_operations"],
+                "dependencies": turn_payload.get("dependencies") or [],
+            }
         resolved = turn_payload.get("resolved") or {}
         operation = turn.get("operation")
         if operation in {"post", "reply", "dm"}:
@@ -124,9 +166,13 @@ class DynamicWorkflowService:
                 "state": "awaiting_approval", "conversation_id": conversation_id,
                 "draft": draft,
             }
-        if operation in {"read", "summarize"}:
+        if operation in {"read", "summarize", "list_channels", "list_private_channels"}:
+            goal = ({
+                "list_channels": "Lista los canales públicos de Slack",
+                "list_private_channels": "Lista los canales privados de Slack",
+            }.get(operation, text))
             workflow = self.plan(
-                tenant_id, principal_id, text,
+                tenant_id, principal_id, goal,
                 {"slack_resolution": resolved},
             )
             self.conversation_store.update(
@@ -209,13 +255,151 @@ class DynamicWorkflowService:
         return result
 
     def _disabled_slack_feature(self, operation):
-        if operation in {"read", "summarize"} and not self.conversational_reads_enabled:
+        if operation in {"read", "summarize", "list_channels", "list_private_channels"} and not self.conversational_reads_enabled:
             return "slack_conversational_reads"
         if operation in {"post", "reply", "dm"} and not self.slack_writes_enabled:
             return "slack_writes"
         if operation == "dm" and not self.slack_dms_enabled:
             return "slack_dms"
         return None
+
+    def _slack_family_state(self):
+        state = {
+            "slack_connection_status": True,
+            "slack_channel_discovery": self.conversational_reads_enabled,
+            "slack_private_reads": self.conversational_reads_enabled,
+            "slack_conversation_reads": self.conversational_reads_enabled,
+            "slack_user_discovery": True,
+            "slack_messaging": self.slack_writes_enabled,
+            "slack_direct_messages": self.slack_writes_enabled and self.slack_dms_enabled,
+            "slack_reactions": False,
+        }
+        state.update(self.slack_family_flags)
+        return state
+
+    @staticmethod
+    def _runtime_slack_operation_ids():
+        return frozenset({
+            "slack.connection.status", "slack.channels.list",
+            "slack.private_channels.list", "slack.conversation.read",
+            "slack.conversation.summarize", "slack.message.send",
+            "slack.thread.reply", "slack.direct_message.send",
+        })
+
+    def _policy_allows_slack_operation(self, operation):
+        if operation.operation_id not in self._runtime_slack_operation_ids():
+            return False
+        if self.slack_policy_visible is None:
+            return True
+        try:
+            return self.slack_policy_visible(operation) is True
+        except Exception:
+            return False
+
+    def _slack_operation_projection(self, installations):
+        connected = [
+            item for item in installations if item.get("status") == "connected"
+        ]
+        installed = set()
+        for connection in connected:
+            enabled = set(connection.get("enabled_capabilities") or ())
+            scopes = set(connection.get("granted_scopes") or ())
+            for definition in self.definitions:
+                if (
+                    definition.provider == "slack"
+                    and definition.capability_id in enabled
+                    and definition.required_scopes.issubset(scopes)
+                ):
+                    installed.add(definition.capability_id)
+        return self.slack_operation_registry.model_projection(
+            installed, self._slack_family_state(), self._policy_allows_slack_operation,
+        )
+
+    def _interpretation_limitation(
+        self, text, interpretation, installations, projection,
+    ):
+        proposed = [item.operation_id for item in interpretation.operations]
+        visible = {item["operation_id"] for item in projection}
+        if proposed:
+            for operation_id in proposed:
+                descriptor = self.slack_operation_registry.get(operation_id)
+                if descriptor is None:
+                    return self._slack_limitation(
+                        "unsupported_operation", "choose_supported_operation",
+                        operation_id=operation_id,
+                    )
+                if operation_id not in visible:
+                    return self._operation_unavailable(descriptor, installations)
+            return None
+        alias = self.slack_operation_registry.lookup_alias(text)
+        if alias is not None and alias.operation_id not in visible:
+            return self._operation_unavailable(alias, installations)
+        blockers = list(getattr(interpretation, "blockers", ()) or ())
+        if blockers and blockers[0].kind == "unsupported_operation":
+            return self._slack_limitation(
+                "unsupported_operation", "choose_supported_operation",
+            )
+        return None
+
+    def _operation_unavailable(self, descriptor, installations):
+        if descriptor.operation_id not in self._runtime_slack_operation_ids():
+            return self._slack_limitation(
+                "operation_unavailable", "wait_for_family_rollout",
+                operation_id=descriptor.operation_id,
+            )
+        families = self._slack_family_state()
+        if families.get(descriptor.family_flag) is not True:
+            return self._slack_limitation(
+                "feature_disabled", "contact_admin", feature=descriptor.family_flag,
+            )
+        if not self._policy_allows_slack_operation(descriptor):
+            return self._slack_limitation(
+                "policy_denied", "contact_admin", operation_id=descriptor.operation_id,
+            )
+        connected = [item for item in installations if item.get("status") == "connected"]
+        if descriptor.operation_kind != "local" and not connected:
+            return self._slack_limitation(
+                "connection_unavailable", "connect_slack",
+                operation_id=descriptor.operation_id,
+            )
+        required = {
+            step.capability_id for step in descriptor.capability_recipe
+        }
+        definitions = {
+            item.capability_id: item for item in self.definitions
+            if item.provider == "slack"
+        }
+        enabled_anywhere = any(
+            required.issubset(set(item.get("enabled_capabilities") or ()))
+            for item in connected
+        )
+        missing_scopes = sorted({
+            scope
+            for capability_id in required
+            for scope in definitions[capability_id].required_scopes
+            if not any(
+                capability_id in set(item.get("enabled_capabilities") or ())
+                and scope in set(item.get("granted_scopes") or ())
+                for item in connected
+            )
+        })
+        if enabled_anywhere and missing_scopes:
+            return self._slack_limitation(
+                "missing_scope", "upgrade_slack_scopes",
+                operation_id=descriptor.operation_id, scopes=missing_scopes,
+            )
+        return self._slack_limitation(
+            "capability_unavailable", "reconnect_or_enable_capability",
+            operation_id=descriptor.operation_id,
+        )
+
+    @staticmethod
+    def _slack_limitation(code, action, **details):
+        return {
+            "state": "retryable_failure",
+            "error": {"code": code, **details},
+            "recovery": {"action": action, **details},
+        }
 
     def _tenant_installations(self, tenant_id, principal_id):
         if hasattr(self.connections, "list_tenant_installations"):

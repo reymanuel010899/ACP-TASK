@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, PlanRejected, descriptor_hash
@@ -5,11 +7,14 @@ from libs.integrations.catalog import ConnectionCapabilitySnapshot, TrustedCapab
 from libs.integrations.catalog import slack_definitions
 
 
-def _definition(capability_id, provider, effect="read"):
+def _definition(
+    capability_id, provider, effect="read", input_schema=None,
+    output_schema=None,
+):
     return TrustedCapabilityDefinition(
         capability_id=capability_id, version="1.0.0", provider=provider,
-        input_schema={"type": "object", "additionalProperties": True},
-        output_schema={"type": "object", "additionalProperties": True},
+        input_schema=input_schema or {"type": "object", "additionalProperties": True},
+        output_schema=output_schema or {"type": "object", "additionalProperties": True},
         required_scopes=frozenset({"scope:%s" % capability_id}), effect=effect,
         risk="medium" if effect == "write" else "low", retry_policy="safe",
         preview_fields=("payload",) if effect == "write" else (), verifier=None,
@@ -39,6 +44,61 @@ def _step(definition, step_id, connection_id, dependencies):
     }
 
 
+def _compiler_for(definitions):
+    snapshots = [ConnectionCapabilitySnapshot(
+        connection_id="conn:s", tenant_id="org:acme",
+        capability_id=item.capability_id,
+        capability_version=item.version, credential_version=1,
+        effective_scopes=item.required_scopes, health="healthy",
+        rollout_version="rollout-1",
+    ) for item in definitions]
+    return PlanCompiler(definitions, snapshots, "rollout-1")
+
+
+def _reference_definitions():
+    source = _definition(
+        "slack.message.lookup", "slack",
+        output_schema={
+            "type": "object",
+            "required": ["message_ts", "messages"],
+            "properties": {
+                "message_ts": {"type": "string"},
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["text"],
+                        "properties": {"text": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+    destination = _definition(
+        "slack.thread.reply", "slack", "write",
+        input_schema={
+            "type": "object",
+            "required": ["thread_ts"],
+            "properties": {"thread_ts": {"type": "string"}},
+            "anyOf": [{"required": ["thread_ts"]}],
+            "additionalProperties": False,
+        },
+    )
+    return source, destination
+
+
+def _reference_plan(source, destination, reference, dependencies=("lookup",)):
+    lookup = _step(source, "lookup", "conn:s", [])
+    reply = _step(destination, "reply", "conn:s", list(dependencies))
+    reply["input"] = {"thread_ts": {"$ref": reference}}
+    return {
+        "tenant_id": "org:acme", "goal": "reply to the found message",
+        "steps": [lookup, reply],
+    }
+
+
 def test_same_dynamic_contract_composes_slack_calendar_gmail_without_named_workflow():
     definitions = [
         _definition("slack.thread.read", "slack"),
@@ -65,6 +125,83 @@ def test_same_dynamic_contract_composes_slack_calendar_gmail_without_named_workf
     ]
     assert result["shadow_mode"] is True
     assert "schedule_from_slack" not in str(result)
+
+
+def test_compiler_accepts_typed_reference_from_declared_ancestor_output():
+    source, destination = _reference_definitions()
+
+    result = _compiler_for([source, destination]).compile(_reference_plan(
+        source, destination, "lookup.output.message_ts",
+    ))
+
+    assert result["steps"][1]["input"]["thread_ts"] == {
+        "$ref": "lookup.output.message_ts"
+    }
+
+
+def test_compiler_rejects_reference_to_undeclared_output_path():
+    source, destination = _reference_definitions()
+
+    with pytest.raises(PlanRejected, match="undeclared source output path"):
+        _compiler_for([source, destination]).compile(_reference_plan(
+            source, destination, "lookup.output.missing_ts",
+        ))
+
+
+def test_compiler_rejects_incompatible_reference_type():
+    source, destination = _reference_definitions()
+
+    with pytest.raises(PlanRejected, match="incompatible reference type"):
+        _compiler_for([source, destination]).compile(_reference_plan(
+            source, destination, "lookup.output.messages",
+        ))
+
+
+def test_compiler_rejects_reference_to_undeclared_destination_input_path():
+    source, destination = _reference_definitions()
+    destination = replace(destination, input_schema={
+        "type": "object", "additionalProperties": True,
+    })
+
+    with pytest.raises(PlanRejected, match="undeclared destination input path"):
+        _compiler_for([source, destination]).compile(_reference_plan(
+            source, destination, "lookup.output.message_ts",
+        ))
+
+
+def test_compiler_rejects_reference_to_future_step():
+    source, destination = _reference_definitions()
+    plan = _reference_plan(
+        source, destination, "future.output.message_ts", dependencies=(),
+    )
+    plan["steps"][0]["step_id"] = "future"
+    plan["steps"][0]["depends_on"] = ["reply"]
+
+    with pytest.raises(PlanRejected, match="output reference is invalid"):
+        _compiler_for([source, destination]).compile(plan)
+
+
+def test_compiler_rejects_reference_to_unrelated_branch():
+    source, destination = _reference_definitions()
+
+    with pytest.raises(PlanRejected, match="output reference is invalid"):
+        _compiler_for([source, destination]).compile(_reference_plan(
+            source, destination, "lookup.output.message_ts", dependencies=(),
+        ))
+
+
+def test_compiler_rejects_reference_plan_after_catalog_descriptor_drift():
+    source, destination = _reference_definitions()
+    drifted = replace(source, output_schema={
+        "type": "object",
+        "properties": {"replacement_ts": {"type": "string"}},
+        "additionalProperties": False,
+    })
+
+    with pytest.raises(PlanRejected, match="descriptor snapshot is stale"):
+        _compiler_for([drifted, destination]).compile(_reference_plan(
+            source, destination, "lookup.output.message_ts",
+        ))
 
 
 def test_offline_planner_can_list_public_slack_channels():

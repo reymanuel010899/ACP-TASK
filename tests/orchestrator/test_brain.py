@@ -17,6 +17,7 @@ Covers both brain implementations behind the ``Brain`` protocol:
 """
 
 import pytest
+import requests
 from pydantic import ValidationError
 
 from agents.orchestrator.brain import (
@@ -27,6 +28,12 @@ from agents.orchestrator.brain import (
     RuleBrain,
     make_brain,
 )
+from agents.orchestrator.workflow_models import (
+    SlackInterpretation,
+    SlackInterpretationSlot,
+)
+from agents.orchestrator.slack_operations import load_slack_operations
+from libs.integrations.catalog import slack_definitions
 
 
 # -- test doubles ----------------------------------------------------------
@@ -288,20 +295,252 @@ def test_rulebrain_compose_reply_handles_empty_state():
     assert reply.strip()
 
 
-def test_both_brains_expose_same_authority_free_slack_turn_contract():
+_SLACK_REGISTRY = load_slack_operations(slack_definitions())
+SLACK_PROJECTION = list(_SLACK_REGISTRY.model_projection(
+    {item.capability_id for item in slack_definitions()},
+    {flag: True for flag in _SLACK_REGISTRY.family_flags},
+))
+
+
+def test_slack_interpretation_models_forbid_authority_and_provider_ids():
+    with pytest.raises(ValidationError):
+        SlackInterpretation.model_validate({
+            "operations": [{
+                "operation_id": "slack.conversation.read",
+                "confidence": 0.9,
+                "capability_id": "slack.conversation.read",
+            }],
+            "slots": [], "corrections": [], "dependencies": [],
+            "blockers": [], "locale": "en", "confidence": 0.9,
+        })
+    with pytest.raises(ValidationError):
+        SlackInterpretationSlot(
+            name="channel", value="C123456789", provenance="current_turn",
+        )
+    with pytest.raises(ValidationError, match="slot operation index"):
+        SlackInterpretation.model_validate({
+            "operations": [{
+                "operation_id": "slack.conversation.read", "confidence": 0.9,
+            }],
+            "slots": [{
+                "name": "channel", "value": "general",
+                "provenance": "current_turn", "operation_index": 1,
+            }],
+            "corrections": [], "dependencies": [], "blockers": [],
+            "locale": "en", "confidence": 0.9,
+        })
+
+
+def test_rule_and_claude_expose_same_authority_free_slack_contract():
+    context = {"slack_operation_projection": SLACK_PROJECTION}
     rule = RuleBrain().understand_slack(
-        "What did María write in #canal-espanol?", {}
+        "What did María write in #canal-espanol?", context,
     )
     claude = ClaudeBrain(client=None).understand_slack(
-        "What did María write in #canal-espanol?", {}
+        "What did María write in #canal-espanol?", context,
     )
     assert rule == claude
-    assert rule.operation == "read"
+    assert isinstance(rule, SlackInterpretation)
+    assert rule.operations[0].operation_id == "slack.conversation.read"
     assert rule.locale == "en"
-    assert rule.channel_name == "canal-espanol"
-    assert not {"channel_id", "user_id", "connection_id"}.intersection(
+    assert rule.slots[0].name == "channel"
+    assert rule.slots[0].value == "canal-espanol"
+    assert not {
+        "channel_id", "user_id", "connection_id", "capability_id", "scopes",
+    }.intersection(
         rule.model_dump()
     )
+
+
+def test_rule_slack_fallback_uses_manifest_message_slot():
+    result = RuleBrain().understand_slack(
+        "Publica en #general: Hola equipo",
+        {"slack_operation_projection": SLACK_PROJECTION},
+    )
+
+    assert result.operations[0].operation_id == "slack.message.send"
+    assert {slot.name: slot.value for slot in result.slots} == {
+        "channel": "general", "message": "Hola equipo",
+    }
+    assert result.blockers == []
+
+
+def test_groq_understand_slack_uses_json_mode_and_visible_projection(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+    calls = []
+
+    def fake_chat(system, user, json_mode=False):
+        calls.append((system, user, json_mode))
+        return """{
+          "operations": [
+            {"operation_id": "slack.conversation.read", "confidence": 0.94},
+            {"operation_id": "slack.message.send", "confidence": 0.91}
+          ],
+          "slots": [
+            {"name": "channel", "value": "canal-espanol", "provenance": "current_turn"},
+            {"name": "message", "value": "avisa al equipo", "provenance": "current_turn"}
+          ],
+          "corrections": [],
+          "dependencies": [{"operation_index": 1, "depends_on_index": 0}],
+          "blockers": [], "locale": "mixed", "confidence": 0.92
+        }"""
+
+    monkeypatch.setattr(brain, "_chat", fake_chat)
+    result = brain.understand_slack(
+        "Lee #canal-espanol y postea un mensage saying avisa al equipo",
+        {"slack_operation_projection": SLACK_PROJECTION},
+    )
+
+    assert [item.operation_id for item in result.operations] == [
+        "slack.conversation.read", "slack.message.send",
+    ]
+    assert result.dependencies[0].depends_on_index == 0
+    assert set(result.model_dump()) == {
+        "operations", "slots", "corrections", "dependencies", "blockers",
+        "locale", "confidence",
+    }
+    assert calls[0][2] is True
+    assert "slack_operation_projection" in calls[0][1]
+    assert "contract_examples" in calls[0][1]
+    assert "capability_recipe" not in calls[0][1]
+
+
+@pytest.mark.parametrize("payload", [
+    {
+        "operations": [{
+            "operation_id": "slack.conversation.read", "confidence": 0.99,
+            "connection_id": "conn:forged",
+        }],
+        "slots": [], "corrections": [], "dependencies": [], "blockers": [],
+        "locale": "en", "confidence": 0.99,
+    },
+    {
+        "operations": [{"operation_id": "slack.admin.users", "confidence": 0.99}],
+        "slots": [], "corrections": [], "dependencies": [], "blockers": [],
+        "locale": "en", "confidence": 0.99,
+    },
+    {
+        "operations": [{"operation_id": "slack.conversation.read", "confidence": 0.2}],
+        "slots": [], "corrections": [], "dependencies": [], "blockers": [],
+        "locale": "en", "confidence": 0.2,
+    },
+])
+def test_groq_invalid_unregistered_or_low_confidence_output_degrades_once(
+    monkeypatch, payload,
+):
+    brain = GroqBrain(api_key="test-key")
+    monkeypatch.setattr(
+        brain, "_chat", lambda *_args, **_kwargs: __import__("json").dumps(payload)
+    )
+
+    result = brain.understand_slack(
+        "read Slack", {"slack_operation_projection": SLACK_PROJECTION}
+    )
+
+    assert result.operations == []
+    assert result.slots == []
+    assert len(result.blockers) == 1
+    assert result.blockers[0].question
+
+
+def test_groq_preserves_one_named_unsupported_outcome_without_proxying(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+    monkeypatch.setattr(
+        brain,
+        "_chat",
+        lambda *_args, **_kwargs: __import__("json").dumps({
+            "operations": [],
+            "slots": [],
+            "corrections": [],
+            "dependencies": [],
+            "blockers": [{
+                "kind": "unsupported_operation",
+                "field": "operation",
+                "question": "Slack search is not available in this profile.",
+            }],
+            "locale": "en",
+            "confidence": 0.95,
+        }),
+    )
+
+    result = brain.understand_slack(
+        "Search every Slack message about budget",
+        {"slack_operation_projection": SLACK_PROJECTION},
+    )
+
+    assert result.operations == []
+    assert len(result.blockers) == 1
+    assert result.blockers[0].kind == "unsupported_operation"
+
+
+def test_low_overall_confidence_keeps_clear_operation_and_asks_for_missing_slot(
+    monkeypatch,
+):
+    brain = GroqBrain(api_key="test-key")
+    monkeypatch.setattr(
+        brain,
+        "_chat",
+        lambda *_args, **_kwargs: __import__("json").dumps({
+            "operations": [{
+                "operation_id": "slack.message.send", "confidence": 0.92,
+            }],
+            "slots": [{
+                "name": "message", "value": "Aprobado",
+                "provenance": "current_turn", "operation_index": 0,
+            }],
+            "corrections": [], "dependencies": [], "blockers": [],
+            "locale": "es", "confidence": 0.45,
+        }),
+    )
+
+    result = brain.understand_slack(
+        "publica que diga Aprobado",
+        {"slack_operation_projection": SLACK_PROJECTION},
+    )
+
+    assert result.operations[0].operation_id == "slack.message.send"
+    assert result.blockers[0].field == "channel"
+
+
+def test_groq_slack_outage_uses_rule_fallback_for_common_request(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+
+    def unavailable(*_args, **_kwargs):
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr(brain, "_chat", unavailable)
+    result = brain.understand_slack(
+        "leer canal #general",
+        {"slack_operation_projection": SLACK_PROJECTION},
+    )
+
+    assert result.operations[0].operation_id == "slack.conversation.read"
+    assert result.slots[0].value == "general"
+
+
+def test_groq_model_blockers_are_reduced_to_one_precise_question(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+    payload = {
+        "operations": [{
+            "operation_id": "slack.conversation.read", "confidence": 0.9,
+        }],
+        "slots": [], "corrections": [], "dependencies": [],
+        "blockers": [
+            {"kind": "missing_slot", "field": "channel", "question": "Which channel?"},
+            {"kind": "missing_slot", "field": "limit", "question": "How many?"},
+        ],
+        "locale": "en", "confidence": 0.9,
+    }
+    monkeypatch.setattr(
+        brain, "_chat", lambda *_args, **_kwargs: __import__("json").dumps(payload)
+    )
+
+    result = brain.understand_slack(
+        "read Slack", {"slack_operation_projection": SLACK_PROJECTION}
+    )
+
+    assert len(result.blockers) == 1
+    assert result.blockers[0].question == "Which channel?"
 
 
 # -- make_brain factory ----------------------------------------------------

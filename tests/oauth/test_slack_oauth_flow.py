@@ -63,9 +63,11 @@ class Crypto:
 class Vault:
     def __init__(self):
         self.records = {}
+        self.sequence = 0
 
     def store_managed_oauth(self, body, signer=None):
-        credential_id = "cred:%s" % (len(self.records) + 1)
+        self.sequence += 1
+        credential_id = "cred:%s" % self.sequence
         self.records[credential_id] = body
         return 200, {"credential_id": credential_id}
 
@@ -170,6 +172,66 @@ def test_tenant_member_can_see_owner_installation_but_cannot_mutate_it(tmp_path)
     )[0] == 404
 
 
+def test_fresh_consent_repairs_orphaned_workspace_for_same_tenant(tmp_path):
+    service, _crypto, vault = _service(tmp_path)
+    _, started = service.initiate_slack(
+        "session-1", "csrf-1", {"capabilities": ["slack.message.send"]}
+    )
+    first_state = parse_qs(
+        urlsplit(started["authorization_url"]).query
+    )["state"][0]
+    status, first = service.complete_slack(
+        "session-1", "valid-code", first_state
+    )
+    assert status == 200
+    original = service.repository.get_installation(
+        first["connection_id"], "org:acme"
+    )
+    vault.records.pop(original["credential_id"])
+
+    _, restarted = service.initiate_slack(
+        "session-2", "csrf-2", {"capabilities": ["slack.message.send"]}
+    )
+    second_state = parse_qs(
+        urlsplit(restarted["authorization_url"]).query
+    )["state"][0]
+    status, repaired = service.complete_slack(
+        "session-2", "valid-code", second_state
+    )
+
+    assert status == 200
+    assert repaired["connection_id"] == first["connection_id"]
+    current = service.repository.get_installation(
+        repaired["connection_id"], "org:acme"
+    )
+    assert current["principal_id"] == "user:bob"
+    assert current["credential_id"] == "cred:2"
+    assert "cred:2" in vault.records
+
+
+def test_same_tenant_reauthorization_retires_replaced_credential(tmp_path):
+    service, _crypto, vault = _service(tmp_path)
+    connection_ids = []
+    for session_id, csrf_token in (
+        ("session-1", "csrf-1"), ("session-2", "csrf-2")
+    ):
+        _, started = service.initiate_slack(
+            session_id, csrf_token,
+            {"capabilities": ["slack.message.send"]},
+        )
+        state = parse_qs(
+            urlsplit(started["authorization_url"]).query
+        )["state"][0]
+        status, completed = service.complete_slack(
+            session_id, "valid-code", state
+        )
+        assert status == 200
+        connection_ids.append(completed["connection_id"])
+
+    assert connection_ids[0] == connection_ids[1]
+    assert set(vault.records) == {"cred:2"}
+
+
 def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):
     service, _crypto, vault = _service(tmp_path)
     _, started = service.initiate_slack(
@@ -181,3 +243,12 @@ def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):
     assert service.complete_slack("session-1", "valid-code", state)[0] == 200
     assert service.complete_slack("session-1", "valid-code", state)[0] == 400
     assert len(vault.records) == 1
+
+
+def test_configured_local_tenant_fallback_survives_principal_rotation(monkeypatch):
+    from services.oauth.app import _configured_tenant_resolver
+
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+
+    assert _configured_tenant_resolver()("new-principal") == "org:local"

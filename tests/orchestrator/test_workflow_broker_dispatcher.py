@@ -3,10 +3,41 @@ import pytest
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.workflow_broker_dispatcher import (
     WorkflowBrokerDispatcher,
+    _raise_for_broker_failure,
     _matches_approved_template,
 )
 from agents.orchestrator.workflow_repository import WorkflowRepository
-from agents.orchestrator.workflow_executor import RetryableStepError
+from agents.orchestrator.workflow_executor import (
+    AmbiguousStepError, CorrectableStepError, RetryableStepError,
+)
+
+
+def test_safe_write_failures_remain_retryable_instead_of_requiring_reconciliation():
+    with pytest.raises(RetryableStepError):
+        _raise_for_broker_failure(
+            503,
+            {"error": "provider operation failed safely", "outcome_certainty": "safe"},
+            "write",
+        )
+
+    with pytest.raises(AmbiguousStepError):
+        _raise_for_broker_failure(202, {"status": "execution_unknown"}, "write")
+
+
+@pytest.mark.parametrize("status, category", [
+    (403, "scope"),
+    (403, "membership"),
+    (422, "validation"),
+    (409, "provider"),
+])
+def test_deterministic_slack_failures_are_correctable(status, category):
+    with pytest.raises(CorrectableStepError, match=category):
+        _raise_for_broker_failure(
+            status,
+            {"error": "slack_error", "category": category,
+             "outcome_certainty": "safe"},
+            "write",
+        )
 
 
 def test_group_approval_materializes_one_exact_action_and_lease(tmp_path):
@@ -183,6 +214,74 @@ def test_write_rechecks_credential_version_and_connection_before_dispatch(
                                           clock=lambda: 5)
     with pytest.raises((PermissionError, RetryableStepError)):
         dispatcher(step, claim)
+
+
+def test_claimed_old_revision_cannot_dispatch_after_replan(tmp_path):
+    workflows = WorkflowRepository(str(tmp_path / "w.db"))
+    actions = ActionRepository(str(tmp_path / "a.db"))
+    run = workflows.create_run("org:1", "user:1", "goal", 1)
+    first = workflows.create_revision(
+        run["workflow_run_id"], "org:1", "graph:1", [{
+            "step_id": "send",
+            "capability_id": "slack.message.send",
+            "capability_version": "1.0.0",
+            "connection_id": "conn:1",
+            "credential_version": 1,
+            "descriptor_snapshot_hash": "descriptor:1",
+            "input_hash": "input:1",
+            "input": {"channel_id": "C1", "text": "old"},
+            "depends_on": [],
+            "effect": "write",
+        }], 2,
+    )
+    workflows.record_approval(
+        run["workflow_run_id"], first["workflow_revision_id"],
+        "org:1", "graph:1", "user:1", 3,
+    )
+    claim = workflows.claim_ready_step(
+        run["workflow_run_id"], first["workflow_revision_id"],
+        "org:1", "worker", 4, 60,
+    )
+    old_step = workflows.get_revision(
+        run["workflow_run_id"], first["workflow_revision_id"], "org:1"
+    )["steps"][0]
+
+    workflows.create_revision(
+        run["workflow_run_id"], "org:1", "graph:2", [{
+            "step_id": "send",
+            "capability_id": "slack.message.send",
+            "capability_version": "1.0.0",
+            "connection_id": "conn:1",
+            "credential_version": 1,
+            "descriptor_snapshot_hash": "descriptor:2",
+            "input_hash": "input:2",
+            "input": {"channel_id": "C1", "text": "new"},
+            "depends_on": [],
+            "effect": "write",
+        }], 5,
+    )
+
+    class Connections:
+        def get_installation(self, connection_id, tenant_id):
+            return {
+                "connection_id": connection_id,
+                "status": "connected",
+                "credential_id": "cred:1",
+                "credential_version": 1,
+                "granted_scopes": ["chat:write"],
+            }
+
+    class Broker:
+        def execute(self, *_args):
+            raise AssertionError("superseded revision reached provider dispatch")
+
+    dispatcher = WorkflowBrokerDispatcher(
+        actions, Broker(), Connections(), workflows, clock=lambda: 6,
+    )
+
+    with pytest.raises(PermissionError, match="approval expired"):
+        dispatcher(old_step, claim)
+    assert actions.get("proposal:%s:send" % first["workflow_revision_id"]) is None
 
 
 def test_resolved_effect_may_change_only_declared_references():

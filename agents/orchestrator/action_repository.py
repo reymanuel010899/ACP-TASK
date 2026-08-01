@@ -100,11 +100,28 @@ class ActionRepository(object):
     ):
         proposal_id = proposal_id or "proposal-%s" % uuid.uuid4().hex
         idempotency_key = idempotency_key or "action-%s" % uuid.uuid4().hex
+        dynamic = workflow_revision_id not in (None, "legacy")
+        if dynamic:
+            attempt_suffix = ":attempt:%s" % int(attempt)
+            if not idempotency_key.endswith(attempt_suffix):
+                idempotency_key += attempt_suffix
         serialized = canonical_payload(payload)
         payload_hash = canonical_payload_hash(payload)
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                if dynamic:
+                    unresolved = self._connection.execute(
+                        """SELECT version FROM action_proposals
+                           WHERE proposal_id = ?
+                             AND status IN ('executing', 'execution_unknown')
+                           ORDER BY version DESC LIMIT 1""",
+                        (proposal_id,),
+                    ).fetchone()
+                    if unresolved is not None:
+                        raise ValueError(
+                            "prior attempt is still executing or unresolved"
+                        )
                 row = self._connection.execute(
                     "SELECT COALESCE(MAX(version), 0) AS version "
                     "FROM action_proposals WHERE proposal_id = ?",

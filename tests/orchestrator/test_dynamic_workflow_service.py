@@ -5,6 +5,321 @@ from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.planner import descriptor_hash
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from libs.integrations.catalog import TrustedCapabilityDefinition
+from libs.integrations.catalog import slack_definitions
+from agents.orchestrator.workflow_models import (
+    SlackInterpretation,
+    SlackInterpretationCorrection,
+    SlackInterpretationSlot,
+    SlackOperationCandidate,
+    SlackOperationDependency,
+)
+from agents.orchestrator.slack_operations import SlackOperationManifestError
+
+
+class _SlackConnections:
+    def __init__(self, status="connected", scopes=None, enabled=None):
+        self.status = status
+        self.scopes = list(scopes if scopes is not None else ["chat:write"])
+        self.enabled = list(enabled if enabled is not None else ["slack.message.send"])
+
+    def list_tenant_installations(self, tenant, provider):
+        return [{
+            "connection_id": "conn:s", "team_id": "T1", "team_name": "Acme",
+            "status": self.status, "credential_version": 1,
+            "granted_scopes": self.scopes, "enabled_capabilities": self.enabled,
+        }]
+
+
+class _SlackProposalBrain:
+    def __init__(self, proposals):
+        self.proposals = list(proposals)
+        self.contexts = []
+
+    def understand_slack(self, text, context):
+        self.contexts.append(context)
+        return self.proposals.pop(0)
+
+
+def _post_interpretation(channel="general", message="Hola equipo"):
+    return SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.message.send", confidence=0.95,
+        )],
+        slots=[
+            SlackInterpretationSlot(name="channel", value=channel, provenance="current_turn"),
+            SlackInterpretationSlot(name="message", value=message, provenance="current_turn"),
+        ],
+        locale="es", confidence=0.95,
+    )
+
+
+def test_live_registry_brain_post_reaches_exact_approval(tmp_path):
+    brain = _SlackProposalBrain([_post_interpretation()])
+    repository = WorkflowRepository(str(tmp_path / "brain-post.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+
+    turn = service.coordinate_slack_turn(
+        "org:1", "user:1", "publica el mensaje",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+    result = service.advance_slack_turn(
+        turn["conversation_id"], "org:1", "user:1", "publica el mensaje", turn,
+    )
+
+    visible = {item["operation_id"] for item in brain.contexts[0]["slack_operation_projection"]}
+    assert "slack.message.send" in visible
+    assert "slack.reaction.add" not in visible
+    assert result["state"] == "awaiting_approval"
+    assert result["draft"]["destination_label"] == "#general"
+    assert result["draft"]["text"] == "Hola equipo"
+
+
+def test_model_channel_correction_preserves_exact_message(tmp_path):
+    correction = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.message.send", confidence=0.95,
+        )],
+        corrections=[SlackInterpretationCorrection(
+            slot="channel", replacement="anuncios", provenance="current_turn",
+        )], locale="es", confidence=0.95,
+    )
+    brain = _SlackProposalBrain([_post_interpretation(), correction])
+    repository = WorkflowRepository(str(tmp_path / "brain-correction.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    channels = [{"id": "C1", "name": "general"}, {"id": "C2", "name": "anuncios"}]
+    first = service.coordinate_slack_turn("org:1", "user:1", "publica", channels=channels)
+    service.advance_slack_turn(first["conversation_id"], "org:1", "user:1", "publica", first)
+
+    changed = service.coordinate_slack_turn(
+        "org:1", "user:1", "no, mejor anuncios",
+        conversation_id=first["conversation_id"], channels=channels,
+    )
+    result = service.advance_slack_turn(
+        first["conversation_id"], "org:1", "user:1", "no, mejor anuncios", changed,
+    )
+    assert result["draft"]["destination_label"] == "#anuncios"
+    assert result["draft"]["text"] == "Hola equipo"
+
+
+@pytest.mark.parametrize(
+    "connections,writes,expected_code",
+    [
+        (_SlackConnections(status="revoked"), True, "connection_unavailable"),
+        (_SlackConnections(scopes=[]), True, "missing_scope"),
+        (_SlackConnections(), False, "feature_disabled"),
+    ],
+)
+def test_known_but_unavailable_operation_returns_named_recovery(
+    tmp_path, connections, writes, expected_code,
+):
+    brain = _SlackProposalBrain([_post_interpretation()])
+    repository = WorkflowRepository(str(tmp_path / (expected_code + ".db")))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), connections, repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        slack_writes_enabled=writes, clock=lambda: 10,
+    )
+
+    result = service.coordinate_slack_turn("org:1", "user:1", "post message")
+
+    assert result["state"] == "retryable_failure"
+    assert result["error"]["code"] == expected_code
+    assert result["recovery"]["action"]
+
+
+def test_unregistered_model_operation_is_rejected_but_unknown_request_clarifies(tmp_path):
+    unregistered = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.admin.fabricated", confidence=0.99,
+        )], locale="en", confidence=0.99,
+    )
+    unknown = SlackInterpretation(locale="en", confidence=0.1)
+    brain = _SlackProposalBrain([unregistered, unknown])
+    repository = WorkflowRepository(str(tmp_path / "unregistered.db"))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        clock=lambda: 10,
+    )
+
+    rejected = service.coordinate_slack_turn("org:1", "user:1", "admin magic")
+    clarified = service.coordinate_slack_turn("org:1", "user:1", "something mysterious")
+
+    assert rejected["error"]["code"] == "unsupported_operation"
+    assert rejected["recovery"]["action"] == "choose_supported_operation"
+    assert clarified["state"] == "needs_input"
+    assert clarified["need"]["field"] == "operation"
+
+
+def test_model_named_unsupported_outcome_returns_limitation_not_generic_question(tmp_path):
+    unsupported = SlackInterpretation(
+        blockers=[{
+            "kind": "unsupported_operation", "field": "operation",
+            "question": "La búsqueda global no está disponible.",
+        }],
+        locale="es", confidence=0.95,
+    )
+    repository = WorkflowRepository(str(tmp_path / "named-unsupported.db"))
+    service = DynamicWorkflowService(
+        _SlackProposalBrain([unsupported]), slack_definitions(),
+        _SlackConnections(), repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        clock=lambda: 10,
+    )
+
+    result = service.coordinate_slack_turn(
+        "org:1", "user:1", "busca en todo Slack por presupuesto",
+    )
+
+    assert result["state"] == "retryable_failure"
+    assert result["error"]["code"] == "unsupported_operation"
+    assert result["recovery"]["action"] == "choose_supported_operation"
+
+
+def test_live_status_remains_local_and_does_not_fabricate_workflow(tmp_path):
+    interpretation = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.connection.status", confidence=0.99,
+        )], locale="es", confidence=0.99,
+    )
+    brain = _SlackProposalBrain([interpretation])
+    repository = WorkflowRepository(str(tmp_path / "status.db"))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        clock=lambda: 10,
+    )
+
+    result = service.coordinate_slack_turn("org:1", "user:1", "estado de slack")
+
+    assert result["state"] == "completed"
+    assert "Acme" in result["message"]
+    assert repository.list_runnable_revisions() == []
+
+
+def test_policy_hidden_operation_is_not_projected_and_has_named_recovery(tmp_path):
+    brain = _SlackProposalBrain([_post_interpretation()])
+    repository = WorkflowRepository(str(tmp_path / "policy-hidden.db"))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        slack_policy_visible=lambda operation: operation.operation_id != "slack.message.send",
+        clock=lambda: 10,
+    )
+
+    result = service.coordinate_slack_turn("org:1", "user:1", "post message")
+
+    visible = {item["operation_id"] for item in brain.contexts[0]["slack_operation_projection"]}
+    assert "slack.message.send" not in visible
+    assert result["error"]["code"] == "policy_denied"
+    assert result["recovery"]["action"] == "contact_admin"
+
+
+def test_compound_proposal_keeps_dependencies_without_partial_execution(tmp_path):
+    proposal = SlackInterpretation(
+        operations=[
+            SlackOperationCandidate(operation_id="slack.conversation.read", confidence=0.9),
+            SlackOperationCandidate(operation_id="slack.message.send", confidence=0.9),
+        ],
+        slots=[
+            SlackInterpretationSlot(name="channel", value="general", provenance="current_turn"),
+            SlackInterpretationSlot(name="message", value="Resumen listo", provenance="current_turn"),
+        ],
+        dependencies=[SlackOperationDependency(operation_index=1, depends_on_index=0)],
+        locale="es", confidence=0.9,
+    )
+    brain = _SlackProposalBrain([proposal])
+    connections = _SlackConnections(
+        scopes=["channels:history", "chat:write"],
+        enabled=["slack.conversation.read", "slack.message.send"],
+    )
+    repository = WorkflowRepository(str(tmp_path / "compound.db"))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), connections, repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        clock=lambda: 10,
+    )
+
+    turn = service.coordinate_slack_turn(
+        "org:1", "user:1", "lee y publica",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+    result = service.advance_slack_turn(
+        turn["conversation_id"], "org:1", "user:1", "lee y publica", turn,
+    )
+
+    assert [item["operation_id"] for item in turn["compound_operations"]] == [
+        "slack.conversation.read", "slack.message.send",
+    ]
+    assert turn["dependencies"] == [{"operation_index": 1, "depends_on_index": 0}]
+    assert result["error"]["code"] == "compound_execution_unavailable"
+    assert repository.list_runnable_revisions() == []
+
+
+def test_service_fails_closed_when_partial_slack_catalog_cannot_join_manifest(tmp_path):
+    definitions = tuple(
+        item for item in slack_definitions()
+        if item.capability_id != "slack.message.send"
+    )
+
+    with pytest.raises(SlackOperationManifestError, match="not trusted"):
+        DynamicWorkflowService(
+            object(), definitions, _SlackConnections(),
+            WorkflowRepository(str(tmp_path / "catalog-drift.db")),
+        )
+
+
+def test_typed_second_turn_extracts_only_exact_message_for_draft(tmp_path):
+    first = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.message.send", confidence=0.95,
+        )],
+        slots=[SlackInterpretationSlot(
+            name="channel", value="general", provenance="current_turn",
+        )],
+        locale="es", confidence=0.95,
+    )
+    second = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.message.send", confidence=0.95,
+        )],
+        slots=[SlackInterpretationSlot(
+            name="message", value="Hola equipo", provenance="current_turn",
+        )],
+        locale="es", confidence=0.95,
+    )
+    brain = _SlackProposalBrain([first, second])
+    repository = WorkflowRepository(str(tmp_path / "typed-message.db"))
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=ConciergeConversationStore(repository, clock=lambda: 10),
+        clock=lambda: 10,
+    )
+    initial = service.coordinate_slack_turn(
+        "org:1", "user:1", "publica en general",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+
+    answered = service.coordinate_slack_turn(
+        "org:1", "user:1", 'el mensaje es "Hola equipo"',
+        conversation_id=initial["conversation_id"],
+    )
+    result = service.advance_slack_turn(
+        initial["conversation_id"], "org:1", "user:1",
+        'el mensaje es "Hola equipo"', answered,
+    )
+
+    assert answered["need"] is None
+    assert result["state"] == "awaiting_approval"
+    assert result["draft"]["text"] == "Hola equipo"
 
 
 def test_service_uses_connected_catalog_and_persists_approval_ready_revision(tmp_path):
@@ -143,6 +458,38 @@ def test_named_channel_starts_brokered_resolution_and_resumes_exact_post(tmp_pat
     assert resumed["state"] == "awaiting_approval"
     assert resumed["draft"]["destination_label"] == "#general"
     assert resumed["draft"]["text"] == "Hola equipo"
+
+
+def test_public_channel_clarification_creates_authorized_listing_workflow(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "team_name": "Acme",
+                     "status": "connected", "credential_version": 1,
+                     "granted_scopes": ["channels:read"],
+                     "enabled_capabilities": ["slack.channels.list"]}]
+    repository = WorkflowRepository(str(tmp_path / "channel-list.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), Connections(), repository,
+        conversation_store=store, clock=lambda: 10, shadow_mode=False,
+    )
+    first = service.coordinate_slack_turn("org:1", "user:1", "Slack")
+    second = service.coordinate_slack_turn(
+        "org:1", "user:1", "sí, tengo canales públicos",
+        conversation_id=first["conversation_id"],
+    )
+
+    result = service.advance_slack_turn(
+        first["conversation_id"], "org:1", "user:1",
+        "sí, tengo canales públicos", second,
+    )
+
+    assert result["state"] == "retrieving"
+    revision = repository.get_revision_by_id(
+        result["workflow"]["revisionId"], "org:1"
+    )
+    assert revision["steps"][0]["capability_id"] == "slack.channels.list"
 
 
 def test_completed_read_presentation_is_generated_once_across_polls(tmp_path):
