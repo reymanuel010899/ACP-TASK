@@ -16,6 +16,14 @@ class WorkflowRepository(object):
         "ready", "awaiting_approval", "executing", "succeeded",
         "retryable_failure", "unknown_outcome", "cancelled", "expired", "closed",
     })
+    CONVERSATION_STATE_FIELDS = frozenset({
+        "locale", "operation", "operation_candidates", "active_connection",
+        "active_channel", "active_person", "active_thread", "active_message",
+        "active_file", "active_reaction", "read_period", "pending_draft",
+        "effect_candidates", "known_inputs", "slot_state", "corrections",
+        "dependencies", "blockers", "entity_refs", "blocking_need",
+        "resolution_request",
+    })
 
     def __init__(self, database_path, content_crypto=None):
         self.content_crypto = content_crypto
@@ -132,6 +140,7 @@ class WorkflowRepository(object):
                 tenant_id TEXT NOT NULL,
                 principal_id TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'interpreting',
+                state_version INTEGER NOT NULL DEFAULT 1 CHECK(state_version > 0),
                 state_json TEXT NOT NULL,
                 presentation_json TEXT,
                 presentation_hash TEXT,
@@ -155,6 +164,103 @@ class WorkflowRepository(object):
                 workflow_revision_id TEXT,
                 applied_at INTEGER NOT NULL,
                 PRIMARY KEY(conversation_id, tenant_id, principal_id, idempotency_key),
+                FOREIGN KEY(conversation_id, tenant_id, principal_id)
+                    REFERENCES concierge_conversations(
+                        conversation_id, tenant_id, principal_id
+                    )
+            );
+            CREATE TABLE IF NOT EXISTS concierge_turns (
+                conversation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                client_turn_id TEXT NOT NULL,
+                turn_version INTEGER NOT NULL CHECK(turn_version > 0),
+                base_state_version INTEGER NOT NULL CHECK(base_state_version > 0),
+                request_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                response_hash TEXT,
+                response_json TEXT,
+                status TEXT NOT NULL CHECK(status IN (
+                    'started', 'committed', 'conflicted', 'failed'
+                )),
+                content_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                committed_at INTEGER,
+                PRIMARY KEY(
+                    conversation_id, tenant_id, principal_id, client_turn_id
+                ),
+                UNIQUE(
+                    conversation_id, tenant_id, principal_id, turn_version
+                ),
+                FOREIGN KEY(conversation_id, tenant_id, principal_id)
+                    REFERENCES concierge_conversations(
+                        conversation_id, tenant_id, principal_id
+                    )
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS concierge_turns_one_active_base
+                ON concierge_turns(
+                    conversation_id, tenant_id, principal_id, base_state_version
+                ) WHERE status = 'started';
+            CREATE TABLE IF NOT EXISTS slack_conversation_entities (
+                entity_ref_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                team_id TEXT NOT NULL,
+                entity_version INTEGER NOT NULL CHECK(entity_version > 0),
+                entity_hash TEXT NOT NULL,
+                entity_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                observed_at INTEGER NOT NULL,
+                stale_after INTEGER NOT NULL,
+                superseded_at INTEGER,
+                PRIMARY KEY(entity_ref_id, tenant_id),
+                UNIQUE(tenant_id, conversation_id, entity_ref_id, entity_version),
+                FOREIGN KEY(conversation_id, tenant_id, principal_id)
+                    REFERENCES concierge_conversations(
+                        conversation_id, tenant_id, principal_id
+                    )
+            );
+            CREATE TABLE IF NOT EXISTS slack_resolver_runs (
+                resolver_run_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                query_hash TEXT NOT NULL,
+                requested_state_version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                cursor_json TEXT NOT NULL DEFAULT '{}',
+                budget_json TEXT NOT NULL DEFAULT '{}',
+                pages_processed INTEGER NOT NULL DEFAULT 0,
+                candidates_seen INTEGER NOT NULL DEFAULT 0,
+                retry_at INTEGER,
+                last_error_code TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                PRIMARY KEY(resolver_run_id, tenant_id),
+                UNIQUE(tenant_id, conversation_id, resolver_run_id),
+                FOREIGN KEY(conversation_id, tenant_id, principal_id)
+                    REFERENCES concierge_conversations(
+                        conversation_id, tenant_id, principal_id
+                    )
+            );
+            CREATE TABLE IF NOT EXISTS concierge_outcome_events (
+                event_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                event_sequence INTEGER NOT NULL CHECK(event_sequence > 0),
+                event_type TEXT NOT NULL,
+                operation_family TEXT,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(event_id, tenant_id),
+                UNIQUE(tenant_id, conversation_id, event_sequence),
                 FOREIGN KEY(conversation_id, tenant_id, principal_id)
                     REFERENCES concierge_conversations(
                         conversation_id, tenant_id, principal_id
@@ -212,6 +318,10 @@ class WorkflowRepository(object):
             "workflow_approvals", "authorization_mode",
             "TEXT NOT NULL DEFAULT 'explicit_write'",
         )
+        self._ensure_table_column(
+            "concierge_conversations", "state_version",
+            "INTEGER NOT NULL DEFAULT 1 CHECK(state_version > 0)",
+        )
 
     def _ensure_step_column(self, name, declaration):
         self._ensure_table_column("workflow_steps", name, declaration)
@@ -223,7 +333,7 @@ class WorkflowRepository(object):
             ).fetchall()
         }
         if name not in columns:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 "ALTER TABLE %s ADD COLUMN %s %s" % (table, name, declaration)
             )
 
@@ -1080,6 +1190,7 @@ class WorkflowRepository(object):
             "tenant_id": row["tenant_id"],
             "principal_id": row["principal_id"],
             "status": row["status"],
+            "state_version": int(row["state_version"]),
             "workflow_run_id": row["workflow_run_id"],
             "workflow_revision_id": row["workflow_revision_id"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
@@ -1098,13 +1209,10 @@ class WorkflowRepository(object):
 
     def update_conversation(
         self, conversation_id, tenant_id, principal_id, changes, now_ts,
-        ttl_seconds=180,
+        ttl_seconds=180, expected_version=None,
     ):
-        allowed = {
-            "status", "locale", "operation", "active_connection",
-            "active_channel", "active_person", "active_thread", "read_period",
-            "pending_draft", "blocking_need", "workflow_run_id",
-            "workflow_revision_id", "resolution_request",
+        allowed = set(self.CONVERSATION_STATE_FIELDS) | {
+            "status", "workflow_run_id", "workflow_revision_id",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -1116,6 +1224,10 @@ class WorkflowRepository(object):
             )
             if current is None:
                 raise KeyError("conversation unavailable")
+            if expected_version is not None and int(
+                current["state_version"]
+            ) != int(expected_version):
+                raise RuntimeError("conversation version conflict")
             state = {
                 key: current.get(key) for key in allowed
                 if key not in ("status", "workflow_run_id", "workflow_revision_id")
@@ -1134,19 +1246,281 @@ class WorkflowRepository(object):
             revision_id = changes.get(
                 "workflow_revision_id", current["workflow_revision_id"]
             )
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """UPDATE concierge_conversations SET status = ?, state_json = ?,
                        workflow_run_id = ?, workflow_revision_id = ?, updated_at = ?,
-                       expires_at = ?, content_expires_at = ?
-                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?""",
+                       expires_at = ?, content_expires_at = ?,
+                       state_version = state_version + 1
+                   WHERE conversation_id = ? AND tenant_id = ? AND principal_id = ?
+                     AND state_version = ?""",
                 (status, self._encode_conversation_content(
                     state, tenant_id, conversation_id, "state"
                 ), run_id, revision_id, now_ts, now_ts + int(ttl_seconds),
-                 now_ts + int(ttl_seconds), conversation_id, tenant_id, principal_id),
+                 now_ts + int(ttl_seconds), conversation_id, tenant_id, principal_id,
+                 int(current["state_version"])),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError("conversation version conflict")
         return self.get_conversation(
             conversation_id, tenant_id, principal_id, now_ts
         )
+
+    def begin_conversation_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, request, now_ts, content_ttl_seconds=180,
+    ):
+        """Reserve one owner-bound client turn without advancing conversation state."""
+        if not client_turn_id or not isinstance(request, dict):
+            raise ValueError("client_turn_id and request object are required")
+        expected_version = int(expected_version)
+        now_ts = int(now_ts)
+        request_raw = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        request_hash = hashlib.sha256(request_raw.encode("utf-8")).hexdigest()
+        with self._lock:
+            current = self.get_conversation(
+                conversation_id, tenant_id, principal_id, now_ts
+            )
+            if current is None:
+                raise KeyError("conversation unavailable")
+            prior = self._connection.execute(
+                """SELECT * FROM concierge_turns
+                   WHERE conversation_id = ? AND tenant_id = ?
+                     AND principal_id = ? AND client_turn_id = ?""",
+                (conversation_id, tenant_id, principal_id, client_turn_id),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ValueError(
+                        "client turn id was used for a different request"
+                    )
+                return self._conversation_turn_result(
+                    prior, current, duplicate=True
+                )
+            if int(current["state_version"]) != expected_version:
+                raise RuntimeError("conversation version conflict")
+            active = self._connection.execute(
+                """SELECT client_turn_id FROM concierge_turns
+                   WHERE conversation_id = ? AND tenant_id = ?
+                     AND principal_id = ? AND base_state_version = ?
+                     AND status = 'started'""",
+                (conversation_id, tenant_id, principal_id, expected_version),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError("conversation turn already in progress")
+            turn_version = self._connection.execute(
+                """SELECT COALESCE(MAX(turn_version), 0) + 1 AS next_version
+                   FROM concierge_turns WHERE conversation_id = ?
+                     AND tenant_id = ? AND principal_id = ?""",
+                (conversation_id, tenant_id, principal_id),
+            ).fetchone()["next_version"]
+            try:
+                self._connection.execute(
+                    """INSERT INTO concierge_turns(
+                           conversation_id, tenant_id, principal_id, client_turn_id,
+                           turn_version, base_state_version, request_hash,
+                           request_json, status, content_expires_at, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)""",
+                    (
+                        conversation_id, tenant_id, principal_id, client_turn_id,
+                        int(turn_version), expected_version, request_hash,
+                        self._encode_conversation_content(
+                            request, tenant_id, conversation_id,
+                            "turn:%s:request" % client_turn_id,
+                        ),
+                        now_ts + int(content_ttl_seconds), now_ts,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError(
+                    "conversation turn already in progress"
+                ) from exc
+            row = self._connection.execute(
+                """SELECT * FROM concierge_turns
+                   WHERE conversation_id = ? AND tenant_id = ?
+                     AND principal_id = ? AND client_turn_id = ?""",
+                (conversation_id, tenant_id, principal_id, client_turn_id),
+            ).fetchone()
+        return self._conversation_turn_result(row, current, duplicate=False)
+
+    def commit_conversation_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, changes, response, now_ts, ttl_seconds=180,
+    ):
+        """Atomically apply a turn, advance CAS state, and append its event."""
+        if not isinstance(changes, dict) or not isinstance(response, dict):
+            raise ValueError("turn changes and response must be objects")
+        allowed = set(self.CONVERSATION_STATE_FIELDS) | {
+            "status", "workflow_run_id", "workflow_revision_id",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError("unsupported conversation fields: %s" % sorted(unknown))
+        expected_version = int(expected_version)
+        now_ts = int(now_ts)
+        conflict = False
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                turn = self._connection.execute(
+                    """SELECT * FROM concierge_turns
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ? AND client_turn_id = ?""",
+                    (conversation_id, tenant_id, principal_id, client_turn_id),
+                ).fetchone()
+                if turn is None:
+                    raise KeyError("conversation turn unavailable")
+                current_row = self._connection.execute(
+                    """SELECT * FROM concierge_conversations
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ?""",
+                    (conversation_id, tenant_id, principal_id),
+                ).fetchone()
+                if current_row is None or current_row["status"] in (
+                    "closed", "expired"
+                ):
+                    raise KeyError("conversation unavailable")
+                current = self._conversation(current_row)
+                if turn["status"] == "committed":
+                    self._connection.execute("COMMIT")
+                    return self._conversation_turn_result(
+                        turn, current, duplicate=True
+                    )
+                if (
+                    turn["status"] != "started"
+                    or int(turn["base_state_version"]) != expected_version
+                    or int(current["state_version"]) != expected_version
+                ):
+                    if turn["status"] == "started":
+                        self._connection.execute(
+                            """UPDATE concierge_turns SET status = 'conflicted'
+                               WHERE conversation_id = ? AND tenant_id = ?
+                                 AND principal_id = ? AND client_turn_id = ?""",
+                            (conversation_id, tenant_id, principal_id, client_turn_id),
+                        )
+                    self._connection.execute("COMMIT")
+                    conflict = True
+                else:
+                    state = {
+                        key: current.get(key)
+                        for key in self.CONVERSATION_STATE_FIELDS
+                        if current.get(key) is not None
+                    }
+                    for key, value in changes.items():
+                        if key not in {
+                            "status", "workflow_run_id", "workflow_revision_id"
+                        }:
+                            if value is None:
+                                state.pop(key, None)
+                            else:
+                                state[key] = value
+                    blocking_need = state.get("blocking_need")
+                    if blocking_need is not None and not isinstance(
+                        blocking_need, dict
+                    ):
+                        raise ValueError("blocking_need must be one object")
+                    status = changes.get("status", current["status"])
+                    if status not in self.CONVERSATION_STATUSES:
+                        raise ValueError("invalid conversation status")
+                    run_id = changes.get(
+                        "workflow_run_id", current["workflow_run_id"]
+                    )
+                    revision_id = changes.get(
+                        "workflow_revision_id", current["workflow_revision_id"]
+                    )
+                    updated = self._connection.execute(
+                        """UPDATE concierge_conversations SET status = ?,
+                               state_json = ?, workflow_run_id = ?,
+                               workflow_revision_id = ?, updated_at = ?,
+                               expires_at = ?, content_expires_at = ?,
+                               state_version = state_version + 1
+                           WHERE conversation_id = ? AND tenant_id = ?
+                             AND principal_id = ? AND state_version = ?""",
+                        (
+                            status,
+                            self._encode_conversation_content(
+                                state, tenant_id, conversation_id, "state"
+                            ),
+                            run_id, revision_id, now_ts,
+                            now_ts + int(ttl_seconds),
+                            now_ts + int(ttl_seconds),
+                            conversation_id, tenant_id, principal_id,
+                            expected_version,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("conversation version conflict")
+                    response_raw = json.dumps(
+                        response, sort_keys=True, separators=(",", ":")
+                    )
+                    response_hash = hashlib.sha256(
+                        response_raw.encode("utf-8")
+                    ).hexdigest()
+                    self._connection.execute(
+                        """UPDATE concierge_turns SET status = 'committed',
+                               response_hash = ?, response_json = ?, committed_at = ?
+                           WHERE conversation_id = ? AND tenant_id = ?
+                             AND principal_id = ? AND client_turn_id = ?
+                             AND status = 'started'""",
+                        (
+                            response_hash,
+                            self._encode_conversation_content(
+                                response, tenant_id, conversation_id,
+                                "turn:%s:response" % client_turn_id,
+                            ),
+                            now_ts, conversation_id, tenant_id, principal_id,
+                            client_turn_id,
+                        ),
+                    )
+                    self.append_outbox_event(
+                        tenant_id, "conversation", conversation_id,
+                        "conversation.turn_committed",
+                        {
+                            "client_turn_id": client_turn_id,
+                            "state_version": expected_version + 1,
+                            "request_hash": turn["request_hash"],
+                            "response_hash": response_hash,
+                        },
+                        "conversation-turn:%s:%s" % (
+                            conversation_id, client_turn_id
+                        ),
+                        now_ts,
+                    )
+                    self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+            if conflict:
+                raise RuntimeError("conversation version conflict")
+            turn = self._connection.execute(
+                """SELECT * FROM concierge_turns
+                   WHERE conversation_id = ? AND tenant_id = ?
+                     AND principal_id = ? AND client_turn_id = ?""",
+                (conversation_id, tenant_id, principal_id, client_turn_id),
+            ).fetchone()
+            current = self.get_conversation(
+                conversation_id, tenant_id, principal_id, now_ts
+            )
+        return self._conversation_turn_result(turn, current, duplicate=False)
+
+    def _conversation_turn_result(self, row, conversation, duplicate):
+        response = self._decode_conversation_content(
+            row["response_json"], row["tenant_id"], row["conversation_id"],
+            "turn:%s:response" % row["client_turn_id"], None,
+        )
+        return {
+            "turn": {
+                "client_turn_id": row["client_turn_id"],
+                "turn_version": int(row["turn_version"]),
+                "base_state_version": int(row["base_state_version"]),
+                "status": row["status"],
+                "request_hash": row["request_hash"],
+                "response_hash": row["response_hash"],
+            },
+            "conversation": conversation,
+            "response": response,
+            "duplicate": bool(duplicate),
+        }
 
     def apply_conversation_answer(
         self, conversation_id, tenant_id, principal_id, idempotency_key,
@@ -1453,8 +1827,10 @@ class WorkflowRepository(object):
         now_ts = int(now_ts)
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         with self._lock:
+            owns_transaction = not self._connection.in_transaction
             try:
-                self._connection.execute("BEGIN IMMEDIATE")
+                if owns_transaction:
+                    self._connection.execute("BEGIN IMMEDIATE")
                 prior = self._connection.execute(
                     "SELECT * FROM workflow_outbox WHERE tenant_id = ? AND dedupe_key = ?",
                     (tenant_id, dedupe_key),
@@ -1467,7 +1843,8 @@ class WorkflowRepository(object):
                         or prior["payload_json"] != payload_json
                     ):
                         raise ValueError("outbox dedupe key was reused for another event")
-                    self._connection.execute("COMMIT")
+                    if owns_transaction:
+                        self._connection.execute("COMMIT")
                     return self._outbox_event(prior)
                 row = self._connection.execute(
                     "SELECT COALESCE(MAX(aggregate_version), 0) AS version "
@@ -1490,9 +1867,11 @@ class WorkflowRepository(object):
                 event = self._connection.execute(
                     "SELECT * FROM workflow_outbox WHERE event_id = ?", (event_id,)
                 ).fetchone()
-                self._connection.execute("COMMIT")
+                if owns_transaction:
+                    self._connection.execute("COMMIT")
             except Exception:
-                self._connection.execute("ROLLBACK")
+                if owns_transaction and self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
                 raise
         return self._outbox_event(event)
 

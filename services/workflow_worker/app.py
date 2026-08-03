@@ -90,7 +90,11 @@ class WorkflowWorker:
         return drained
 
     def _project_event(self, event, now):
-        if event.get("event_type") != "workflow.outcome":
+        event_type = event.get("event_type")
+        if event_type not in {
+            "workflow.outcome",
+            "conversation.turn_committed",
+        }:
             raise ValueError("unsupported outbox event type")
         watermark = self.workflows.get_projection_watermark(
             event["tenant_id"], event["aggregate_type"], event["aggregate_id"]
@@ -99,12 +103,13 @@ class WorkflowWorker:
             event["aggregate_version"]
         ):
             return False
-        payload = event.get("payload") or {}
-        projected = self.workflows.sync_conversation_workflow_outcome(
-            payload["revision_id"], event["tenant_id"], payload["outcome"], now
-        )
-        if not projected:
-            raise RuntimeError("conversation outcome was not projectable")
+        if event_type == "workflow.outcome":
+            payload = event.get("payload") or {}
+            projected = self.workflows.sync_conversation_workflow_outcome(
+                payload["revision_id"], event["tenant_id"], payload["outcome"], now
+            )
+            if not projected:
+                raise RuntimeError("conversation outcome was not projectable")
         advanced = self.workflows.advance_projection_watermark(
             event["tenant_id"], event["aggregate_type"], event["aggregate_id"],
             event["aggregate_version"], event["event_id"], now,

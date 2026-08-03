@@ -191,12 +191,24 @@ class ConciergeConversationState(BaseModel):
     tenant_id: str
     principal_id: str
     status: str = "interpreting"
+    state_version: int = 1
     locale: Optional[str] = None
     operation: Optional[str] = None
+    operation_candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    known_inputs: Dict[str, Any] = Field(default_factory=dict)
+    slot_state: List[Dict[str, Any]] = Field(default_factory=list)
+    corrections: List[Dict[str, Any]] = Field(default_factory=list)
+    dependencies: List[Dict[str, Any]] = Field(default_factory=list)
+    blockers: List[Dict[str, Any]] = Field(default_factory=list)
+    effect_candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    entity_refs: List[Dict[str, Any]] = Field(default_factory=list)
     active_connection: Optional[Dict[str, Any]] = None
     active_channel: Optional[Dict[str, Any]] = None
     active_person: Optional[Dict[str, Any]] = None
     active_thread: Optional[Dict[str, Any]] = None
+    active_message: Optional[Dict[str, Any]] = None
+    active_file: Optional[Dict[str, Any]] = None
+    active_reaction: Optional[Dict[str, Any]] = None
     read_period: Optional[Dict[str, Any]] = None
     pending_draft: Optional[Dict[str, Any]] = None
     workflow_run_id: Optional[str] = None

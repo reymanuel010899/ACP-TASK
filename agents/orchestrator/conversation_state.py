@@ -504,10 +504,33 @@ class ConciergeConversationStore:
             include_terminal=include_terminal,
         )
 
-    def update(self, conversation_id, tenant_id, principal_id, **changes):
+    def update(
+        self, conversation_id, tenant_id, principal_id,
+        expected_version=None, **changes
+    ):
         return self.repository.update_conversation(
             conversation_id, tenant_id, principal_id, changes,
             int(self.clock()), self.ttl_seconds,
+            expected_version=expected_version,
+        )
+
+    def begin_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, request,
+    ):
+        return self.repository.begin_conversation_turn(
+            conversation_id, tenant_id, principal_id, client_turn_id,
+            expected_version, request, int(self.clock()), self.ttl_seconds,
+        )
+
+    def commit_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, changes, response,
+    ):
+        return self.repository.commit_conversation_turn(
+            conversation_id, tenant_id, principal_id, client_turn_id,
+            expected_version, changes, response, int(self.clock()),
+            self.ttl_seconds,
         )
 
     def record_need(self, conversation_id, tenant_id, principal_id, need):

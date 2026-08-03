@@ -66,3 +66,47 @@ def test_worker_enqueues_then_projects_terminal_outcome():
         "org:1", "conversation", "conversation:1", 1
     )
     assert repository.completed == ("event:1", "org:1", "worker:1")
+
+
+def test_worker_acknowledges_committed_turn_event_without_mutating_conversation():
+    class Repository:
+        def __init__(self):
+            self.event = {
+                "event_id": "event:turn", "tenant_id": "org:1",
+                "aggregate_type": "conversation",
+                "aggregate_id": "conversation:1", "aggregate_version": 2,
+                "event_type": "conversation.turn_committed",
+                "payload": {"client_turn_id": "turn:1", "state_version": 2},
+            }
+
+        def list_runnable_revisions(self):
+            return []
+
+        def claim_outbox_event(self, worker, now, visibility):
+            event, self.event = self.event, None
+            return event
+
+        def sync_conversation_workflow_outcome(self, *args):
+            raise AssertionError("turn event must not reapply conversation state")
+
+        def advance_projection_watermark(
+            self, tenant, kind, aggregate, version, event, now
+        ):
+            self.watermark = (tenant, kind, aggregate, version, event)
+            return True
+
+        def complete_outbox_event(self, event, tenant, worker, now):
+            self.completed = (event, tenant, worker)
+            return True
+
+    repository = Repository()
+
+    class Executor:
+        pass
+
+    WorkflowWorker(repository, Executor(), "worker:1").run_once()
+
+    assert repository.watermark == (
+        "org:1", "conversation", "conversation:1", 2, "event:turn"
+    )
+    assert repository.completed == ("event:turn", "org:1", "worker:1")

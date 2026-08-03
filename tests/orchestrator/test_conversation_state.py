@@ -166,3 +166,140 @@ def test_presentation_is_encrypted_then_purged_but_hash_remains(tmp_path):
     )
     assert audit["presentation"] is None
     assert audit["presentation_hash"] == presentation_hash
+
+
+def test_turn_commit_is_versioned_idempotent_and_emits_one_outbox_event(tmp_path):
+    store = _store(tmp_path)
+    created = store.create("org:acme", "user:alice", "conversation:turn")
+    assert created["state_version"] == 1
+
+    started = store.begin_turn(
+        "conversation:turn", "org:acme", "user:alice", "turn:client-1",
+        expected_version=1, request={"text": "Send a Slack message"},
+    )
+    assert started["duplicate"] is False
+    committed = store.commit_turn(
+        "conversation:turn", "org:acme", "user:alice", "turn:client-1",
+        expected_version=1,
+        changes={
+            "status": "needs_input",
+            "operation": "post",
+            "blocking_need": {
+                "kind": "missing", "field": "channel",
+                "question": "Which channel?",
+            },
+        },
+        response={"state": "needs_input", "need": {"field": "channel"}},
+    )
+
+    assert committed["conversation"]["state_version"] == 2
+    assert committed["conversation"]["operation"] == "post"
+    assert committed["response"]["state"] == "needs_input"
+    replay = store.begin_turn(
+        "conversation:turn", "org:acme", "user:alice", "turn:client-1",
+        expected_version=1, request={"text": "Send a Slack message"},
+    )
+    assert replay["duplicate"] is True
+    assert replay["response"] == committed["response"]
+
+    rows = store.repository._connection.execute(
+        "SELECT count(*) AS count FROM concierge_turns"
+    ).fetchone()
+    assert rows["count"] == 1
+    assert store.repository.count_outbox_events(
+        "org:acme", "conversation-turn:conversation:turn:turn:client-1"
+    ) == 1
+
+
+def test_turn_key_reuse_and_parallel_base_version_fail_closed(tmp_path):
+    store = _store(tmp_path)
+    store.create("org:acme", "user:alice", "conversation:cas")
+    store.begin_turn(
+        "conversation:cas", "org:acme", "user:alice", "turn:a", 1,
+        {"text": "first"},
+    )
+    with pytest.raises(RuntimeError, match="turn already in progress"):
+        store.begin_turn(
+            "conversation:cas", "org:acme", "user:alice", "turn:b", 1,
+            {"text": "second"},
+        )
+    store.commit_turn(
+        "conversation:cas", "org:acme", "user:alice", "turn:a", 1,
+        {"locale": "en"}, {"state": "interpreting"},
+    )
+
+    with pytest.raises(RuntimeError, match="conversation version conflict"):
+        store.begin_turn(
+            "conversation:cas", "org:acme", "user:alice", "turn:b", 1,
+            {"text": "second"},
+        )
+    current = store.get("conversation:cas", "org:acme", "user:alice")
+    assert current["state_version"] == 2
+    assert current["locale"] == "en"
+
+    with pytest.raises(ValueError, match="different request"):
+        store.begin_turn(
+            "conversation:cas", "org:acme", "user:alice", "turn:a", 1,
+            {"text": "changed"},
+        )
+
+
+def test_turn_commit_rolls_back_state_when_outbox_append_fails(tmp_path):
+    store = _store(tmp_path)
+    store.create("org:acme", "user:alice", "conversation:atomic")
+    store.begin_turn(
+        "conversation:atomic", "org:acme", "user:alice", "turn:atomic", 1,
+        {"text": "send it"},
+    )
+    store.repository.append_outbox_event(
+        "org:acme", "conversation", "conversation:atomic", "test.conflict",
+        {"different": True},
+        "conversation-turn:conversation:atomic:turn:atomic", 100,
+    )
+
+    with pytest.raises(ValueError, match="dedupe key was reused"):
+        store.commit_turn(
+            "conversation:atomic", "org:acme", "user:alice", "turn:atomic", 1,
+            {"locale": "es"}, {"state": "interpreting"},
+        )
+
+    current = store.get("conversation:atomic", "org:acme", "user:alice")
+    assert current["state_version"] == 1
+    assert current.get("locale") is None
+    turn = store.repository._connection.execute(
+        "SELECT status, response_json FROM concierge_turns "
+        "WHERE conversation_id = ? AND client_turn_id = ?",
+        ("conversation:atomic", "turn:atomic"),
+    ).fetchone()
+    assert dict(turn) == {"status": "started", "response_json": None}
+
+
+def test_turn_lookup_is_tenant_principal_scoped_and_survives_restart(tmp_path):
+    database = str(tmp_path / "workflows.sqlite3")
+    repository = WorkflowRepository(database)
+    store = ConciergeConversationStore(repository, Clock(), ttl_seconds=180)
+    store.create("org:acme", "user:alice", "conversation:restart")
+    store.begin_turn(
+        "conversation:restart", "org:acme", "user:alice", "turn:stable", 1,
+        {"text": "hello"},
+    )
+    store.commit_turn(
+        "conversation:restart", "org:acme", "user:alice", "turn:stable", 1,
+        {"locale": "en"}, {"state": "ready"},
+    )
+    repository.close()
+
+    restarted = ConciergeConversationStore(
+        WorkflowRepository(database), Clock(), ttl_seconds=180
+    )
+    replay = restarted.begin_turn(
+        "conversation:restart", "org:acme", "user:alice", "turn:stable", 1,
+        {"text": "hello"},
+    )
+    assert replay["duplicate"] is True
+    assert replay["response"] == {"state": "ready"}
+    with pytest.raises(KeyError, match="conversation unavailable"):
+        restarted.begin_turn(
+            "conversation:restart", "org:other", "user:alice", "turn:stable", 1,
+            {"text": "hello"},
+        )
