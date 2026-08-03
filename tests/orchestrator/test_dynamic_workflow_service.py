@@ -896,7 +896,6 @@ def test_a_grounded_read_compiles_without_the_planner_brain(tmp_path):
     assert step["capability_id"] == "slack.conversation.read"
     assert step["effect"] == "read"
     assert step["input"]["channel_id"] == "C1"
-    assert step["input"]["limit"] == 200
     assert int(step["input"]["latest"]) == 1_000_000
     assert int(step["input"]["oldest"]) == 1_000_000 - 7 * 86400
     assert repository.revision_authorization_mode(
@@ -946,6 +945,7 @@ def test_listing_channels_needs_no_channel_and_no_period(tmp_path):
     step = revision["steps"][0]
     assert step["capability_id"] == "slack.channels.list"
     assert step["input"] == {"limit": 200}
+    _assert_matches_capability_schema(step)
 
 
 def test_a_read_without_scope_or_target_fails_closed(tmp_path):
@@ -960,3 +960,37 @@ def test_a_read_without_scope_or_target_fails_closed(tmp_path):
             "org:1", "user:1", "list_private_channels",
             {"active_connection": {"id": "conn:s"}},
         )
+
+
+def _assert_matches_capability_schema(step):
+    """Every compiled read must satisfy the descriptor the broker enforces."""
+    import jsonschema
+
+    definition = next(
+        item for item in slack_definitions()
+        if item.capability_id == step["capability_id"]
+    )
+    jsonschema.validate(step["input"], definition.input_schema)
+
+
+@pytest.mark.parametrize("operation,resolved", [
+    ("read", {"active_connection": {"id": "conn:s"},
+              "active_channel": {"id": "C1"}}),
+    ("summarize", {"active_connection": {"id": "conn:s"},
+                   "active_channel": {"id": "C1"},
+                   "read_period": {"days": 30}}),
+    ("read", {"active_connection": {"id": "conn:s"},
+              "active_channel": {"id": "C1"},
+              "active_thread": {"channel_id": "C1", "thread_ts": "1710.1"}}),
+    ("list_channels", {"active_connection": {"id": "conn:s"}}),
+])
+def test_every_compiled_read_satisfies_its_capability_schema(
+    tmp_path, operation, resolved,
+):
+    _, _, service = _read_service(tmp_path, "read-schema-%s.db" % operation)
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", operation, resolved,
+    )
+
+    _assert_matches_capability_schema(revision["steps"][0])

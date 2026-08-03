@@ -300,7 +300,15 @@ class DynamicWorkflowService:
         "summarize": "slack.conversation.read",
     }
     DEFAULT_READ_DAYS = 7
-    READ_PAGE_LIMIT = 200
+    # Each capability declares its own maximum; exceeding it is rejected as a
+    # schema violation at the broker, not clamped.
+    READ_PAGE_LIMITS = {
+        "slack.channels.list": 200,
+        "slack.private_channels.list": 200,
+        "slack.conversation.read": 100,
+        "slack.thread.read": 100,
+        "slack.private_conversation.read": 100,
+    }
 
     def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved):
         """Compile the read workflow deterministically.
@@ -355,22 +363,23 @@ class DynamicWorkflowService:
 
     def _slack_read_input(self, capability_id, resolved, thread, now):
         """Bound every read by page size and an explicit, disclosed period."""
+        limit = self.READ_PAGE_LIMITS[capability_id]
         if capability_id in {"slack.channels.list", "slack.private_channels.list"}:
-            return {"limit": self.READ_PAGE_LIMIT}
+            return {"limit": limit}
         channel = resolved.get("active_channel") or {}
         channel_id = thread.get("channel_id") or channel.get("id")
         if not channel_id:
             raise ValueError("Slack read target is unresolved")
+        if capability_id == "slack.private_conversation.read":
+            return {"channel_id": channel_id, "limit": limit}
         period = resolved.get("read_period") or {}
         days = int(period.get("days") or self.DEFAULT_READ_DAYS)
         payload = {
-            "channel_id": channel_id, "limit": self.READ_PAGE_LIMIT,
+            "channel_id": channel_id, "limit": limit,
             "oldest": str(now - days * 86400), "latest": str(now),
         }
         if capability_id == "slack.thread.read":
             payload["thread_ts"] = thread["thread_ts"]
-        if capability_id == "slack.private_conversation.read":
-            payload = {"channel_id": channel_id, "limit": self.READ_PAGE_LIMIT}
         return payload
 
     def _start_slack_entity_resolution(self, conversation_id, tenant_id,
