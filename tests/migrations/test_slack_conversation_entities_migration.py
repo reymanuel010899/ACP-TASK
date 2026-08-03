@@ -24,6 +24,11 @@ def test_slack_conversation_entities_are_versioned_and_tenant_guarded():
     assert "unique (conversation_id, tenant_id, principal_id, turn_version)" in sql
     assert "concierge_turns_one_active_base" in sql
     assert "where status = 'started'" in sql
+    assert "provider_entity_id text not null" in sql
+    assert (
+        "conversation_id, entity_kind, connection_id, provider_entity_id, "
+        "entity_version"
+    ) in " ".join(sql.split())
     assert "primary key (conversation_id, tenant_id, principal_id, client_turn_id)" in sql
     assert sql.count(
         "references orchestrator.concierge_conversations("

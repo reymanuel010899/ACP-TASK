@@ -24,6 +24,23 @@ class WorkflowRepository(object):
         "dependencies", "blockers", "entity_refs", "blocking_need",
         "resolution_request",
     })
+    SLACK_ENTITY_FIELDS = {
+        "workspace": frozenset({"id", "name", "domain"}),
+        "channel": frozenset({
+            "id", "name", "is_private", "is_archived", "is_ext_shared",
+        }),
+        "user": frozenset({
+            "id", "display_name", "real_name", "handle", "image_url",
+            "is_bot", "deleted",
+        }),
+        "message": frozenset({"channel_id", "ts", "thread_ts", "user_id"}),
+        "thread": frozenset({"channel_id", "thread_ts", "parent_ts"}),
+        "file": frozenset({"id", "name", "mimetype", "size", "user_id"}),
+        "reaction": frozenset({"channel_id", "message_ts", "name", "user_id"}),
+    }
+    SLACK_ENTITY_PROVENANCE_FIELDS = frozenset({
+        "source", "resolver_run_id", "client_turn_id", "matched_by",
+    })
 
     def __init__(self, database_path, content_crypto=None):
         self.content_crypto = content_crypto
@@ -209,6 +226,7 @@ class WorkflowRepository(object):
                 entity_kind TEXT NOT NULL,
                 connection_id TEXT NOT NULL,
                 team_id TEXT NOT NULL,
+                provider_entity_id TEXT NOT NULL,
                 entity_version INTEGER NOT NULL CHECK(entity_version > 0),
                 entity_hash TEXT NOT NULL,
                 entity_json TEXT NOT NULL,
@@ -217,7 +235,10 @@ class WorkflowRepository(object):
                 stale_after INTEGER NOT NULL,
                 superseded_at INTEGER,
                 PRIMARY KEY(entity_ref_id, tenant_id),
-                UNIQUE(tenant_id, conversation_id, entity_ref_id, entity_version),
+                UNIQUE(
+                    tenant_id, conversation_id, entity_kind, connection_id,
+                    provider_entity_id, entity_version
+                ),
                 FOREIGN KEY(conversation_id, tenant_id, principal_id)
                     REFERENCES concierge_conversations(
                         conversation_id, tenant_id, principal_id
@@ -321,6 +342,16 @@ class WorkflowRepository(object):
         self._ensure_table_column(
             "concierge_conversations", "state_version",
             "INTEGER NOT NULL DEFAULT 1 CHECK(state_version > 0)",
+        )
+        self._ensure_table_column(
+            "slack_conversation_entities", "provider_entity_id", "TEXT",
+        )
+        self._connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS slack_entity_versions
+               ON slack_conversation_entities(
+                   tenant_id, conversation_id, entity_kind, connection_id,
+                   provider_entity_id, entity_version
+               )"""
         )
 
     def _ensure_step_column(self, name, declaration):
@@ -1521,6 +1552,165 @@ class WorkflowRepository(object):
             "response": response,
             "duplicate": bool(duplicate),
         }
+
+    def store_slack_conversation_entity(
+        self, conversation_id, tenant_id, principal_id, entity_kind,
+        connection_id, team_id, provider_entity_id, entity, provenance,
+        now_ts, stale_after_ts, expected_state_version=None,
+    ):
+        """Store one minimized, owner-bound provider snapshot idempotently."""
+        fields = self.SLACK_ENTITY_FIELDS.get(entity_kind)
+        if fields is None:
+            raise ValueError("unsupported Slack entity kind")
+        if not all((connection_id, team_id, provider_entity_id)):
+            raise ValueError("Slack entity authority binding is required")
+        if not isinstance(entity, dict) or not isinstance(provenance, dict):
+            raise ValueError("Slack entity and provenance must be objects")
+        minimized = {
+            key: entity[key] for key in fields if entity.get(key) is not None
+        }
+        if not minimized:
+            raise ValueError("Slack entity has no retainable fields")
+        if str(minimized.get("id") or provider_entity_id) != str(
+            provider_entity_id
+        ) and entity_kind in {"workspace", "channel", "user", "file"}:
+            raise ValueError("Slack entity provider identity changed")
+        safe_provenance = {
+            key: provenance[key]
+            for key in self.SLACK_ENTITY_PROVENANCE_FIELDS
+            if provenance.get(key) is not None
+        }
+        entity_raw = json.dumps(
+            minimized, sort_keys=True, separators=(",", ":")
+        )
+        entity_hash = hashlib.sha256(entity_raw.encode("utf-8")).hexdigest()
+        now_ts = int(now_ts)
+        stale_after_ts = int(stale_after_ts)
+        if stale_after_ts <= now_ts:
+            raise ValueError("Slack entity freshness window must be in the future")
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                conversation = self._connection.execute(
+                    """SELECT state_version FROM concierge_conversations
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ? AND status NOT IN ('closed', 'expired')
+                         AND expires_at >= ?""",
+                    (conversation_id, tenant_id, principal_id, now_ts),
+                ).fetchone()
+                if conversation is None:
+                    raise KeyError("conversation unavailable")
+                if expected_state_version is not None and int(
+                    conversation["state_version"]
+                ) != int(expected_state_version):
+                    raise RuntimeError("conversation version conflict")
+                latest = self._connection.execute(
+                    """SELECT * FROM slack_conversation_entities
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ? AND entity_kind = ?
+                         AND connection_id = ? AND team_id = ?
+                         AND provider_entity_id = ?
+                       ORDER BY entity_version DESC LIMIT 1""",
+                    (
+                        conversation_id, tenant_id, principal_id, entity_kind,
+                        connection_id, team_id, provider_entity_id,
+                    ),
+                ).fetchone()
+                if latest is not None and latest["entity_hash"] == entity_hash:
+                    self._connection.execute("COMMIT")
+                    return self._slack_conversation_entity(latest, now_ts)
+                entity_version = 1 if latest is None else int(
+                    latest["entity_version"]
+                ) + 1
+                if latest is not None and latest["superseded_at"] is None:
+                    self._connection.execute(
+                        """UPDATE slack_conversation_entities
+                           SET superseded_at = ?
+                           WHERE entity_ref_id = ? AND tenant_id = ?""",
+                        (now_ts, latest["entity_ref_id"], tenant_id),
+                    )
+                entity_ref_id = "slack-entity:%s" % uuid.uuid4().hex
+                self._connection.execute(
+                    """INSERT INTO slack_conversation_entities(
+                           entity_ref_id, tenant_id, conversation_id, principal_id,
+                           entity_kind, connection_id, team_id, provider_entity_id,
+                           entity_version, entity_hash, entity_json, provenance_json,
+                           observed_at, stale_after
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        entity_ref_id, tenant_id, conversation_id, principal_id,
+                        entity_kind, connection_id, team_id, provider_entity_id,
+                        entity_version, entity_hash,
+                        self._encode_conversation_content(
+                            minimized, tenant_id, conversation_id,
+                            "entity:%s" % entity_ref_id,
+                        ),
+                        json.dumps(
+                            safe_provenance, sort_keys=True, separators=(",", ":")
+                        ),
+                        now_ts, stale_after_ts,
+                    ),
+                )
+                row = self._connection.execute(
+                    """SELECT * FROM slack_conversation_entities
+                       WHERE entity_ref_id = ? AND tenant_id = ?""",
+                    (entity_ref_id, tenant_id),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return self._slack_conversation_entity(row, now_ts)
+
+    def get_slack_conversation_entity(
+        self, entity_ref_id, conversation_id, tenant_id, principal_id, now_ts,
+        include_stale=False,
+    ):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT e.* FROM slack_conversation_entities e
+                   JOIN concierge_conversations c
+                     ON c.conversation_id = e.conversation_id
+                    AND c.tenant_id = e.tenant_id
+                    AND c.principal_id = e.principal_id
+                   WHERE e.entity_ref_id = ? AND e.conversation_id = ?
+                     AND e.tenant_id = ? AND e.principal_id = ?
+                     AND c.status NOT IN ('closed', 'expired')
+                     AND c.expires_at >= ?""",
+                (
+                    entity_ref_id, conversation_id, tenant_id, principal_id,
+                    int(now_ts),
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        stale = row["superseded_at"] is not None or int(row["stale_after"]) < int(
+            now_ts
+        )
+        if stale and not include_stale:
+            return None
+        return self._slack_conversation_entity(row, int(now_ts))
+
+    def _slack_conversation_entity(self, row, now_ts):
+        result = {
+            key: row[key] for key in (
+                "entity_ref_id", "tenant_id", "conversation_id", "principal_id",
+                "entity_kind", "connection_id", "team_id", "provider_entity_id",
+                "entity_hash", "observed_at", "stale_after", "superseded_at",
+            )
+        }
+        result["entity_version"] = int(row["entity_version"])
+        result["provenance"] = json.loads(row["provenance_json"] or "{}")
+        result["entity"] = self._decode_conversation_content(
+            row["entity_json"], row["tenant_id"], row["conversation_id"],
+            "entity:%s" % row["entity_ref_id"], {},
+        )
+        result["stale"] = (
+            row["superseded_at"] is not None
+            or int(row["stale_after"]) < int(now_ts)
+        )
+        return result
 
     def apply_conversation_answer(
         self, conversation_id, tenant_id, principal_id, idempotency_key,

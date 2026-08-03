@@ -114,9 +114,61 @@ class DynamicWorkflowService:
                 key: value for key, value in result.resolved.items()
                 if key in {
                     "active_connection", "active_channel", "active_person",
-                    "active_thread", "read_period", "pending_draft",
+                    "active_thread", "active_message", "active_file",
+                    "active_reaction", "read_period", "pending_draft",
                 }
             }
+            prior_refs = {
+                item.get("slot"): item
+                for item in (active.get("entity_refs") or [])
+                if isinstance(item, dict) and item.get("slot")
+            }
+            entity_refs = self._persist_grounded_slack_entities(
+                active, result.resolved, installations,
+                "brain" if interpretation is not None else "deterministic",
+            )
+            if entity_refs:
+                updates["entity_refs"] = entity_refs
+            if interpretation is not None:
+                proposal = interpretation.model_dump()
+                updates["operation_candidates"] = proposal["operations"]
+                updates["slot_state"] = proposal["slots"]
+                updates["dependencies"] = proposal["dependencies"]
+                updates["blockers"] = proposal["blockers"]
+                updates["effect_candidates"] = proposal["operations"]
+                known_inputs = dict(active.get("known_inputs") or {})
+                for slot in proposal["slots"]:
+                    known_inputs[slot["name"]] = slot["value"]
+                updates["known_inputs"] = known_inputs
+                current_refs = {
+                    item.get("slot"): item
+                    for item in entity_refs
+                    if isinstance(item, dict) and item.get("slot")
+                }
+                corrections = list(active.get("corrections") or [])
+                slot_names = {
+                    "channel": "active_channel",
+                    "person": "active_person",
+                    "thread": "active_thread",
+                    "message": "active_message",
+                    "file": "active_file",
+                    "reaction": "active_reaction",
+                    "workspace": "active_connection",
+                }
+                for correction in proposal["corrections"]:
+                    slot = slot_names.get(correction["slot"])
+                    previous = prior_refs.get(slot) or {}
+                    replacement = current_refs.get(slot) or {}
+                    corrections.append({
+                        **correction,
+                        "recorded_at": int(self.clock()),
+                        "base_state_version": active["state_version"],
+                        "previous_entity_ref_id": previous.get("entity_ref_id"),
+                        "replacement_entity_ref_id": replacement.get(
+                            "entity_ref_id"
+                        ),
+                    })
+                updates["corrections"] = corrections
             persisted_status = "succeeded" if result.state == "completed" else result.state
             updates.update(status=persisted_status, locale=result.turn.locale,
                            operation=result.turn.operation, blocking_need=None)
@@ -407,6 +459,95 @@ class DynamicWorkflowService:
         if hasattr(self.connections, "list_for_tenant"):
             return self.connections.list_for_tenant(tenant_id, "slack")
         return self.connections.list_installations(tenant_id, principal_id)
+
+    def _persist_grounded_slack_entities(
+        self, conversation, resolved, installations, matched_by,
+    ):
+        """Persist minimized provider-grounded refs without trusting model IDs."""
+        existing = [
+            dict(item) for item in (conversation.get("entity_refs") or [])
+            if isinstance(item, dict) and item.get("slot")
+        ]
+        by_slot = {item["slot"]: item for item in existing}
+        connection = resolved.get("active_connection") or conversation.get(
+            "active_connection"
+        ) or {}
+        connection_id = connection.get("id")
+        installation = next((
+            item for item in installations
+            if item.get("connection_id") == connection_id
+        ), None)
+        team_id = (installation or {}).get("team_id")
+        if not connection_id or not team_id:
+            return existing
+        now = int(self.clock())
+        stale_after = now + 300
+        candidates = [(
+            "active_connection", "workspace", str(team_id), {
+                "id": str(team_id),
+                "name": (installation or {}).get("team_name")
+                or connection.get("label"),
+                "domain": (installation or {}).get("team_domain"),
+            },
+        )]
+        targets = (
+            ("active_channel", "channel"),
+            ("active_person", "user"),
+            ("active_message", "message"),
+            ("active_thread", "thread"),
+            ("active_file", "file"),
+            ("active_reaction", "reaction"),
+        )
+        for slot, kind in targets:
+            value = resolved.get(slot)
+            if not isinstance(value, dict):
+                continue
+            provider_entity_id = self._slack_provider_entity_id(kind, value)
+            if provider_entity_id:
+                candidates.append((slot, kind, provider_entity_id, value))
+        for slot, kind, provider_entity_id, value in candidates:
+            stored = self.workflows.store_slack_conversation_entity(
+                conversation["conversation_id"], conversation["tenant_id"],
+                conversation["principal_id"], kind, connection_id, team_id,
+                provider_entity_id, value,
+                {"source": "turn_grounding", "matched_by": matched_by},
+                now, stale_after,
+                expected_state_version=conversation["state_version"],
+            )
+            by_slot[slot] = {
+                "slot": slot,
+                "entity_kind": kind,
+                "entity_ref_id": stored["entity_ref_id"],
+                "entity_version": stored["entity_version"],
+                "entity_hash": stored["entity_hash"],
+                "connection_id": connection_id,
+                "team_id": team_id,
+                "observed_at": stored["observed_at"],
+                "stale_after": stored["stale_after"],
+            }
+        return list(by_slot.values())
+
+    @staticmethod
+    def _slack_provider_entity_id(kind, value):
+        if kind in {"channel", "user", "file"}:
+            return value.get("id")
+        if kind == "message":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("ts") or value.get("message_ts")
+            return "%s:%s" % (channel, timestamp) if channel and timestamp else None
+        if kind == "thread":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("thread_ts") or value.get("parent_ts")
+            return "%s:%s" % (channel, timestamp) if channel and timestamp else None
+        if kind == "reaction":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("message_ts") or value.get("ts")
+            name = value.get("name")
+            return (
+                "%s:%s:%s" % (channel, timestamp, name)
+                if channel and timestamp and name else None
+            )
+        return None
 
     def plan(self, tenant_id, principal_id, goal, context=None):
         context = dict(context or {})

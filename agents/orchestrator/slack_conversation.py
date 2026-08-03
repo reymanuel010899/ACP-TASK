@@ -170,7 +170,8 @@ class SlackConversationCoordinator:
         resolved = {
             key: active[key] for key in (
                 "active_connection", "active_channel", "active_person",
-                "active_thread", "read_period", "pending_draft",
+                "active_thread", "active_message", "active_file",
+                "active_reaction", "read_period", "pending_draft",
             ) if active.get(key) is not None
         }
         if turn.message_text is None:

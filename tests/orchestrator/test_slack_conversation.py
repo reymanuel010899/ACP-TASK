@@ -270,6 +270,28 @@ def test_channel_only_model_correction_preserves_resolved_message():
     assert result.resolved["message_text"] == "Hola equipo"
 
 
+def test_thread_shorthand_uses_only_server_grounded_context():
+    result = SlackConversationCoordinator().coordinate(
+        "respóndele ahí que recibido",
+        active_state={
+            "operation": "read", "locale": "es",
+            "active_connection": {"id": "conn:slack", "label": "Acme"},
+            "active_channel": {"id": "C1", "name": "general"},
+            "active_thread": {
+                "channel_id": "C1", "thread_ts": "1710000000.000100",
+            },
+        },
+        installations=[INSTALLATION],
+    )
+
+    assert result.state == "resolving"
+    assert result.turn.operation == "reply"
+    assert result.resolved["active_thread"] == {
+        "channel_id": "C1", "thread_ts": "1710000000.000100",
+    }
+    assert result.resolved["message_text"] == "recibido"
+
+
 def test_blocking_message_answer_preserves_post_operation_and_channel():
     result = SlackConversationCoordinator().coordinate(
         "Hola equipo",

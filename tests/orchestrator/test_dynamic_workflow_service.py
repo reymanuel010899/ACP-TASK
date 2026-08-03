@@ -109,6 +109,69 @@ def test_model_channel_correction_preserves_exact_message(tmp_path):
     assert result["draft"]["text"] == "Hola equipo"
 
 
+def test_grounded_entity_refs_and_correction_lineage_are_persisted(tmp_path):
+    correction = SlackInterpretation(
+        operations=[SlackOperationCandidate(
+            operation_id="slack.message.send", confidence=0.96,
+        )],
+        corrections=[SlackInterpretationCorrection(
+            slot="channel", replacement="anuncios", provenance="current_turn",
+        )],
+        locale="es", confidence=0.96,
+    )
+    brain = _SlackProposalBrain([_post_interpretation(), correction])
+    repository = WorkflowRepository(str(tmp_path / "entity-lineage.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        brain, slack_definitions(), _SlackConnections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    channels = [
+        {"id": "C1", "name": "general"},
+        {"id": "C2", "name": "anuncios"},
+    ]
+
+    first = service.coordinate_slack_turn(
+        "org:1", "user:1", "publica", channels=channels,
+    )
+    service.advance_slack_turn(
+        first["conversation_id"], "org:1", "user:1", "publica", first,
+    )
+    initial = store.get(first["conversation_id"], "org:1", "user:1")
+    initial_channel_ref = next(
+        item for item in initial["entity_refs"]
+        if item["slot"] == "active_channel"
+    )
+    assert initial["operation_candidates"] == [
+        {"operation_id": "slack.message.send", "confidence": 0.95}
+    ]
+    assert {item["name"] for item in initial["slot_state"]} == {
+        "channel", "message"
+    }
+
+    changed = service.coordinate_slack_turn(
+        "org:1", "user:1", "no, mejor anuncios",
+        conversation_id=first["conversation_id"], channels=channels,
+    )
+    persisted = store.get(first["conversation_id"], "org:1", "user:1")
+    changed_channel_ref = next(
+        item for item in persisted["entity_refs"]
+        if item["slot"] == "active_channel"
+    )
+
+    assert changed["resolved"]["message_text"] == "Hola equipo"
+    assert persisted["active_channel"] == {"id": "C2", "name": "anuncios"}
+    assert changed_channel_ref["entity_ref_id"] != initial_channel_ref["entity_ref_id"]
+    assert persisted["corrections"][-1]["slot"] == "channel"
+    assert persisted["corrections"][-1]["previous_entity_ref_id"] == (
+        initial_channel_ref["entity_ref_id"]
+    )
+    assert persisted["corrections"][-1]["replacement_entity_ref_id"] == (
+        changed_channel_ref["entity_ref_id"]
+    )
+    assert persisted["known_inputs"]["message"] == "Hola equipo"
+
+
 @pytest.mark.parametrize(
     "connections,writes,expected_code",
     [

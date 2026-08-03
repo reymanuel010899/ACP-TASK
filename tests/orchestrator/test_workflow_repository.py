@@ -524,3 +524,111 @@ def test_recovery_options_only_offer_safe_read_retry(tmp_path):
         run["workflow_run_id"], revision["workflow_revision_id"], "org:acme"
     )
     assert repository.recovery_options(current)["retryableStepIds"] == []
+
+
+def test_slack_entity_snapshots_are_minimized_versioned_and_idempotent(tmp_path):
+    repository = _repository(tmp_path)
+    conversation = repository.create_conversation(
+        "org:acme", "user:alice", 10, conversation_id="conversation:entities"
+    )
+
+    first = repository.store_slack_conversation_entity(
+        conversation["conversation_id"], "org:acme", "user:alice",
+        "channel", "conn:slack", "T1", "C1",
+        {
+            "id": "C1", "name": "general", "is_private": False,
+            "is_archived": False, "topic": "must not persist",
+            "email": "must-not-persist@example.com",
+        },
+        {"source": "conversations.list", "cursor": "page:1"},
+        11, 71, expected_state_version=1,
+    )
+    replay = repository.store_slack_conversation_entity(
+        conversation["conversation_id"], "org:acme", "user:alice",
+        "channel", "conn:slack", "T1", "C1",
+        {"id": "C1", "name": "general", "is_private": False,
+         "is_archived": False, "topic": "changed but excluded"},
+        {"source": "conversations.list", "cursor": "page:2"},
+        12, 72, expected_state_version=1,
+    )
+    changed = repository.store_slack_conversation_entity(
+        conversation["conversation_id"], "org:acme", "user:alice",
+        "channel", "conn:slack", "T1", "C1",
+        {"id": "C1", "name": "announcements", "is_private": False,
+         "is_archived": False},
+        {"source": "conversations.list", "cursor": "page:3"},
+        13, 73, expected_state_version=1,
+    )
+
+    assert first["entity"] == {
+        "id": "C1", "name": "general", "is_private": False,
+        "is_archived": False,
+    }
+    assert replay["entity_ref_id"] == first["entity_ref_id"]
+    assert replay["entity_version"] == 1
+    assert changed["entity_ref_id"] != first["entity_ref_id"]
+    assert changed["entity_version"] == 2
+    rows = repository._connection.execute(
+        "SELECT entity_version, superseded_at FROM slack_conversation_entities "
+        "ORDER BY entity_version"
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {"entity_version": 1, "superseded_at": 13},
+        {"entity_version": 2, "superseded_at": None},
+    ]
+
+
+def test_slack_entity_reads_require_owner_binding_and_freshness(tmp_path):
+    repository = _repository(tmp_path)
+    repository.create_conversation(
+        "org:acme", "user:alice", 10, conversation_id="conversation:entities"
+    )
+    stored = repository.store_slack_conversation_entity(
+        "conversation:entities", "org:acme", "user:alice", "user",
+        "conn:slack", "T1", "U1",
+        {
+            "id": "U1", "display_name": "Maria", "real_name": "Maria R",
+            "handle": "maria", "email": "private@example.com",
+            "profile": {"phone": "private"},
+        },
+        {"source": "users.list"}, 11, 20, expected_state_version=1,
+    )
+
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:acme",
+        "user:alice", 19,
+    )["entity"] == {
+        "id": "U1", "display_name": "Maria", "real_name": "Maria R",
+        "handle": "maria",
+    }
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:other",
+        "user:alice", 19,
+    ) is None
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:acme",
+        "user:bob", 19,
+    ) is None
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:acme",
+        "user:alice", 21,
+    ) is None
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:acme",
+        "user:alice", 21, include_stale=True,
+    )["stale"] is True
+
+    with pytest.raises(RuntimeError, match="conversation version conflict"):
+        repository.store_slack_conversation_entity(
+            "conversation:entities", "org:acme", "user:alice", "user",
+            "conn:slack", "T1", "U2", {"id": "U2"},
+            {"source": "users.list"}, 12, 20, expected_state_version=2,
+        )
+
+    repository.close_conversation(
+        "conversation:entities", "org:acme", "user:alice", 22
+    )
+    assert repository.get_slack_conversation_entity(
+        stored["entity_ref_id"], "conversation:entities", "org:acme",
+        "user:alice", 22, include_stale=True,
+    ) is None

@@ -45,6 +45,7 @@ create table orchestrator.slack_conversation_entities (
     )),
     connection_id text not null,
     team_id text not null,
+    provider_entity_id text not null,
     entity_version bigint not null check (entity_version > 0),
     entity_hash text not null,
     entity_json jsonb not null,
@@ -53,7 +54,10 @@ create table orchestrator.slack_conversation_entities (
     stale_after timestamptz not null,
     superseded_at timestamptz,
     primary key (entity_ref_id, tenant_id),
-    unique (tenant_id, conversation_id, entity_ref_id, entity_version),
+    unique (
+        tenant_id, conversation_id, entity_kind, connection_id,
+        provider_entity_id, entity_version
+    ),
     foreign key (conversation_id, tenant_id, principal_id)
         references orchestrator.concierge_conversations(
             conversation_id, tenant_id, principal_id
@@ -62,7 +66,8 @@ create table orchestrator.slack_conversation_entities (
 
 create index slack_conversation_entities_lookup
     on orchestrator.slack_conversation_entities(
-        tenant_id, conversation_id, entity_kind, observed_at desc
+        tenant_id, conversation_id, entity_kind, connection_id,
+        provider_entity_id, observed_at desc
     ) where superseded_at is null;
 
 create table orchestrator.slack_resolver_runs (
