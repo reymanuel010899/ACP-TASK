@@ -95,6 +95,7 @@ In particular, rerun after U2-B2 finalizes the context passed to `GroqBrain`.
 | 2026-07-31 | `llama-3.3-70b-versatile` | **NO-GO — TPD exhausted** | 20.83% fallback-contaminated | 0% fallback-contaminated | 0 | 24/24 failed |
 | 2026-07-31 | `openai/gpt-oss-120b` | **NO-GO — slot threshold** | 91.67% | 81.82% | 0 | 0/24 failed |
 | 2026-07-31 | `openai/gpt-oss-120b` blind holdout v2 | **NO-GO** | 87.50% | 60.00% | 0 | 2/24 failed |
+| 2026-08-03 | `openai/gpt-oss-120b` blind holdout v3 | **GO** | 100.00% | 100.00% | 0 | 0/24 failed |
 
 The 2026-07-31 run loaded the local `.env` without echoing secret values.
 Only 11 of 24 Groq calls completed; the remaining 13 entered the brain's
@@ -105,10 +106,13 @@ manifest alias, or production rule was tuned from these cases. The recorded
 zero is for grounded output; raw-response authority inspection was added to
 the gate afterward and therefore also requires the full rerun.
 
-Current Phase 1 decision: **NO-GO**. Obtain enough Groq evaluation capacity
-and pass a newly authored blind holdout after the indexed-slot/context-reference
-contract changes. Previously observed corpora remain diagnostic records and are
-not reused as blind promotion evidence.
+Current U2 language-quality decision: **GO**. The untouched blind V3 holdout
+passed all four promotion requirements on 2026-08-03 after the indexed-slot and
+context-reference contract changes: 24/24 exact operation cases, 100% required
+slot accuracy, zero authority violations, and zero transport failures. The run
+used 26-second pacing and bounded 429 retries and completed in 10 minutes 59
+seconds. Previously observed corpora remain diagnostic records and were not
+reused as blind promotion evidence.
 
 The second 70B run identified the external constraint precisely: the Groq
 on-demand organization had consumed 99,539 of its 100,000 tokens-per-day
