@@ -32,9 +32,36 @@ The system will be bot-first and capability-driven. User-token and Enterprise ad
 **Last unit completed:** U3 — Versioned conversational turns and grounded Slack
 entity graph (all slices).
 
-**Next unit:** U4 — Complete grounded reads, search, and evidence presentation.
+**Next unit:** None is unblocked. U4 is the next unit in sequence, but Phase 1
+lists the installed app's measured per-method rate tier — and the explicit
+choice between Marketplace listing, AI-search/user-token strategies, or a
+redesigned low-volume read UX — as a prerequisite for enabling U4. That
+measurement has not been taken.
 
 **Full repository verification at this checkpoint:** `1224 passed, 4 skipped`.
+
+#### Phase 1 is not closed
+
+U1-U3 are complete and the U2 language gate passed, but Phase 1 has six
+remaining exit items, none of which are code:
+
+| Phase 1 exit item | Status |
+|---|---|
+| U1-U3 hardening | **Complete** |
+| U2 bilingual/typo language-quality gate | **Passed** — evidence in `docs/operations/slack-phase1-language-gate.md` |
+| Product baselines established | **Not started** — U3E built the data source (`concierge_outcome_events`, `conversation_outcome_baseline`); nothing has been measured from it yet |
+| V1 operation manifest frozen | **Not started** |
+| High-frequency bot message/read canary | **Not started** |
+| Measured per-method rate tier + explicit strategy decision | **Not started** — gates U4 |
+| Sequential-chaining vs. composition comparison | **Not started** — scopes U7's compound-DAG slice |
+| First 2-3 bot-authorized jobs released behind a tenant flag | **Not started** |
+| R25 go/no-go checkpoint per hypothesis family | **Not started** — gates U9 and U10 |
+
+Three later units are conditional, not merely sequenced: U4 waits on the rate-tier
+decision, U9 and U10 are funded only if their R25 demand checkpoint passes, and
+U7's compound-DAG slice proceeds only if the chaining comparison shows measurable
+improvement. The immediate work is measurement in a real Slack workspace and
+product decisions, not implementation.
 
 #### Current progress
 
