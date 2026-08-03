@@ -179,8 +179,67 @@ class DynamicWorkflowService:
                 self.conversation_store.record_need(
                     conversation_id, tenant_id, principal_id, result.need
                 )
+            self._record_conversation_outcomes(
+                conversation_id, tenant_id, principal_id, result,
+                updates.get("corrections"), active.get("corrections"),
+            )
             payload["conversation_id"] = conversation_id
         return payload
+
+    OUTCOME_STATUS_EVENTS = {
+        "needs_input": "clarification_requested",
+        "awaiting_approval": "previewed",
+        "succeeded": "completed",
+        "completed": "completed",
+        "ready": "completed",
+        "failed": "failed",
+        "retryable_failure": "failed",
+    }
+
+    def _record_conversation_outcomes(
+        self, conversation_id, tenant_id, principal_id, result, corrections,
+        prior_corrections,
+    ):
+        """Emit privacy-safe outcome facts that Phase 1 baselines depend on."""
+        if not hasattr(self.workflows, "append_conversation_outcome_event"):
+            return
+        now = int(self.clock())
+        operation = result.turn.operation
+        metrics = {
+            "locale": result.turn.locale,
+            "correction_count": len(corrections or ()),
+        }
+        events = []
+        if operation:
+            events.append(("operation_attempted", metrics))
+        if len(corrections or ()) > len(prior_corrections or ()):
+            events.append(("corrected", metrics))
+        status_event = self.OUTCOME_STATUS_EVENTS.get(
+            "succeeded" if result.state == "completed" else result.state
+        )
+        if status_event:
+            events.append((status_event, metrics))
+        for event_type, event_metrics in events:
+            self._emit_conversation_outcome(
+                conversation_id, tenant_id, principal_id, event_type,
+                operation_family=operation, metrics=event_metrics,
+            )
+
+    def _emit_conversation_outcome(self, conversation_id, tenant_id,
+                                   principal_id, event_type,
+                                   operation_family=None, metrics=None):
+        """Never let a metrics write break the operation it measures."""
+        if not hasattr(self.workflows, "append_conversation_outcome_event"):
+            return False
+        try:
+            self.workflows.append_conversation_outcome_event(
+                conversation_id, tenant_id, principal_id, event_type,
+                int(self.clock()), operation_family=operation_family,
+                metrics=metrics,
+            )
+        except (KeyError, ValueError):
+            return False
+        return True
 
     def advance_slack_turn(self, conversation_id, tenant_id, principal_id,
                            text, turn_payload):
@@ -856,6 +915,11 @@ class DynamicWorkflowService:
             workflow_run_id=run["workflow_run_id"],
             workflow_revision_id=revision["workflow_revision_id"],
         )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "previewed",
+            operation_family=(conversation or {}).get("operation"),
+            metrics={"locale": (conversation or {}).get("locale", "es")},
+        )
         return dict(draft)
 
     def approve_slack_draft(
@@ -898,6 +962,11 @@ class DynamicWorkflowService:
         self.conversation_store.update(
             conversation_id, tenant_id, principal_id, status="executing"
         )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "approved",
+            operation_family=conversation.get("operation"),
+            metrics={"locale": conversation.get("locale", "es")},
+        )
         return dict(draft)
 
     def complete_slack_write(
@@ -914,5 +983,13 @@ class DynamicWorkflowService:
         self.conversation_store.update(
             conversation_id, tenant_id, principal_id,
             status="succeeded", pending_draft=None,
+        )
+        completed = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "completed",
+            operation_family=(completed or {}).get("operation"),
+            metrics={"terminal_outcome": "sent", "locale": locale},
         )
         return presentation

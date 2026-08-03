@@ -791,3 +791,85 @@ def test_slack_resolver_runs_fail_closed_on_unavailable_conversations(tmp_path):
     assert repository.get_slack_resolver_run(
         run["resolver_run_id"], "org:acme"
     )["status"] == "pending"
+
+
+def test_conversation_outcome_events_are_append_only_and_metric_only(tmp_path):
+    repository = _repository(tmp_path)
+    repository.create_conversation(
+        "org:acme", "user:alice", 10, ttl_seconds=600,
+        conversation_id="conversation:outcomes",
+    )
+
+    attempted = repository.append_conversation_outcome_event(
+        "conversation:outcomes", "org:acme", "user:alice",
+        "operation_attempted", 11, operation_family="post",
+        metrics={
+            "clarification_count": 1, "locale": "es",
+            "message_text": "Hola equipo", "channel_name": "general",
+            "email": "alice@acme.com",
+        },
+    )
+    completed = repository.append_conversation_outcome_event(
+        "conversation:outcomes", "org:acme", "user:alice", "completed", 12,
+        operation_family="post", metrics={"terminal_outcome": "sent"},
+    )
+
+    assert attempted["event_sequence"] == 1
+    assert completed["event_sequence"] == 2
+    assert attempted["metrics"] == {"clarification_count": 1, "locale": "es"}
+    events = repository.list_conversation_outcome_events(
+        "conversation:outcomes", "org:acme", "user:alice"
+    )
+    assert [item["event_type"] for item in events] == [
+        "operation_attempted", "completed"
+    ]
+    assert "Hola equipo" not in str(events)
+    assert "alice@acme.com" not in str(events)
+
+    assert repository.list_conversation_outcome_events(
+        "conversation:outcomes", "org:other", "user:alice"
+    ) == []
+    assert repository.list_conversation_outcome_events(
+        "conversation:outcomes", "org:acme", "user:bob"
+    ) == []
+    with pytest.raises(ValueError, match="unsupported conversation outcome"):
+        repository.append_conversation_outcome_event(
+            "conversation:outcomes", "org:acme", "user:alice", "exfiltrated", 13
+        )
+    with pytest.raises(KeyError, match="conversation unavailable"):
+        repository.append_conversation_outcome_event(
+            "conversation:outcomes", "org:other", "user:alice", "completed", 13
+        )
+
+
+def test_conversation_outcome_baseline_counts_without_reading_content(tmp_path):
+    repository = _repository(tmp_path)
+    for index in (1, 2):
+        conversation_id = "conversation:baseline-%d" % index
+        repository.create_conversation(
+            "org:acme", "user:alice", 10, ttl_seconds=600,
+            conversation_id=conversation_id,
+        )
+        repository.append_conversation_outcome_event(
+            conversation_id, "org:acme", "user:alice", "operation_attempted",
+            11, operation_family="post",
+        )
+    repository.append_conversation_outcome_event(
+        "conversation:baseline-1", "org:acme", "user:alice",
+        "clarification_requested", 12, operation_family="post",
+    )
+    repository.append_conversation_outcome_event(
+        "conversation:baseline-1", "org:acme", "user:alice", "completed", 99,
+        operation_family="post",
+    )
+
+    baseline = repository.conversation_outcome_baseline("org:acme", 10, 50)
+
+    assert sorted(
+        (item["event_type"], item["total"], item["conversations"])
+        for item in baseline
+    ) == [
+        ("clarification_requested", 1, 1),
+        ("operation_attempted", 2, 2),
+    ]
+    assert repository.conversation_outcome_baseline("org:other", 10, 50) == []

@@ -41,6 +41,15 @@ class WorkflowRepository(object):
     SLACK_ENTITY_PROVENANCE_FIELDS = frozenset({
         "source", "resolver_run_id", "client_turn_id", "matched_by",
     })
+    OUTCOME_EVENT_TYPES = frozenset({
+        "operation_attempted", "clarification_requested", "corrected",
+        "previewed", "approved", "rejected", "completed", "abandoned", "failed",
+    })
+    OUTCOME_METRIC_FIELDS = frozenset({
+        "clarification_count", "correction_count", "turn_count",
+        "page_count", "candidate_count", "duration_seconds",
+        "terminal_outcome", "error_code", "locale",
+    })
     RESOLVER_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
     RESOLVER_OUTCOMES = frozenset({
         "matched", "ambiguous", "not_found", "exhausted", "failed",
@@ -1937,6 +1946,108 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
+    def append_conversation_outcome_event(
+        self, conversation_id, tenant_id, principal_id, event_type, now_ts,
+        operation_family=None, metrics=None,
+    ):
+        """Append one append-only product-outcome fact, metrics only."""
+        if event_type not in self.OUTCOME_EVENT_TYPES:
+            raise ValueError("unsupported conversation outcome event")
+        if not all((conversation_id, tenant_id, principal_id)):
+            raise ValueError("outcome events require owner binding")
+        safe_metrics = {
+            key: value for key, value in (metrics or {}).items()
+            if key in self.OUTCOME_METRIC_FIELDS
+            and isinstance(value, (int, float, str, bool))
+        }
+        now_ts = int(now_ts)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                owned = self._connection.execute(
+                    """SELECT 1 FROM concierge_conversations
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ?""",
+                    (conversation_id, tenant_id, principal_id),
+                ).fetchone()
+                if owned is None:
+                    raise KeyError("conversation unavailable")
+                row = self._connection.execute(
+                    """SELECT COALESCE(MAX(event_sequence), 0) AS sequence
+                       FROM concierge_outcome_events
+                       WHERE tenant_id = ? AND conversation_id = ?""",
+                    (tenant_id, conversation_id),
+                ).fetchone()
+                sequence = int(row["sequence"]) + 1
+                event_id = "outcome:%s" % uuid.uuid4().hex
+                self._connection.execute(
+                    """INSERT INTO concierge_outcome_events(
+                           event_id, tenant_id, conversation_id, principal_id,
+                           event_sequence, event_type, operation_family,
+                           metrics_json, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_id, tenant_id, conversation_id, principal_id,
+                        sequence, event_type, operation_family,
+                        json.dumps(
+                            safe_metrics, sort_keys=True, separators=(",", ":")
+                        ),
+                        now_ts,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return {
+            "event_id": event_id, "event_sequence": sequence,
+            "event_type": event_type, "operation_family": operation_family,
+            "metrics": safe_metrics, "created_at": now_ts,
+        }
+
+    def list_conversation_outcome_events(
+        self, conversation_id, tenant_id, principal_id,
+    ):
+        if not all((conversation_id, tenant_id, principal_id)):
+            raise ValueError("outcome event reads require owner binding")
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM concierge_outcome_events
+                   WHERE conversation_id = ? AND tenant_id = ?
+                     AND principal_id = ?
+                   ORDER BY event_sequence ASC""",
+                (conversation_id, tenant_id, principal_id),
+            ).fetchall()
+        return [{
+            "event_id": row["event_id"],
+            "event_sequence": int(row["event_sequence"]),
+            "event_type": row["event_type"],
+            "operation_family": row["operation_family"],
+            "metrics": json.loads(row["metrics_json"] or "{}"),
+            "created_at": row["created_at"],
+        } for row in rows]
+
+    def conversation_outcome_baseline(self, tenant_id, since_ts, until_ts):
+        """Aggregate the Phase 1 baseline without reading any content."""
+        if not tenant_id:
+            raise ValueError("baselines require a tenant")
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT event_type, operation_family, COUNT(*) AS total,
+                          COUNT(DISTINCT conversation_id) AS conversations
+                   FROM concierge_outcome_events
+                   WHERE tenant_id = ? AND created_at >= ? AND created_at < ?
+                   GROUP BY event_type, operation_family""",
+                (tenant_id, int(since_ts), int(until_ts)),
+            ).fetchall()
+        return [{
+            "event_type": row["event_type"],
+            "operation_family": row["operation_family"],
+            "total": int(row["total"]),
+            "conversations": int(row["conversations"]),
+        } for row in rows]
+
     def _record_slack_resolver_step_page(
         self, resolver_run_id, tenant_id, resolver_step, output, candidates,
         now_ts,
@@ -2192,6 +2303,10 @@ class WorkflowRepository(object):
         )
 
     def close_conversation(self, conversation_id, tenant_id, principal_id, now_ts):
+        now_ts = int(now_ts)
+        current = self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
         with self._lock:
             cursor = self._connection.execute(
                 """UPDATE concierge_conversations SET status = 'closed', state_json = ?,
@@ -2200,9 +2315,17 @@ class WorkflowRepository(object):
                      AND status NOT IN ('closed', 'expired')""",
                 (self._encode_conversation_content(
                     {}, tenant_id, conversation_id, "state"
-                ), int(now_ts), int(now_ts), conversation_id, tenant_id, principal_id),
+                ), now_ts, now_ts, conversation_id, tenant_id, principal_id),
             )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return False
+        self.append_conversation_outcome_event(
+            conversation_id, tenant_id, principal_id,
+            "rejected" if (current or {}).get("pending_draft") else "abandoned",
+            now_ts, operation_family=(current or {}).get("operation"),
+            metrics={"terminal_outcome": "closed_by_user"},
+        )
+        return True
 
     def purge_expired_conversation_content(self, now_ts):
         with self._lock:

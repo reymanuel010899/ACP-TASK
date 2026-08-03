@@ -775,3 +775,77 @@ def test_resolution_pages_durably_across_restart_and_finishes_from_its_event(tmp
     assert finished["pending_draft"]["destination_label"] == "#general"
     assert finished["pending_draft"]["text"] == "Hola equipo"
     assert finished.get("resolution_request") is None
+
+
+def test_outcome_events_track_the_whole_write_lifecycle_without_content(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+
+    repository = WorkflowRepository(str(tmp_path / "outcome-lifecycle.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), _ResolverConnections(), repository,
+        conversation_store=store, clock=lambda: 10, slack_writes_enabled=True,
+    )
+    intake = service.coordinate_slack_turn(
+        "org:1", "user:1", "Manda en #general que Hola equipo",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+    conversation_id = intake["conversation_id"]
+    previewed = service.advance_slack_turn(
+        conversation_id, "org:1", "user:1",
+        "Manda en #general que Hola equipo", intake,
+    )
+    service.approve_slack_draft(
+        conversation_id, "org:1", "user:1", previewed["draft"]["draft_hash"]
+    )
+    service.complete_slack_write(conversation_id, "org:1", "user:1")
+
+    events = repository.list_conversation_outcome_events(
+        conversation_id, "org:1", "user:1"
+    )
+
+    assert [item["event_type"] for item in events] == [
+        "operation_attempted", "previewed", "approved", "completed",
+    ]
+    assert [item["event_sequence"] for item in events] == [1, 2, 3, 4]
+    assert {item["operation_family"] for item in events} == {"post"}
+    assert events[-1]["metrics"]["terminal_outcome"] == "sent"
+    assert "Hola equipo" not in str(events)
+    assert "C1" not in str(events)
+    assert repository.conversation_outcome_baseline("org:1", 10, 11) == [
+        {"event_type": event_type, "operation_family": "post",
+         "total": 1, "conversations": 1}
+        for event_type in (
+            "approved", "completed", "operation_attempted", "previewed",
+        )
+    ]
+
+
+def test_closing_a_previewed_conversation_records_an_explicit_rejection(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+
+    repository = WorkflowRepository(str(tmp_path / "outcome-rejected.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), _ResolverConnections(), repository,
+        conversation_store=store, clock=lambda: 10, slack_writes_enabled=True,
+    )
+    intake = service.coordinate_slack_turn(
+        "org:1", "user:1", "Manda en #general que Hola equipo",
+        channels=[{"id": "C1", "name": "general"}],
+    )
+    conversation_id = intake["conversation_id"]
+    service.advance_slack_turn(
+        conversation_id, "org:1", "user:1",
+        "Manda en #general que Hola equipo", intake,
+    )
+
+    assert store.close(conversation_id, "org:1", "user:1") is True
+    assert store.close(conversation_id, "org:1", "user:1") is False
+
+    events = repository.list_conversation_outcome_events(
+        conversation_id, "org:1", "user:1"
+    )
+    assert [item["event_type"] for item in events][-1] == "rejected"
+    assert events[-1]["operation_family"] == "post"
+    assert events[-1]["metrics"]["terminal_outcome"] == "closed_by_user"
