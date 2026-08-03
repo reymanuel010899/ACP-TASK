@@ -205,9 +205,14 @@ def main(argv=None):
     read_jobs, message_jobs, chained, composed = [], [], [], []
     for index in range(args.jobs):
         if reads:
+            # Imperative phrasing on purpose. Interrogative reads
+            # ("que se dijo en #x?") currently classify as unsupported, and a
+            # canary measuring that would report a language gap as a product
+            # failure rate. See docs/operations/slack-phase1-language-gate.md.
             read_jobs.append(run_job(
                 service, store, args.tenant, args.principal,
-                ["Que se dijo en #%s?" % args.channel], approve=False,
+                ["Lee los ultimos mensajes de #%s" % args.channel],
+                approve=False,
             ))
         if writes:
             message_jobs.append(run_job(

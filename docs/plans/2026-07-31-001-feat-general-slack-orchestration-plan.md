@@ -51,9 +51,9 @@ code:
 |---|---|
 | U1-U3 hardening | **Complete** |
 | U2 bilingual/typo language-quality gate | **Passed** — evidence in `docs/operations/slack-phase1-language-gate.md` |
-| Product baselines established | **Not started** — U3E built the data source (`concierge_outcome_events`, `conversation_outcome_baseline`); nothing has been measured from it yet |
+| Product baselines established | **Measured 2026-08-03 (partial)** — evidence in `docs/operations/slack-phase1-baseline.md`; the message family completes 100% at ~1.8s median, the read family 0% until U4 |
 | V1 operation manifest frozen | **Not started** |
-| High-frequency bot message/read canary | **Not started** |
+| High-frequency bot message/read canary | **Built and run** — `scripts/slack_phase1_canary.py` |
 | Measured per-method rate tier + explicit strategy decision | **Measured 2026-08-03 — resolved** — evidence in `docs/operations/slack-phase1-rate-tier.md`; see the note below |
 | Sequential-chaining vs. composition comparison | **Not started** — scopes U7's compound-DAG slice |
 | First 2-3 bot-authorized jobs released behind a tenant flag | **Not started** |
