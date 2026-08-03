@@ -184,11 +184,6 @@ def _make_handler(agent, label, runner_url, registry_url=None,
                         "state": "expired", "conversationId": conversation_id,
                         "recovery": {"action": "start_new_conversation"},
                     })
-                if (conversation.get("status") == "resolving"
-                        and conversation.get("resolution_request")):
-                    return self._send(200, _turn_response(
-                        dynamic_workflow_service.resume_resolved_slack_turn(conversation)
-                    ))
                 return self._send(200, _conversation_response(conversation))
             if path.startswith("/workflows/") and workflow_repository and session_repository:
                 workflow_id = _workflow_id_from_path(path)

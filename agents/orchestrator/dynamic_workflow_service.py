@@ -253,8 +253,58 @@ class DynamicWorkflowService:
             required = sorted(definition.required_scopes)[0] if definition else "unknown"
             raise PermissionError("missing_scope:%s" % required)
         now = int(self.clock())
-        run = self.workflows.create_run(tenant_id, principal_id, _hash("resolve:%s" % field), now)
+        resolver_run = self._reserve_slack_resolver_run(
+            conversation, conversation_id, tenant_id, principal_id,
+            connection_id, field, query, now,
+        )
+        run, revision = self._dispatch_slack_resolver_page(
+            tenant_id, principal_id, field, capability_id, definition,
+            connection_id, connection, None, now,
+        )
+        if resolver_run is not None:
+            self.workflows.attach_slack_resolver_workflow(
+                resolver_run["resolver_run_id"], tenant_id,
+                run["workflow_run_id"], revision["workflow_revision_id"], now,
+            )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id, status="retrieving",
+            blocking_need=None, workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+            resolution_request={"field": field, "query": query,
+                                "text": text, "turn": turn,
+                                "locale": turn.get("locale", "es"),
+                                "resolver_run_id": (resolver_run or {}).get(
+                                    "resolver_run_id"
+                                )},
+        )
+        return {"state": "retrieving", "conversation_id": conversation_id,
+                "workflow": {"workflowId": run["workflow_run_id"],
+                             "revisionId": revision["workflow_revision_id"]}}
+
+    def _reserve_slack_resolver_run(
+        self, conversation, conversation_id, tenant_id, principal_id,
+        connection_id, field, query, now,
+    ):
+        """Reserve the durable run that owns this resolution's pagination."""
+        if not hasattr(self.workflows, "start_slack_resolver_run"):
+            return None
+        return self.workflows.start_slack_resolver_run(
+            conversation_id, tenant_id, principal_id, connection_id,
+            "channel" if field == "channel" else "user",
+            _hash({"field": field, "query": query}),
+            int((conversation or {}).get("state_version") or 1), now,
+        )
+
+    def _dispatch_slack_resolver_page(
+        self, tenant_id, principal_id, field, capability_id, definition,
+        connection_id, connection, cursor, now,
+    ):
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("resolve:%s" % field), now
+        )
         payload = {"limit": 200}
+        if cursor:
+            payload["cursor"] = cursor
         step = {
             "step_id": "resolve-slack-%s" % field,
             "capability_id": capability_id, "capability_version": definition.version,
@@ -270,17 +320,71 @@ class DynamicWorkflowService:
             run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
             graph_hash, principal_id, now,
         )
-        self.conversation_store.update(
-            conversation_id, tenant_id, principal_id, status="retrieving",
-            blocking_need=None, workflow_run_id=run["workflow_run_id"],
-            workflow_revision_id=revision["workflow_revision_id"],
-            resolution_request={"field": field, "query": query,
-                                "text": text, "turn": turn,
-                                "locale": turn.get("locale", "es")},
+        return run, revision
+
+    def apply_slack_resolver_completion(self, tenant_id, conversation_id,
+                                        payload, now=None):
+        """Continue a resolved turn from its durable event, never from a GET."""
+        principal_id = payload.get("principal_id")
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        ) if self.conversation_store and principal_id else None
+        if conversation is None:
+            return False
+        request = conversation.get("resolution_request") or {}
+        if request.get("resolver_run_id") != payload.get("resolver_run_id"):
+            return False
+        if conversation.get("status") != "resolving":
+            return False
+        self.resume_resolved_slack_turn(conversation)
+        return True
+
+    def continue_slack_resolver_run(self, run, now=None):
+        """Dispatch the next durable page after completion or a restart."""
+        cursor = run.get("cursor") or {}
+        next_cursor = cursor.get("next")
+        if not next_cursor or next_cursor in (cursor.get("consumed") or []):
+            return False
+        if cursor.get("dispatched") == next_cursor:
+            return False
+        conversation = self.conversation_store.get(
+            run["conversation_id"], run["tenant_id"], run["principal_id"]
+        ) if self.conversation_store else None
+        if conversation is None:
+            return False
+        request = conversation.get("resolution_request") or {}
+        if request.get("resolver_run_id") != run["resolver_run_id"]:
+            return False
+        field = request.get("field")
+        capability_id = (
+            "slack.channels.list" if field == "channel" else "slack.users.list"
         )
-        return {"state": "retrieving", "conversation_id": conversation_id,
-                "workflow": {"workflowId": run["workflow_run_id"],
-                             "revisionId": revision["workflow_revision_id"]}}
+        connection = next((
+            item for item in self._tenant_installations(
+                run["tenant_id"], run["principal_id"]
+            ) if item.get("connection_id") == run["connection_id"]
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition:
+            return False
+        now = int(self.clock() if now is None else now)
+        page_run, revision = self._dispatch_slack_resolver_page(
+            run["tenant_id"], run["principal_id"], field, capability_id,
+            definition, run["connection_id"], connection, next_cursor, now,
+        )
+        self.workflows.attach_slack_resolver_workflow(
+            run["resolver_run_id"], run["tenant_id"],
+            page_run["workflow_run_id"], revision["workflow_revision_id"],
+            now, cursor_token=next_cursor,
+        )
+        self.conversation_store.update(
+            run["conversation_id"], run["tenant_id"], run["principal_id"],
+            status="retrieving",
+            workflow_run_id=page_run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
 
     def resume_resolved_slack_turn(self, conversation):
         request = conversation.get("resolution_request") or {}

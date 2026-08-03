@@ -41,6 +41,11 @@ class WorkflowRepository(object):
     SLACK_ENTITY_PROVENANCE_FIELDS = frozenset({
         "source", "resolver_run_id", "client_turn_id", "matched_by",
     })
+    RESOLVER_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+    RESOLVER_OUTCOMES = frozenset({
+        "matched", "ambiguous", "not_found", "exhausted", "failed",
+    })
+    DEFAULT_RESOLVER_BUDGET = {"max_pages": 10, "max_candidates": 5000}
 
     def __init__(self, database_path, content_crypto=None):
         self.content_crypto = content_crypto
@@ -260,6 +265,9 @@ class WorkflowRepository(object):
                 candidates_seen INTEGER NOT NULL DEFAULT 0,
                 retry_at INTEGER,
                 last_error_code TEXT,
+                workflow_run_id TEXT,
+                workflow_revision_id TEXT,
+                outcome_json TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 completed_at INTEGER,
@@ -352,6 +360,19 @@ class WorkflowRepository(object):
                    tenant_id, conversation_id, entity_kind, connection_id,
                    provider_entity_id, entity_version
                )"""
+        )
+        for column in ("workflow_run_id", "workflow_revision_id", "outcome_json"):
+            self._ensure_table_column("slack_resolver_runs", column, "TEXT")
+        self._connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS slack_resolver_runs_request
+               ON slack_resolver_runs(
+                   tenant_id, conversation_id, connection_id, entity_kind,
+                   query_hash, requested_state_version
+               )"""
+        )
+        self._connection.execute(
+            """CREATE INDEX IF NOT EXISTS slack_resolver_runs_claimable
+               ON slack_resolver_runs(status, retry_at, updated_at)"""
         )
 
     def _ensure_step_column(self, name, declaration):
@@ -1712,6 +1733,341 @@ class WorkflowRepository(object):
         )
         return result
 
+    def start_slack_resolver_run(
+        self, conversation_id, tenant_id, principal_id, connection_id,
+        entity_kind, query_hash, requested_state_version, now_ts, budget=None,
+        workflow_run_id=None, workflow_revision_id=None,
+    ):
+        """Reserve one durable resolver run per request, replay-safe."""
+        if not all((
+            conversation_id, tenant_id, principal_id, connection_id,
+            entity_kind, query_hash,
+        )):
+            raise ValueError("resolver run binding is required")
+        if entity_kind not in self.SLACK_ENTITY_FIELDS:
+            raise ValueError("unsupported Slack entity kind")
+        requested_state_version = int(requested_state_version)
+        if requested_state_version <= 0:
+            raise ValueError("resolver run requires a positive state version")
+        budget = {**self.DEFAULT_RESOLVER_BUDGET, **dict(budget or {})}
+        now_ts = int(now_ts)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                conversation = self._connection.execute(
+                    """SELECT 1 FROM concierge_conversations
+                       WHERE conversation_id = ? AND tenant_id = ?
+                         AND principal_id = ? AND status NOT IN ('closed', 'expired')
+                         AND expires_at >= ?""",
+                    (conversation_id, tenant_id, principal_id, now_ts),
+                ).fetchone()
+                if conversation is None:
+                    raise KeyError("conversation unavailable")
+                existing = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE tenant_id = ? AND conversation_id = ?
+                         AND connection_id = ? AND entity_kind = ?
+                         AND query_hash = ? AND requested_state_version = ?""",
+                    (
+                        tenant_id, conversation_id, connection_id, entity_kind,
+                        query_hash, requested_state_version,
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    self._connection.execute("COMMIT")
+                    return dict(
+                        self._slack_resolver_run(existing), created=False
+                    )
+                resolver_run_id = "slack-resolver:%s" % uuid.uuid4().hex
+                self._connection.execute(
+                    """INSERT INTO slack_resolver_runs(
+                           resolver_run_id, tenant_id, conversation_id,
+                           principal_id, connection_id, entity_kind, query_hash,
+                           requested_state_version, status, cursor_json,
+                           budget_json, workflow_run_id, workflow_revision_id,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        resolver_run_id, tenant_id, conversation_id,
+                        principal_id, connection_id, entity_kind, query_hash,
+                        requested_state_version,
+                        json.dumps({"next": None, "consumed": []}, sort_keys=True),
+                        json.dumps(budget, sort_keys=True),
+                        workflow_run_id, workflow_revision_id, now_ts, now_ts,
+                    ),
+                )
+                row = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return dict(self._slack_resolver_run(row), created=True)
+
+    def record_slack_resolver_page(
+        self, resolver_run_id, tenant_id, page_token, next_cursor,
+        candidates_seen, now_ts, workflow_revision_id=None,
+    ):
+        """Advance one page durably, ignoring replayed provider callbacks."""
+        now_ts = int(now_ts)
+        page_token = "" if page_token is None else str(page_token)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("resolver run not found")
+                run = self._slack_resolver_run(row)
+                if run["status"] in self.RESOLVER_TERMINAL_STATUSES:
+                    self._connection.execute("COMMIT")
+                    return dict(run, applied=False)
+                cursor = dict(run["cursor"])
+                consumed = list(cursor.get("consumed") or [])
+                if page_token in consumed:
+                    self._connection.execute("COMMIT")
+                    return dict(run, applied=False)
+                consumed.append(page_token)
+                budget = run["budget"]
+                pages_processed = run["pages_processed"] + 1
+                candidates = run["candidates_seen"] + max(int(candidates_seen), 0)
+                cursor = {"next": next_cursor, "consumed": consumed}
+                self._connection.execute(
+                    """UPDATE slack_resolver_runs
+                       SET status = 'running', cursor_json = ?,
+                           pages_processed = ?, candidates_seen = ?,
+                           workflow_revision_id = COALESCE(?, workflow_revision_id),
+                           updated_at = ?
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (
+                        json.dumps(cursor, sort_keys=True), pages_processed,
+                        candidates, workflow_revision_id, now_ts,
+                        resolver_run_id, tenant_id,
+                    ),
+                )
+                updated = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        result = self._slack_resolver_run(updated)
+        result["applied"] = True
+        result["budget_exhausted"] = (
+            pages_processed >= int(budget.get("max_pages", 0) or 0)
+            or candidates >= int(budget.get("max_candidates", 0) or 0)
+        )
+        result["exhausted"] = bool(
+            result["budget_exhausted"] or not next_cursor
+        )
+        return result
+
+    def complete_slack_resolver_run(
+        self, resolver_run_id, tenant_id, outcome, now_ts, error_code=None,
+    ):
+        """Close a resolver run and publish its completion exactly once."""
+        kind = (outcome or {}).get("kind")
+        if kind not in self.RESOLVER_OUTCOMES:
+            raise ValueError("unsupported resolver outcome")
+        now_ts = int(now_ts)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("resolver run not found")
+                run = self._slack_resolver_run(row)
+                if run["status"] in self.RESOLVER_TERMINAL_STATUSES:
+                    self._connection.execute("COMMIT")
+                    return dict(run, completed=False)
+                status = "failed" if kind == "failed" else "completed"
+                self._connection.execute(
+                    """UPDATE slack_resolver_runs
+                       SET status = ?, outcome_json = ?, last_error_code = ?,
+                           updated_at = ?, completed_at = ?
+                       WHERE resolver_run_id = ? AND tenant_id = ?
+                         AND status NOT IN ('completed', 'failed', 'cancelled')""",
+                    (
+                        status,
+                        self._encode_conversation_content(
+                            dict(outcome), tenant_id, run["conversation_id"],
+                            "resolver:%s" % resolver_run_id,
+                        ),
+                        error_code, now_ts, now_ts, resolver_run_id, tenant_id,
+                    ),
+                )
+                self.append_outbox_event(
+                    tenant_id, "conversation", run["conversation_id"],
+                    "conversation.resolver_completed",
+                    {
+                        "resolver_run_id": resolver_run_id,
+                        "principal_id": run["principal_id"],
+                        "entity_kind": run["entity_kind"],
+                        "outcome": kind,
+                        "pages_processed": run["pages_processed"],
+                        "candidates_seen": run["candidates_seen"],
+                        "requested_state_version": run["requested_state_version"],
+                    },
+                    "slack-resolver:%s" % resolver_run_id, now_ts,
+                )
+                updated = self._connection.execute(
+                    """SELECT * FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return dict(self._slack_resolver_run(updated), completed=True)
+
+    def _record_slack_resolver_step_page(
+        self, resolver_run_id, tenant_id, resolver_step, output, candidates,
+        now_ts,
+    ):
+        """Fold one executed resolver step into its durable run."""
+        if not resolver_run_id:
+            return None
+        page_token = (resolver_step.get("input") or {}).get("cursor")
+        next_cursor = output.get("next_cursor") or (
+            output.get("response_metadata") or {}
+        ).get("next_cursor")
+        try:
+            return self.record_slack_resolver_page(
+                resolver_run_id, tenant_id, page_token, next_cursor or None,
+                candidates, now_ts,
+                workflow_revision_id=resolver_step.get("workflow_revision_id"),
+            )
+        except KeyError:
+            return None
+
+    def _complete_slack_resolver_run_if_any(
+        self, resolver_run_id, tenant_id, outcome, now_ts,
+    ):
+        if not resolver_run_id:
+            return None
+        try:
+            return self.complete_slack_resolver_run(
+                resolver_run_id, tenant_id, outcome, now_ts
+            )
+        except KeyError:
+            return None
+
+    def get_slack_resolver_run(
+        self, resolver_run_id, tenant_id, conversation_id=None,
+        principal_id=None,
+    ):
+        if not tenant_id:
+            raise ValueError("resolver run reads require a tenant")
+        clauses = ["resolver_run_id = ?", "tenant_id = ?"]
+        values = [resolver_run_id, tenant_id]
+        if conversation_id is not None:
+            clauses.append("conversation_id = ?")
+            values.append(conversation_id)
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            values.append(principal_id)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM slack_resolver_runs WHERE %s" % " AND ".join(clauses),
+                tuple(values),
+            ).fetchone()
+        return self._slack_resolver_run(row) if row else None
+
+    def list_resumable_slack_resolver_runs(self, now_ts, limit=50):
+        """Return live runs whose conversation can still consume them."""
+        now_ts = int(now_ts)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT r.* FROM slack_resolver_runs r
+                   JOIN concierge_conversations c
+                     ON c.conversation_id = r.conversation_id
+                    AND c.tenant_id = r.tenant_id
+                    AND c.principal_id = r.principal_id
+                   WHERE r.status IN ('pending', 'running', 'waiting_retry')
+                     AND (r.retry_at IS NULL OR r.retry_at <= ?)
+                     AND c.status NOT IN ('closed', 'expired')
+                     AND c.expires_at >= ?
+                   ORDER BY r.updated_at ASC LIMIT ?""",
+                (now_ts, now_ts, int(limit)),
+            ).fetchall()
+        return [self._slack_resolver_run(row) for row in rows]
+
+    def attach_slack_resolver_workflow(
+        self, resolver_run_id, tenant_id, workflow_run_id, workflow_revision_id,
+        now_ts, cursor_token=None,
+    ):
+        """Bind the workflow now fetching one page, so retries stay single."""
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """SELECT cursor_json FROM slack_resolver_runs
+                       WHERE resolver_run_id = ? AND tenant_id = ?
+                         AND status NOT IN ('completed', 'failed', 'cancelled')""",
+                    (resolver_run_id, tenant_id),
+                ).fetchone()
+                if row is None:
+                    self._connection.execute("COMMIT")
+                    return False
+                cursor = json.loads(row["cursor_json"] or "{}")
+                cursor["dispatched"] = cursor_token
+                self._connection.execute(
+                    """UPDATE slack_resolver_runs
+                       SET workflow_run_id = ?, workflow_revision_id = ?,
+                           cursor_json = ?, status = 'running', updated_at = ?
+                       WHERE resolver_run_id = ? AND tenant_id = ?
+                         AND status NOT IN ('completed', 'failed', 'cancelled')""",
+                    (
+                        workflow_run_id, workflow_revision_id,
+                        json.dumps(cursor, sort_keys=True), int(now_ts),
+                        resolver_run_id, tenant_id,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return True
+
+    def _slack_resolver_run(self, row):
+        result = {
+            key: row[key] for key in (
+                "resolver_run_id", "tenant_id", "conversation_id",
+                "principal_id", "connection_id", "entity_kind", "query_hash",
+                "status", "retry_at", "last_error_code", "workflow_run_id",
+                "workflow_revision_id", "created_at", "updated_at",
+                "completed_at",
+            )
+        }
+        result["requested_state_version"] = int(row["requested_state_version"])
+        result["pages_processed"] = int(row["pages_processed"])
+        result["candidates_seen"] = int(row["candidates_seen"])
+        result["cursor"] = json.loads(row["cursor_json"] or "{}")
+        result["budget"] = json.loads(row["budget_json"] or "{}")
+        result["outcome"] = self._decode_conversation_content(
+            row["outcome_json"], row["tenant_id"], row["conversation_id"],
+            "resolver:%s" % row["resolver_run_id"], None,
+        ) if row["outcome_json"] else None
+        return result
+
     def apply_conversation_answer(
         self, conversation_id, tenant_id, principal_id, idempotency_key,
         field_name, value, now_ts, workflow_run_id=None,
@@ -1910,6 +2266,11 @@ class WorkflowRepository(object):
                     normalize_name(item.get("real_name")),
                     normalize_name(item.get("handle")),
                 }]
+            resolver_run_id = resolution_request.get("resolver_run_id")
+            page = self._record_slack_resolver_step_page(
+                resolver_run_id, tenant_id, resolver_step, output,
+                len(candidates), now_ts,
+            )
             if len(matches) == 1:
                 selected = matches[0]
                 entity = ({"id": selected["id"], "name": selected["name"]}
@@ -1921,6 +2282,16 @@ class WorkflowRepository(object):
                           })
                 changes.update(status="resolving", blocking_need=None)
                 changes["active_channel" if field == "channel" else "active_person"] = entity
+                self._complete_slack_resolver_run_if_any(
+                    resolver_run_id, tenant_id,
+                    {"kind": "matched", "entity": entity}, now_ts,
+                )
+            elif not matches and page is not None and not page["exhausted"]:
+                self.update_conversation(
+                    row["conversation_id"], tenant_id, row["principal_id"],
+                    {"status": "retrieving"}, now_ts,
+                )
+                return True
             else:
                 safe_options = [{key: item[key] for key in (
                     "id", "name", "display_name", "real_name", "handle", "image_url"
@@ -1935,6 +2306,17 @@ class WorkflowRepository(object):
                                   else "Which Slack person?")),
                     "options": safe_options,
                 })
+                self._complete_slack_resolver_run_if_any(
+                    resolver_run_id, tenant_id,
+                    {
+                        "kind": "ambiguous" if safe_options else (
+                            "exhausted" if page is not None
+                            and page.get("budget_exhausted") else "not_found"
+                        ),
+                        "options": safe_options,
+                    },
+                    now_ts,
+                )
             self.update_conversation(
                 row["conversation_id"], tenant_id, row["principal_id"], changes, now_ts
             )

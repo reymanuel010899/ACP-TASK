@@ -666,3 +666,112 @@ def test_thread_and_dm_drafts_materialize_exact_targets_and_localized_success(tm
     state = store.get("conversation:1", "org:1", "user:1")
     assert state.get("pending_draft") is None
     assert state["status"] == "succeeded"
+
+
+class _ResolverConnections:
+    def list_tenant_installations(self, tenant, provider):
+        return [{"connection_id": "conn:s", "team_name": "Acme",
+                 "status": "connected", "credential_version": 1,
+                 "granted_scopes": ["channels:read", "chat:write"],
+                 "enabled_capabilities": [
+                     "slack.channels.list", "slack.message.send"]}]
+
+
+def _finish_resolver_page(repository, revision_id, output, now=10):
+    revision = repository.get_revision_by_id(revision_id, "org:1")
+    claim = repository.claim_ready_step(
+        revision["workflow_run_id"], revision["workflow_revision_id"],
+        "org:1", "worker:1", now, 30,
+    )
+    repository.persist_completion(
+        revision["workflow_revision_id"], "resolve-slack-channel", "org:1",
+        claim["attempt"], {"ok": True}, {}, now, output=output,
+    )
+    return repository.sync_conversation_workflow_outcome(
+        revision["workflow_revision_id"], "org:1", {"status": "complete"}, now
+    )
+
+
+def test_resolution_pages_durably_across_restart_and_finishes_from_its_event(tmp_path):
+    from libs.integrations.catalog import slack_definitions
+
+    database = str(tmp_path / "paged-resolver.db")
+    repository = WorkflowRepository(database)
+    store = ConciergeConversationStore(repository, clock=lambda: 10)
+    service = DynamicWorkflowService(
+        object(), slack_definitions(), _ResolverConnections(), repository,
+        conversation_store=store, clock=lambda: 10,
+    )
+    intake = service.coordinate_slack_turn(
+        "org:1", "user:1", "Manda en #general que Hola equipo"
+    )
+    resolving = service.advance_slack_turn(
+        intake["conversation_id"], "org:1", "user:1",
+        "Manda en #general que Hola equipo", intake,
+    )
+    conversation_id = intake["conversation_id"]
+    resolver_run_id = store.get(
+        conversation_id, "org:1", "user:1"
+    )["resolution_request"]["resolver_run_id"]
+
+    _finish_resolver_page(repository, resolving["workflow"]["revisionId"], {
+        "channels": [{"id": "C9", "name": "otros"}],
+        "response_metadata": {"next_cursor": "page-2"},
+    })
+
+    assert store.get(conversation_id, "org:1", "user:1")["status"] == "retrieving"
+    after_page_one = repository.get_slack_resolver_run(resolver_run_id, "org:1")
+    assert after_page_one["pages_processed"] == 1
+    assert after_page_one["cursor"]["next"] == "page-2"
+    assert after_page_one["status"] == "running"
+
+    restarted = WorkflowRepository(database)
+    restarted_store = ConciergeConversationStore(restarted, clock=lambda: 11)
+    restarted_service = DynamicWorkflowService(
+        object(), slack_definitions(), _ResolverConnections(), restarted,
+        conversation_store=restarted_store, clock=lambda: 11,
+    )
+    resumable = restarted.list_resumable_slack_resolver_runs(11)
+    assert [item["resolver_run_id"] for item in resumable] == [resolver_run_id]
+    assert restarted_service.continue_slack_resolver_run(resumable[0], 11) is True
+    assert restarted_service.continue_slack_resolver_run(
+        restarted.get_slack_resolver_run(resolver_run_id, "org:1"), 11
+    ) is False
+
+    second_revision = restarted_store.get(
+        conversation_id, "org:1", "user:1"
+    )["workflow_revision_id"]
+    page_two = restarted.get_revision_by_id(second_revision, "org:1")
+    assert page_two["steps"][0]["input"]["cursor"] == "page-2"
+
+    _finish_resolver_page(restarted, second_revision, {
+        "channels": [{"id": "C1", "name": "general"}],
+    }, now=11)
+
+    completed = restarted.get_slack_resolver_run(resolver_run_id, "org:1")
+    assert completed["status"] == "completed"
+    assert completed["pages_processed"] == 2
+    assert completed["outcome"]["entity"] == {"id": "C1", "name": "general"}
+    assert restarted.count_outbox_events(
+        "org:1", "slack-resolver:%s" % resolver_run_id
+    ) == 1
+    assert restarted_store.get(
+        conversation_id, "org:1", "user:1"
+    )["status"] == "resolving"
+
+    payload = {"resolver_run_id": resolver_run_id, "principal_id": "user:1"}
+    assert restarted_service.apply_slack_resolver_completion(
+        "org:1", conversation_id, payload, 11,
+    ) is True
+    assert restarted_service.apply_slack_resolver_completion(
+        "org:1", conversation_id, payload, 11,
+    ) is False
+    assert restarted_service.apply_slack_resolver_completion(
+        "org:other", conversation_id, payload, 11,
+    ) is False
+
+    finished = restarted_store.get(conversation_id, "org:1", "user:1")
+    assert finished["status"] == "awaiting_approval"
+    assert finished["pending_draft"]["destination_label"] == "#general"
+    assert finished["pending_draft"]["text"] == "Hola equipo"
+    assert finished.get("resolution_request") is None

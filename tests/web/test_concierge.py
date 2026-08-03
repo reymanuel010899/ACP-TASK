@@ -106,3 +106,35 @@ def test_known_recovery_is_structured_and_redacts_exception_details():
     assert response["error"] == {"code": "missing_scope"}
     assert response["recovery"] == {"action": "upgrade_scopes"}
     assert "xoxb" not in str(response)
+
+
+def test_conversation_polling_projects_state_without_resuming_the_turn():
+    import inspect
+
+    import web.concierge as concierge
+
+    get_source = inspect.getsource(concierge._make_handler).split(
+        "def do_GET", 1
+    )[1].split("def do_POST", 1)[0]
+    for mutator in (
+        "resume_resolved_slack_turn", "coordinate_slack_turn",
+        "advance_slack_turn", "apply_slack_resolver_completion",
+        "continue_slack_resolver_run", ".update(",
+    ):
+        assert mutator not in get_source
+
+    pending = _conversation_response({
+        "status": "resolving", "conversation_id": "conversation:3",
+        "resolution_request": {
+            "field": "channel", "resolver_run_id": "slack-resolver:1",
+            "text": "Manda en #general que Hola equipo",
+        },
+        "workflow_run_id": "workflow:3", "workflow_revision_id": "revision:3",
+    })
+
+    assert pending["state"] == "resolving"
+    assert pending["workflow"] == {
+        "workflowId": "workflow:3", "revisionId": "revision:3",
+    }
+    assert "resolver_run_id" not in str(pending)
+    assert "Hola equipo" not in str(pending)

@@ -88,6 +88,9 @@ create table orchestrator.slack_resolver_runs (
     candidates_seen integer not null default 0 check (candidates_seen >= 0),
     retry_at timestamptz,
     last_error_code text,
+    workflow_run_id text,
+    workflow_revision_id text,
+    outcome_json jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     completed_at timestamptz,
@@ -101,7 +104,13 @@ create table orchestrator.slack_resolver_runs (
 
 create index slack_resolver_runs_claimable
     on orchestrator.slack_resolver_runs(status, retry_at, updated_at)
-    where status in ('pending', 'waiting_retry');
+    where status in ('pending', 'running', 'waiting_retry');
+
+create unique index slack_resolver_runs_request
+    on orchestrator.slack_resolver_runs(
+        tenant_id, conversation_id, connection_id, entity_kind, query_hash,
+        requested_state_version
+    );
 
 create table orchestrator.concierge_outcome_events (
     event_id text not null,

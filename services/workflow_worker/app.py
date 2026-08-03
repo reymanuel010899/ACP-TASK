@@ -6,7 +6,10 @@ import socket
 import time
 
 from agents.orchestrator.action_repository import ActionRepository
+from agents.orchestrator.brain import make_brain
 from agents.orchestrator.broker_client import ActionBrokerClient
+from agents.orchestrator.conversation_state import ConciergeConversationStore
+from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.policy import PolicyEvaluator
 from agents.orchestrator.workflow_broker_dispatcher import WorkflowBrokerDispatcher
 from agents.orchestrator.workflow_executor import WorkflowExecutor
@@ -23,9 +26,11 @@ class WorkflowWorker:
     OUTBOX_VISIBILITY_SECONDS = 30
     OUTBOX_RETRY_SECONDS = 5
 
-    def __init__(self, workflows, executor, worker_id=None):
+    def __init__(self, workflows, executor, worker_id=None,
+                 conversation_resolver=None):
         self.workflows = workflows
         self.executor = executor
+        self.conversation_resolver = conversation_resolver
         self.worker_id = worker_id or "workflow-worker:%s:%s" % (socket.gethostname(), os.getpid())
 
     def run_once(self):
@@ -64,7 +69,24 @@ class WorkflowWorker:
                     "error": type(exc).__name__,
                 })
         self._drain_outbox(now)
+        self._resume_slack_resolver_runs(now)
         return outcomes
+
+    def _resume_slack_resolver_runs(self, now):
+        """Page durable resolver runs forward after completion or restart."""
+        resolver = self.conversation_resolver
+        if resolver is None or not hasattr(
+            self.workflows, "list_resumable_slack_resolver_runs"
+        ):
+            return 0
+        resumed = 0
+        for run in self.workflows.list_resumable_slack_resolver_runs(now):
+            try:
+                if resolver.continue_slack_resolver_run(run, now):
+                    resumed += 1
+            except Exception:
+                continue
+        return resumed
 
     def _drain_outbox(self, now, limit=100):
         if not hasattr(self.workflows, "claim_outbox_event"):
@@ -89,11 +111,22 @@ class WorkflowWorker:
                 )
         return drained
 
+    def _apply_resolver_completion(self, event, now):
+        """Continue the conversation server-side so polling stays read-only."""
+        resolver = self.conversation_resolver
+        if resolver is None:
+            return False
+        return bool(resolver.apply_slack_resolver_completion(
+            event["tenant_id"], event["aggregate_id"],
+            event.get("payload") or {}, now,
+        ))
+
     def _project_event(self, event, now):
         event_type = event.get("event_type")
         if event_type not in {
             "workflow.outcome",
             "conversation.turn_committed",
+            "conversation.resolver_completed",
         }:
             raise ValueError("unsupported outbox event type")
         watermark = self.workflows.get_projection_watermark(
@@ -110,6 +143,8 @@ class WorkflowWorker:
             )
             if not projected:
                 raise RuntimeError("conversation outcome was not projectable")
+        if event_type == "conversation.resolver_completed":
+            self._apply_resolver_completion(event, now)
         advanced = self.workflows.advance_projection_watermark(
             event["tenant_id"], event["aggregate_type"], event["aggregate_id"],
             event["aggregate_version"], event["event_id"], now,
@@ -147,7 +182,36 @@ def build_worker():
         ),
     )
     executor = WorkflowExecutor(workflows, dispatcher, policy=lambda _step: _enabled())
-    return WorkflowWorker(workflows, executor)
+    return WorkflowWorker(
+        workflows, executor,
+        conversation_resolver=_build_conversation_resolver(
+            workflows, connections, rollout_version
+        ),
+    )
+
+
+def _build_conversation_resolver(workflows, connections, rollout_version):
+    """Own resolver continuation here so HTTP polling stays read-only."""
+    return DynamicWorkflowService(
+        make_brain(),
+        google_definitions() + slack_definitions(),
+        connections,
+        workflows,
+        rollout_version=rollout_version,
+        shadow_mode=os.environ.get(
+            "TESSERA_DYNAMIC_PLANNER_SHADOW", "true"
+        ).lower() != "false",
+        conversation_store=ConciergeConversationStore(workflows),
+        conversational_reads_enabled=os.environ.get(
+            "TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED", "false"
+        ).lower() == "true",
+        slack_writes_enabled=os.environ.get(
+            "TESSERA_SLACK_WRITES_ENABLED", "false"
+        ).lower() == "true",
+        slack_dms_enabled=os.environ.get(
+            "TESSERA_SLACK_DMS_ENABLED", "false"
+        ).lower() == "true",
+    )
 
 
 def main(argv=None):

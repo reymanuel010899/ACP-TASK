@@ -1,9 +1,10 @@
 ---
 title: "General Slack Orchestration in Concierge"
 type: feat
-status: active
+status: paused
 date: 2026-07-31
 deepened: 2026-07-31
+paused: 2026-08-03
 ---
 
 # General Slack Orchestration in Concierge
@@ -17,6 +18,117 @@ The system will be bot-first and capability-driven. User-token and Enterprise ad
 ---
 
 ## Current Execution Checkpoint & Laptop Handoff
+
+> **Latest authoritative checkpoint — 2026-08-03:** Execution is paused at
+> the user's request to change models. The older 2026-07-31 handoff retained
+> below is historical evidence and is superseded by this checkpoint.
+
+### Pause checkpoint — 2026-08-03
+
+**Branch:** `codex/feat-conversational-slack-concierge`
+
+**Current phase:** Phase 1 — Safety and contracts
+
+**Current unit:** U3B — Grounded Slack entity graph and correction semantics
+
+**Next unit after U3B:** U3C — Durable paginated resolver and worker projection
+
+**Pause reason:** The user exhausted the current model/token allowance and asked
+to stop execution before changing models.
+
+#### Current progress
+
+| Unit | Status | Verified result |
+|---|---|---|
+| U1 — Execution foundations | **Complete** | Foundation implementation and regression coverage remain green. |
+| U2 — Registry and typed brain | **Complete** | The untouched live V3 gate passed with `openai/gpt-oss-120b`: 100% operation accuracy, 100% required-slot accuracy, zero authority violations, and zero transport failures across 24 cases. Evidence is committed in `docs/operations/slack-phase1-language-gate.md`. |
+| U3A — Versioned turns and CAS | **Complete / committed** | Durable client-turn idempotency, conversation `state_version`, exclusive active-turn reservation, atomic state/outbox commit, RLS migration foundations, and worker support for `conversation.turn_committed`. Full repository verification after this slice: **1201 passed, 4 skipped**. |
+| U3B — Entity graph and corrections | **In progress / uncommitted** | Repository entity snapshots and service grounding are implemented locally; focused verification reached **72 passed** before the final shorthand-context test was added. That last test and the complete current diff have not yet been rerun. |
+| U3C — Durable resolver | **Pending** | Must add paginated/resumable resolver runs, completion outbox events, worker projection, and remove mutation from HTTP GET polling. |
+| U3D — Isolation and expiry integration | **Pending** | Tenant-switch, restart, expiry, concurrent-tab, and read-only polling regressions remain. |
+| U4-U10 / U8 rollout | **Pending** | Do not start until U3 is complete and green. |
+
+#### Commits completed in this work session
+
+- `9c68d09 docs(slack): record phase 1 language gate pass`
+- `e87921b feat(concierge): add versioned idempotent turns`
+
+The U3A commit contains:
+
+- `migrations/0014_slack_conversation_entities.sql` foundations;
+- versioned/idempotent `concierge_turns`;
+- conversation compare-and-swap updates;
+- one active turn reservation per base state version;
+- atomic turn, conversation, and outbox persistence with rollback coverage;
+- worker acknowledgement of `conversation.turn_committed` without replaying
+  conversation mutations.
+
+#### Uncommitted U3B work at the pause boundary
+
+The following tracked files are intentionally modified and must be preserved:
+
+- `agents/orchestrator/dynamic_workflow_service.py`
+- `agents/orchestrator/slack_conversation.py`
+- `agents/orchestrator/workflow_repository.py`
+- `migrations/0014_slack_conversation_entities.sql`
+- `tests/migrations/test_slack_conversation_entities_migration.py`
+- `tests/orchestrator/test_dynamic_workflow_service.py`
+- `tests/orchestrator/test_slack_conversation.py`
+- `tests/orchestrator/test_workflow_repository.py`
+- this plan file
+
+The untracked `docs/brainstorms/` directory was not created or modified as part
+of U3B and must not be staged blindly.
+
+The local U3B diff currently adds:
+
+- minimized entity allowlists for workspace, channel, user, message, thread,
+  file, and reaction records;
+- `provider_entity_id` and monotonic entity versions, with idempotent replay and
+  superseding of changed snapshots;
+- tenant/principal/conversation/connection/team binding and freshness checks;
+- fail-closed entity reads after staleness, conversation expiry, or closure;
+- persisted typed operation candidates, slots, dependencies, blockers, known
+  inputs, correction lineage, and grounded entity references;
+- correction linkage from the prior entity reference to the replacement entity
+  reference while preserving unrelated slots and exact message text;
+- server-grounded shorthand context for active message/thread/file/reaction
+  fields.
+
+#### Exact resume sequence for the next model
+
+1. Do not discard or overwrite the dirty U3B worktree. Inspect `git diff` first.
+2. Run the newly added shorthand test, which was not executed after the pause:
+
+   ```bash
+   .venv/bin/pytest -q \
+     tests/orchestrator/test_slack_conversation.py::test_thread_shorthand_uses_only_server_grounded_context
+   ```
+
+3. Run the complete U3B focused suite:
+
+   ```bash
+   .venv/bin/pytest -q \
+     tests/orchestrator/test_dynamic_workflow_service.py \
+     tests/orchestrator/test_slack_conversation.py \
+     tests/orchestrator/test_workflow_repository.py \
+     tests/orchestrator/test_conversation_state.py \
+     tests/migrations/test_slack_conversation_entities_migration.py
+   ```
+
+4. Review privacy minimization, owner predicates, stale/closed conversation
+   behavior, and migration compatibility. Run `git diff --check`.
+5. If green, commit only the reviewed U3B files with a value-focused message
+   such as `feat(concierge): persist grounded Slack entity context`.
+6. Start U3C test-first: persist resolver runs/cursors/budgets; emit one durable
+   resolver-completion event; consume it in the worker; make conversation GET
+   strictly read-only; prove restart and concurrent-callback idempotency.
+7. Do not mark U3 complete until U3C/U3D tenant isolation, expiry, replay,
+   pagination, restart, and current-state rebase tests pass.
+
+---
+
+### Historical checkpoint — 2026-07-31
 
 **Checkpoint date:** 2026-07-31  
 **Branch:** `codex/feat-conversational-slack-concierge`  

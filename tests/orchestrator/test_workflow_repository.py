@@ -1,3 +1,4 @@
+import json
 import threading
 
 import pytest
@@ -632,3 +633,161 @@ def test_slack_entity_reads_require_owner_binding_and_freshness(tmp_path):
         stored["entity_ref_id"], "conversation:entities", "org:acme",
         "user:alice", 22, include_stale=True,
     ) is None
+
+
+def _resolver_conversation(tmp_path, conversation_id="conversation:resolver"):
+    repository = _repository(tmp_path)
+    repository.create_conversation(
+        "org:acme", "user:alice", 10, ttl_seconds=600,
+        conversation_id=conversation_id,
+    )
+    return repository
+
+
+def test_slack_resolver_runs_page_durably_and_ignore_replayed_callbacks(tmp_path):
+    repository = _resolver_conversation(tmp_path)
+
+    started = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "channel", "query:anuncios", 1, 11, budget={"max_pages": 3},
+    )
+    reserved_again = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "channel", "query:anuncios", 1, 12, budget={"max_pages": 3},
+    )
+
+    assert started["created"] is True
+    assert started["status"] == "pending"
+    assert reserved_again["created"] is False
+    assert reserved_again["resolver_run_id"] == started["resolver_run_id"]
+
+    run_id = started["resolver_run_id"]
+    first_page = repository.record_slack_resolver_page(
+        run_id, "org:acme", None, "cursor:page-2", 200, 13,
+    )
+    replayed = repository.record_slack_resolver_page(
+        run_id, "org:acme", None, "cursor:page-2", 200, 14,
+    )
+    second_page = repository.record_slack_resolver_page(
+        run_id, "org:acme", "cursor:page-2", None, 17, 15,
+    )
+
+    assert first_page["applied"] is True
+    assert first_page["exhausted"] is False
+    assert first_page["cursor"]["next"] == "cursor:page-2"
+    assert replayed["applied"] is False
+    assert replayed["pages_processed"] == 1
+    assert replayed["candidates_seen"] == 200
+    assert second_page["applied"] is True
+    assert second_page["exhausted"] is True
+    assert second_page["pages_processed"] == 2
+    assert second_page["candidates_seen"] == 217
+
+
+def test_slack_resolver_page_budget_stops_unbounded_pagination(tmp_path):
+    repository = _resolver_conversation(tmp_path)
+    run = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "user", "query:maria", 1, 11, budget={"max_pages": 2},
+    )
+
+    first = repository.record_slack_resolver_page(
+        run["resolver_run_id"], "org:acme", None, "cursor:2", 100, 12,
+    )
+    second = repository.record_slack_resolver_page(
+        run["resolver_run_id"], "org:acme", "cursor:2", "cursor:3", 100, 13,
+    )
+
+    assert first["budget_exhausted"] is False
+    assert second["budget_exhausted"] is True
+    assert second["exhausted"] is True
+    assert second["cursor"]["next"] == "cursor:3"
+
+
+def test_slack_resolver_completion_publishes_exactly_one_durable_event(tmp_path):
+    repository = _resolver_conversation(tmp_path)
+    run = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "channel", "query:anuncios", 1, 11,
+    )
+    run_id = run["resolver_run_id"]
+    repository.record_slack_resolver_page(
+        run_id, "org:acme", None, None, 12, 12,
+    )
+
+    completed = repository.complete_slack_resolver_run(
+        run_id, "org:acme",
+        {"kind": "matched", "entity": {"id": "C2", "name": "anuncios"}}, 13,
+    )
+    duplicate = repository.complete_slack_resolver_run(
+        run_id, "org:acme", {"kind": "not_found"}, 14,
+    )
+
+    assert completed["completed"] is True
+    assert completed["status"] == "completed"
+    assert completed["outcome"]["entity"] == {"id": "C2", "name": "anuncios"}
+    assert duplicate["completed"] is False
+    assert duplicate["outcome"]["kind"] == "matched"
+    assert repository.count_outbox_events(
+        "org:acme", "slack-resolver:%s" % run_id
+    ) == 1
+    event = repository._connection.execute(
+        "SELECT event_type, payload_json FROM workflow_outbox "
+        "WHERE dedupe_key = ?", ("slack-resolver:%s" % run_id,),
+    ).fetchone()
+    assert event["event_type"] == "conversation.resolver_completed"
+    assert json.loads(event["payload_json"])["outcome"] == "matched"
+
+
+def test_slack_resolver_runs_resume_after_restart_and_stay_tenant_bound(tmp_path):
+    repository = _resolver_conversation(tmp_path)
+    run = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "channel", "query:anuncios", 1, 11,
+    )
+    run_id = run["resolver_run_id"]
+    repository.record_slack_resolver_page(
+        run_id, "org:acme", None, "cursor:page-2", 200, 12,
+    )
+
+    restarted = WorkflowRepository(str(tmp_path / "workflows.sqlite3"))
+    resumable = restarted.list_resumable_slack_resolver_runs(13)
+
+    assert [item["resolver_run_id"] for item in resumable] == [run_id]
+    assert resumable[0]["cursor"]["next"] == "cursor:page-2"
+    assert resumable[0]["pages_processed"] == 1
+    assert restarted.get_slack_resolver_run(run_id, "org:other") is None
+    assert restarted.get_slack_resolver_run(
+        run_id, "org:acme", principal_id="user:bob"
+    ) is None
+
+    restarted.complete_slack_resolver_run(
+        run_id, "org:acme", {"kind": "not_found"}, 14,
+    )
+    assert restarted.list_resumable_slack_resolver_runs(15) == []
+
+
+def test_slack_resolver_runs_fail_closed_on_unavailable_conversations(tmp_path):
+    repository = _resolver_conversation(tmp_path)
+    run = repository.start_slack_resolver_run(
+        "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+        "channel", "query:anuncios", 1, 11,
+    )
+    repository.close_conversation(
+        "conversation:resolver", "org:acme", "user:alice", 12
+    )
+
+    assert repository.list_resumable_slack_resolver_runs(13) == []
+    with pytest.raises(KeyError):
+        repository.start_slack_resolver_run(
+            "conversation:resolver", "org:acme", "user:alice", "conn:slack",
+            "user", "query:maria", 1, 13,
+        )
+    with pytest.raises(KeyError):
+        repository.start_slack_resolver_run(
+            "conversation:missing", "org:acme", "user:alice", "conn:slack",
+            "channel", "query:x", 1, 13,
+        )
+    assert repository.get_slack_resolver_run(
+        run["resolver_run_id"], "org:acme"
+    )["status"] == "pending"

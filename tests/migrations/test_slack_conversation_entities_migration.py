@@ -46,3 +46,12 @@ def test_outcome_events_are_append_only_and_resolvers_are_resumable():
     assert "budget_json jsonb not null default '{}'" in sql
     assert "check (status in (" in sql
     assert "'pending', 'running', 'waiting_retry', 'completed', 'failed', 'cancelled'" in sql
+    assert "workflow_run_id text" in sql
+    assert "workflow_revision_id text" in sql
+    assert "outcome_json jsonb" in sql
+    assert "create unique index slack_resolver_runs_request" in sql
+    assert (
+        "tenant_id, conversation_id, connection_id, entity_kind, query_hash, "
+        "requested_state_version"
+    ) in " ".join(sql.split())
+    assert "where status in ('pending', 'running', 'waiting_retry')" in sql
