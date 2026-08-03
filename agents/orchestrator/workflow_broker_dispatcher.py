@@ -169,13 +169,20 @@ class WorkflowBrokerDispatcher:
                 "payload_hash": canonical_payload_hash(step["input"]),
                 "idempotency_key": proposal["idempotency_key"],
             })
-        lease = self.actions.issue_lease(
-            run["user_principal_id"], self.agent_principal_id, task_id,
-            connection["credential_id"], [step["capability_id"]], now + self.ttl,
-            workflow_revision_id=claim["workflow_revision_id"],
-            step_id=step["step_id"], plan_graph_hash=revision["plan_graph_hash"],
-            connection_id=step["connection_id"], attempt=claim["attempt"],
-        )
+        try:
+            lease = self.actions.issue_lease(
+                run["user_principal_id"], self.agent_principal_id, task_id,
+                connection["credential_id"], [step["capability_id"]], now + self.ttl,
+                workflow_revision_id=claim["workflow_revision_id"],
+                step_id=step["step_id"], plan_graph_hash=revision["plan_graph_hash"],
+                connection_id=step["connection_id"], attempt=claim["attempt"],
+                now_ts=now,
+            )
+        except Exception as exc:
+            # Nothing has reached the provider yet, so this outcome is known:
+            # no effect occurred. Reporting it as ambiguous would strand the
+            # step in reconciliation instead of letting it retry.
+            raise CorrectableStepError("pre_dispatch:%s" % type(exc).__name__)
         status, body = self.broker.execute(lease, binding, step["input"])
         if status != 200:
             _raise_for_broker_failure(status, body, step["effect"])

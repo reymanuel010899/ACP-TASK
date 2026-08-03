@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 import uuid
 import secrets
 
@@ -289,9 +290,25 @@ class ActionRepository(object):
         plan_graph_hash="legacy",
         connection_id="legacy",
         attempt=0,
+        now_ts=None,
     ):
         lease = secrets.token_urlsafe(32)
+        revoked_at = int(time.time() if now_ts is None else now_ts)
         with self._lock:
+            if workflow_revision_id != "legacy":
+                # A retry inherits the prior attempt's stranded lease. Revoking
+                # it keeps one active lease per step while letting the retry
+                # proceed; without this the insert below violates
+                # capability_one_active_workflow_lease and the step is
+                # misreported as an unknown provider outcome.
+                self._connection.execute(
+                    """
+                    UPDATE capability_leases SET revoked_at = ?
+                    WHERE workflow_revision_id = ? AND step_id = ?
+                      AND consumed_at IS NULL AND revoked_at IS NULL
+                    """,
+                    (revoked_at, workflow_revision_id, step_id),
+                )
             self._connection.execute(
                 """
                 INSERT INTO capability_leases(
