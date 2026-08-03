@@ -277,25 +277,101 @@ class DynamicWorkflowService:
                 "state": "awaiting_approval", "conversation_id": conversation_id,
                 "draft": draft,
             }
-        if operation in {"read", "summarize", "list_channels", "list_private_channels"}:
-            goal = ({
-                "list_channels": "Lista los canales públicos de Slack",
-                "list_private_channels": "Lista los canales privados de Slack",
-            }.get(operation, text))
-            workflow = self.plan(
-                tenant_id, principal_id, goal,
-                {"slack_resolution": resolved},
+        if operation in self.READ_CAPABILITIES:
+            run, revision = self._dispatch_slack_read(
+                tenant_id, principal_id, operation, resolved,
             )
             self.conversation_store.update(
                 conversation_id, tenant_id, principal_id, status="retrieving",
-                workflow_run_id=workflow["run"]["workflow_run_id"],
-                workflow_revision_id=workflow["revision"]["workflow_revision_id"],
+                workflow_run_id=run["workflow_run_id"],
+                workflow_revision_id=revision["workflow_revision_id"],
             )
             return {
                 "state": "retrieving", "conversation_id": conversation_id,
-                "workflow": workflow["preview"],
+                "workflow": {"workflowId": run["workflow_run_id"],
+                             "revisionId": revision["workflow_revision_id"]},
             }
         return turn_payload
+
+    READ_CAPABILITIES = {
+        "list_channels": "slack.channels.list",
+        "list_private_channels": "slack.private_channels.list",
+        "read": "slack.conversation.read",
+        "summarize": "slack.conversation.read",
+    }
+    DEFAULT_READ_DAYS = 7
+    READ_PAGE_LIMIT = 200
+
+    def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved):
+        """Compile the read workflow deterministically.
+
+        The operation and its slots are already grounded by this point, so
+        asking the planner brain to invent a graph adds a second model call
+        that can fail schema validation and strand the turn. U4 makes the
+        bounded pipeline the only conversational read path.
+        """
+        thread = resolved.get("active_thread") or {}
+        capability_id = ("slack.thread.read" if thread.get("thread_ts")
+                         and operation in {"read", "summarize"}
+                         else self.READ_CAPABILITIES[operation])
+        connection_id = (resolved.get("active_connection") or {}).get("id")
+        connection = next((
+            item for item in self._tenant_installations(tenant_id, principal_id)
+            if item.get("connection_id") == connection_id
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            required = sorted(definition.required_scopes)[0] if definition else "unknown"
+            raise PermissionError("missing_scope:%s" % required)
+        now = int(self.clock())
+        payload = self._slack_read_input(capability_id, resolved, thread, now)
+        step = {
+            "step_id": "slack-read-%s" % operation,
+            "capability_id": capability_id,
+            "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload),
+            "depends_on": [], "effect": "read",
+        }
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step]})
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("read:%s" % operation), now
+        )
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, [step], now
+        )
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        return run, revision
+
+    def _slack_read_input(self, capability_id, resolved, thread, now):
+        """Bound every read by page size and an explicit, disclosed period."""
+        if capability_id in {"slack.channels.list", "slack.private_channels.list"}:
+            return {"limit": self.READ_PAGE_LIMIT}
+        channel = resolved.get("active_channel") or {}
+        channel_id = thread.get("channel_id") or channel.get("id")
+        if not channel_id:
+            raise ValueError("Slack read target is unresolved")
+        period = resolved.get("read_period") or {}
+        days = int(period.get("days") or self.DEFAULT_READ_DAYS)
+        payload = {
+            "channel_id": channel_id, "limit": self.READ_PAGE_LIMIT,
+            "oldest": str(now - days * 86400), "latest": str(now),
+        }
+        if capability_id == "slack.thread.read":
+            payload["thread_ts"] = thread["thread_ts"]
+        if capability_id == "slack.private_conversation.read":
+            payload = {"channel_id": channel_id, "limit": self.READ_PAGE_LIMIT}
+        return payload
 
     def _start_slack_entity_resolution(self, conversation_id, tenant_id,
                                        principal_id, text, turn, field, query):

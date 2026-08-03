@@ -849,3 +849,114 @@ def test_closing_a_previewed_conversation_records_an_explicit_rejection(tmp_path
     assert [item["event_type"] for item in events][-1] == "rejected"
     assert events[-1]["operation_family"] == "post"
     assert events[-1]["metrics"]["terminal_outcome"] == "closed_by_user"
+
+
+class _ExplodingBrain:
+    """Any planner call during a grounded read is a regression."""
+
+    def generate_plan(self, *args, **kwargs):
+        raise AssertionError("a grounded read must not call the planner brain")
+
+    def understand_slack(self, *args, **kwargs):
+        raise AssertionError("no interpretation is needed for this fixture")
+
+
+class _ReadConnections:
+    def list_tenant_installations(self, tenant, provider):
+        return [{"connection_id": "conn:s", "team_id": "T1", "team_name": "Acme",
+                 "status": "connected", "credential_version": 1,
+                 "granted_scopes": ["channels:read", "channels:history"],
+                 "enabled_capabilities": [
+                     "slack.channels.list", "slack.conversation.read",
+                     "slack.thread.read"]}]
+
+
+def _read_service(tmp_path, name):
+    repository = WorkflowRepository(str(tmp_path / name))
+    store = ConciergeConversationStore(repository, clock=lambda: 1_000_000)
+    service = DynamicWorkflowService(
+        _ExplodingBrain(), slack_definitions(), _ReadConnections(), repository,
+        conversation_store=store, clock=lambda: 1_000_000,
+    )
+    return repository, store, service
+
+
+def test_a_grounded_read_compiles_without_the_planner_brain(tmp_path):
+    repository, store, service = _read_service(tmp_path, "read-direct.db")
+
+    run, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C1", "name": "general"}},
+    )
+
+    step = repository.get_revision(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:1"
+    )["steps"][0]
+    assert step["capability_id"] == "slack.conversation.read"
+    assert step["effect"] == "read"
+    assert step["input"]["channel_id"] == "C1"
+    assert step["input"]["limit"] == 200
+    assert int(step["input"]["latest"]) == 1_000_000
+    assert int(step["input"]["oldest"]) == 1_000_000 - 7 * 86400
+    assert repository.revision_authorization_mode(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:1",
+        revision["plan_graph_hash"], 1_000_000,
+    ) == "requested_read"
+
+
+def test_an_explicit_period_replaces_the_disclosed_default(tmp_path):
+    _, _, service = _read_service(tmp_path, "read-period.db")
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "summarize",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C1"},
+         "read_period": {"days": 2, "defaulted": False}},
+    )
+
+    step = revision["steps"][0]
+    assert int(step["input"]["latest"]) - int(step["input"]["oldest"]) == 2 * 86400
+
+
+def test_a_thread_context_reads_the_thread_not_the_channel(tmp_path):
+    _, _, service = _read_service(tmp_path, "read-thread.db")
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C1"},
+         "active_thread": {"channel_id": "C1", "thread_ts": "1710.0001"}},
+    )
+
+    step = revision["steps"][0]
+    assert step["capability_id"] == "slack.thread.read"
+    assert step["input"]["thread_ts"] == "1710.0001"
+    assert step["input"]["channel_id"] == "C1"
+
+
+def test_listing_channels_needs_no_channel_and_no_period(tmp_path):
+    _, _, service = _read_service(tmp_path, "read-list.db")
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "list_channels",
+        {"active_connection": {"id": "conn:s"}},
+    )
+
+    step = revision["steps"][0]
+    assert step["capability_id"] == "slack.channels.list"
+    assert step["input"] == {"limit": 200}
+
+
+def test_a_read_without_scope_or_target_fails_closed(tmp_path):
+    _, _, service = _read_service(tmp_path, "read-denied.db")
+
+    with pytest.raises(ValueError, match="Slack read target is unresolved"):
+        service._dispatch_slack_read(
+            "org:1", "user:1", "read", {"active_connection": {"id": "conn:s"}},
+        )
+    with pytest.raises(PermissionError, match="missing_scope"):
+        service._dispatch_slack_read(
+            "org:1", "user:1", "list_private_channels",
+            {"active_connection": {"id": "conn:s"}},
+        )
