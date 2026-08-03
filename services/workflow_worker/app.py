@@ -105,11 +105,39 @@ class WorkflowWorker:
                 )
                 drained += 1
             except Exception as exc:
-                self.workflows.fail_outbox_event(
+                disposition = self.workflows.fail_outbox_event(
                     event["event_id"], event["tenant_id"], self.worker_id,
                     now, type(exc).__name__, self.OUTBOX_RETRY_SECONDS,
                 )
+                if disposition == "dead_letter":
+                    self._strand_conversation(event, now, type(exc).__name__)
         return drained
+
+    def _strand_conversation(self, event, now, error_code):
+        """Give up loudly: a dead event must not leave a turn polling forever."""
+        if event.get("aggregate_type") != "conversation":
+            return False
+        principal_id = (event.get("payload") or {}).get("principal_id")
+        if not principal_id or not hasattr(
+            self.workflows, "update_conversation"
+        ):
+            return False
+        try:
+            return bool(self.workflows.update_conversation(
+                event["aggregate_id"], event["tenant_id"], principal_id,
+                {
+                    "status": "retryable_failure",
+                    "blocking_need": {
+                        "kind": "recovery", "field": "operation", "options": [],
+                        "question": "No pude completar esa consulta. "
+                                    "¿Quieres intentarlo de nuevo?",
+                        "error_code": error_code,
+                    },
+                },
+                now,
+            ))
+        except Exception:
+            return False
 
     def _apply_resolver_completion(self, event, now):
         """Continue the conversation server-side so polling stays read-only."""

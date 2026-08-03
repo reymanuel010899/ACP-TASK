@@ -213,3 +213,74 @@ def test_worker_without_a_resolver_still_acknowledges_resolution_events():
     WorkflowWorker(repository, Executor(), "worker:1").run_once()
 
     assert repository.completed == ("event:resolver", "org:1", "worker:1")
+
+
+def test_a_dead_lettered_conversation_event_stops_the_turn_polling_forever():
+    class Repository(_ResolverEventRepository):
+        def __init__(self):
+            _ResolverEventRepository.__init__(self)
+            self.updated = None
+
+        def fail_outbox_event(self, event, tenant, worker, now, error, retry):
+            self.failed = (event, error)
+            return "dead_letter"
+
+        def update_conversation(self, conversation, tenant, principal, changes,
+                                now):
+            self.updated = (conversation, tenant, principal, changes)
+            return True
+
+    repository = Repository()
+
+    class Resolver:
+        def apply_slack_resolver_completion(self, *args):
+            raise RuntimeError("brain produced an invalid plan")
+
+        def continue_slack_resolver_run(self, run, now):
+            return False
+
+    class Executor:
+        pass
+
+    WorkflowWorker(
+        repository, Executor(), "worker:1", conversation_resolver=Resolver()
+    ).run_once()
+
+    conversation, tenant, principal, changes = repository.updated
+    assert conversation == "conversation:1"
+    assert tenant == "org:1"
+    assert principal == "user:1"
+    assert changes["status"] == "retryable_failure"
+    assert changes["blocking_need"]["error_code"] == "RuntimeError"
+    assert repository.failed == ("event:resolver", "RuntimeError")
+
+
+def test_a_retryable_conversation_event_is_left_alone_to_retry():
+    class Repository(_ResolverEventRepository):
+        def __init__(self):
+            _ResolverEventRepository.__init__(self)
+            self.updated = None
+
+        def fail_outbox_event(self, event, tenant, worker, now, error, retry):
+            return "retry"
+
+        def update_conversation(self, *args):
+            raise AssertionError("a retryable event must not strand the turn")
+
+    repository = Repository()
+
+    class Resolver:
+        def apply_slack_resolver_completion(self, *args):
+            raise RuntimeError("transient")
+
+        def continue_slack_resolver_run(self, run, now):
+            return False
+
+    class Executor:
+        pass
+
+    WorkflowWorker(
+        repository, Executor(), "worker:1", conversation_resolver=Resolver()
+    ).run_once()
+
+    assert repository.updated is None
