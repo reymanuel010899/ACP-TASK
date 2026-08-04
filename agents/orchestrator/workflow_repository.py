@@ -1946,7 +1946,21 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
-    def _present_slack_evidence(self, output, step_input, locale):
+    @staticmethod
+    def _slack_author_labels(directory):
+        """Map ids to a display name only; no email, title, or phone."""
+        labels = {}
+        for member in (directory or []):
+            if not isinstance(member, dict) or not member.get("id"):
+                continue
+            label = (member.get("display_name") or member.get("real_name")
+                     or member.get("handle"))
+            if label:
+                labels[member["id"]] = label
+        return labels
+
+    def _present_slack_evidence(self, output, step_input, locale,
+                                directory=None):
         """Answer only from cited evidence, never by echoing channel text.
 
         The raw provider payload is untrusted: it carries other people's words
@@ -1984,7 +1998,7 @@ class WorkflowRepository(object):
                 "messages": messages, "citations": citations,
                 "period": period, "partial": truncated,
                 "partial_reason": "page_budget_reached" if truncated else None,
-            }, locale,
+            }, locale, self._slack_author_labels(directory),
         )
         # Permalinks require a per-message fan-out this slice does not perform,
         # so citations carry stable references and say so rather than implying
@@ -2530,11 +2544,16 @@ class WorkflowRepository(object):
             current = self.get_conversation(
                 row["conversation_id"], tenant_id, row["principal_id"], now_ts
             )
+            directory = next((
+                (step.get("output") or {}).get("users")
+                for step in revision["steps"]
+                if (step.get("output") or {}).get("users") is not None
+            ), None)
             self.store_conversation_presentation(
                 row["conversation_id"], tenant_id, row["principal_id"],
                 self._present_slack_evidence(
                     evidence, (read_step or {}).get("input") or {},
-                    (current or {}).get("locale", "es"),
+                    (current or {}).get("locale", "es"), directory,
                 ), now_ts,
             )
         if status == "complete" and effects == {"write"}:

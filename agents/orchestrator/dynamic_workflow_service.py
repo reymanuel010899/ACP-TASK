@@ -308,6 +308,7 @@ class DynamicWorkflowService:
         "slack.conversation.read": 100,
         "slack.thread.read": 100,
         "slack.private_conversation.read": 100,
+        "slack.users.list": 200,
     }
 
     def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved):
@@ -338,7 +339,7 @@ class DynamicWorkflowService:
             raise PermissionError("missing_scope:%s" % required)
         now = int(self.clock())
         payload = self._slack_read_input(capability_id, resolved, thread, now)
-        step = {
+        steps = [{
             "step_id": "slack-read-%s" % operation,
             "capability_id": capability_id,
             "capability_version": definition.version,
@@ -347,19 +348,52 @@ class DynamicWorkflowService:
             "credential_version": int(connection.get("credential_version") or 0),
             "input": payload, "input_hash": _hash(payload),
             "depends_on": [], "effect": "read",
-        }
-        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step]})
+        }]
+        directory = self._slack_directory_step(capability_id, connection_id, connection)
+        if directory is not None:
+            steps.append(directory)
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": steps})
         run = self.workflows.create_run(
             tenant_id, principal_id, _hash("read:%s" % operation), now
         )
         revision = self.workflows.create_revision(
-            run["workflow_run_id"], tenant_id, graph_hash, [step], now
+            run["workflow_run_id"], tenant_id, graph_hash, steps, now
         )
         self.workflows.authorize_requested_read(
             run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
             graph_hash, principal_id, now,
         )
         return run, revision
+
+    def _slack_directory_step(self, capability_id, connection_id, connection):
+        """Fetch the member directory alongside a message read.
+
+        Evidence attributed to `U0BFT8SDGK1` is technically cited and
+        practically unreadable. The directory resolves those ids to names.
+        It runs beside the read rather than after it, because it depends on
+        the workspace and not on which messages came back.
+        """
+        if capability_id in {"slack.channels.list", "slack.private_channels.list"}:
+            return None
+        definition = next((item for item in self.definitions
+                           if item.capability_id == "slack.users.list"), None)
+        if definition is None or "slack.users.list" not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            return None
+        payload = {"limit": self.READ_PAGE_LIMITS["slack.users.list"]}
+        return {
+            "step_id": "slack-read-directory",
+            "capability_id": "slack.users.list",
+            "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload),
+            "depends_on": [], "effect": "read",
+        }
 
     def _slack_read_input(self, capability_id, resolved, thread, now):
         """Bound every read by page size and an explicit, disclosed period."""

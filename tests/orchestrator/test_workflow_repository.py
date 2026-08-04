@@ -928,3 +928,42 @@ def test_an_empty_read_says_so_instead_of_answering_from_nothing(tmp_path):
     assert presented["citations"] == []
     assert presented["period"] is None
     assert "No encontré mensajes" in presented["answer"]
+
+
+def test_author_labels_name_people_without_leaking_their_profile(tmp_path):
+    repository = _repository(tmp_path)
+
+    labels = repository._slack_author_labels([
+        {"id": "U1", "display_name": "María", "real_name": "María Ruiz",
+         "email": "maria@acme.com", "title": "CTO", "phone": "+34600"},
+        {"id": "U2", "real_name": "Ana Soto"},
+        {"id": "U3", "handle": "jsmith"},
+        {"id": "U4"},
+        {"display_name": "sin id"},
+    ])
+
+    assert labels == {"U1": "María", "U2": "Ana Soto", "U3": "jsmith"}
+    assert "acme.com" not in str(labels)
+    assert "CTO" not in str(labels)
+
+
+def test_read_evidence_names_authors_when_the_directory_is_present(tmp_path):
+    repository = _repository(tmp_path)
+    output = {"messages": [
+        {"ts": "1785402000.001", "user": "U1", "text": "Lanzamos el viernes."},
+        {"ts": "1785402100.002", "user": "U9", "text": "Voy con retraso."},
+    ]}
+    step_input = {"channel_id": "C1", "oldest": "1", "latest": "2"}
+
+    named = repository._present_slack_evidence(
+        output, step_input, "es", [{"id": "U1", "display_name": "María"}],
+    )
+    anonymous = repository._present_slack_evidence(output, step_input, "es")
+
+    assert "María (" in named["answer"]
+    assert "U1 (" not in named["answer"]
+    # An id absent from the directory still appears, so evidence is never
+    # dropped just because its author could not be named.
+    assert "U9 (" in named["answer"]
+    assert "U1 (" in anonymous["answer"]
+    assert named["citations"][0]["author_id"] == "U1"

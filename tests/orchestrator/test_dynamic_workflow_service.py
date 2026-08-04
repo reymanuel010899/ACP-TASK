@@ -994,3 +994,55 @@ def test_every_compiled_read_satisfies_its_capability_schema(
     )
 
     _assert_matches_capability_schema(revision["steps"][0])
+
+
+def test_a_message_read_fetches_the_directory_beside_it(tmp_path):
+    repository = WorkflowRepository(str(tmp_path / "read-directory.db"))
+    store = ConciergeConversationStore(repository, clock=lambda: 1_000_000)
+
+    class Connections:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "status": "connected",
+                     "credential_version": 1,
+                     "granted_scopes": ["channels:read", "channels:history",
+                                        "users:read"],
+                     "enabled_capabilities": [
+                         "slack.channels.list", "slack.conversation.read",
+                         "slack.users.list"]}]
+
+    service = DynamicWorkflowService(
+        _ExplodingBrain(), slack_definitions(), Connections(), repository,
+        conversation_store=store, clock=lambda: 1_000_000,
+    )
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"}, "active_channel": {"id": "C1"}},
+    )
+    _, listing = service._dispatch_slack_read(
+        "org:1", "user:1", "list_channels", {"active_connection": {"id": "conn:s"}},
+    )
+
+    assert [step["capability_id"] for step in revision["steps"]] == [
+        "slack.conversation.read", "slack.users.list",
+    ]
+    assert all(step["depends_on"] == [] for step in revision["steps"])
+    for step in revision["steps"]:
+        _assert_matches_capability_schema(step)
+    # A channel listing has no authors to name, so it stays a single call.
+    assert [step["capability_id"] for step in listing["steps"]] == [
+        "slack.channels.list",
+    ]
+
+
+def test_a_read_without_directory_scope_still_compiles(tmp_path):
+    _, _, service = _read_service(tmp_path, "read-no-directory.db")
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"}, "active_channel": {"id": "C1"}},
+    )
+
+    assert [step["capability_id"] for step in revision["steps"]] == [
+        "slack.conversation.read",
+    ]
