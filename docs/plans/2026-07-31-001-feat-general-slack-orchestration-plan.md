@@ -677,6 +677,25 @@ audited tenant-grant source is what turns it from a block into a policy.
 
 ### U5. Add messaging and lightweight collaboration effects
 
+**Progress (2026-08-04).** Five slices built and tested; none verified live yet.
+
+| Slice | State |
+|---|---|
+| Compound scopes (DM needs im:write *and* chat:write) | **Done** (`1b8eda6`) |
+| Remove a reaction | **Done** (`1b8eda6`) |
+| Pin / unpin a message | **Done** (`c3126bb`) |
+| Add a bookmark | **Done** (`227c72c`) |
+| Method-specific retry vs reconciliation | **Done** (`0ff0f9e`) |
+| Bookmark edit/remove | Not started — blocked on a bookmark listing capability, since nothing can discover a `bookmark_id` |
+
+Promoting `reactions.remove` and `pins.add` from planned to runtime invalidated
+three eval cases that asserted they were unsupported. Their ground truth
+changed because the product changed; the cases now expect the operation, which
+is stricter. The recorded language-gate pass therefore describes the previous
+corpus — see the note at the top of
+`docs/operations/slack-phase1-language-gate.md`.
+
+
 **Goal:** Complete ordinary posts, replies, DMs, reactions, pins, and bookmarks through exact previews, receipts, and reconciliation.
 
 **Requirements:** R3-R8, R11-R18, R20.
