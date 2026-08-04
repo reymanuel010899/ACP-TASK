@@ -7,6 +7,7 @@ import time
 from agents.orchestrator.compound import (
     apply_effect_decision,
     build_effect_group,
+    dispatchable_effects,
     group_outcome,
 )
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
@@ -27,7 +28,7 @@ class DynamicWorkflowService:
                  conversation_store=None, conversational_reads_enabled=True,
                  slack_writes_enabled=True, slack_dms_enabled=True,
                  slack_policy_visible=None, slack_family_flags=None,
-                 private_read_authorizer=None):
+                 private_read_authorizer=None, control_plane=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -43,6 +44,12 @@ class DynamicWorkflowService:
         self.slack_family_flags = dict(slack_family_flags or {})
         # Absent an audited tenant grant, private reads stay denied (R21).
         self.private_read_authorizer = private_read_authorizer
+        #: Durable per-tenant family and emergency-stop state. When one is
+        #: wired it outranks every constructor default below, because those
+        #: defaults are process-wide and this is not: two tenants on one
+        #: process must be able to hold different answers, and an
+        #: administrator must be able to change theirs without a restart.
+        self.control_plane = control_plane
         self.slack_coordinator = SlackConversationCoordinator()
         slack_definitions = tuple(
             item for item in self.definitions if item.provider == "slack"
@@ -57,6 +64,15 @@ class DynamicWorkflowService:
         channels=None, users=None,
     ):
         """Interpret and ground one turn without compiling unresolved authority."""
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            # R28: a stop is account-wide and covers inbound handling too. It
+            # is refused here, before any interpretation, so a stopped account
+            # neither plans work it can never dispatch nor spends model calls
+            # discovering that. This is the only inbound path a stop degrades;
+            # reconciliation and provider callbacks are deliberately untouched.
+            return self._slack_limitation("emergency_stop", "contact_admin")
         active = None
         if conversation_id and self.conversation_store is not None:
             active = self.conversation_store.get(
@@ -587,6 +603,7 @@ class DynamicWorkflowService:
         group = build_effect_group(
             conversation_id, turn_payload["compound_operations"],
             turn_payload.get("resolved") or {},
+            dependencies=turn_payload.get("dependencies") or [],
         )
         self.conversation_store.update(
             conversation_id, tenant_id, principal_id,
@@ -597,6 +614,64 @@ class DynamicWorkflowService:
             "state": "awaiting_approval", "conversation_id": conversation_id,
             "effect_group": group,
         }
+
+    def dispatch_approved_effects(self, conversation_id, tenant_id,
+                                  principal_id):
+        """Run the effects that are approved and owed nothing, and only those.
+
+        Called after any decision. A sibling failing neither blocks nor drags
+        an effect along, so this is deliberately a loop over independent items
+        rather than a plan the group executes as one.
+        """
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        group = (conversation or {}).get("effect_group")
+        if not group:
+            return []
+        dispatched = []
+        for effect in dispatchable_effects(group):
+            try:
+                self._dispatch_one_effect(
+                    conversation, tenant_id, principal_id, effect,
+                )
+            except (PermissionError, ValueError, KeyError) as exc:
+                group = apply_effect_decision(
+                    group, effect["effect_id"], "failed",
+                )
+                effect = dict(effect, recovery=str(exc).split(":", 1)[0])
+            else:
+                group = apply_effect_decision(
+                    group, effect["effect_id"], "dispatched",
+                )
+            dispatched.append(effect["effect_id"])
+        if dispatched:
+            outcome = group_outcome(group)
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id,
+                effect_group=group,
+                status="ready" if outcome["terminal"] else "executing",
+            )
+        return dispatched
+
+    def _dispatch_one_effect(self, conversation, tenant_id, principal_id,
+                             effect):
+        resolved = {
+            key: conversation.get(key) for key in (
+                "active_connection", "active_channel", "active_person",
+                "active_thread", "read_period",
+            ) if conversation.get(key) is not None
+        }
+        if effect["effect_kind"] == "read":
+            operation = "read"
+            return self._dispatch_slack_read(
+                tenant_id, principal_id, operation, resolved,
+            )
+        return self.materialize_slack_write(
+            conversation["conversation_id"], tenant_id, principal_id,
+            effect["capability_id"],
+            (conversation.get("known_inputs") or {}).get("message"),
+        )
 
     def decide_compound_effect(self, conversation_id, tenant_id, principal_id,
                                effect_id, decision):
@@ -788,16 +863,57 @@ class DynamicWorkflowService:
             )
         return result
 
-    def _disabled_slack_feature(self, operation):
-        if operation in {"read", "summarize", "list_channels", "list_private_channels"} and not self.conversational_reads_enabled:
+    #: The families each legacy switch stood for, before family state became
+    #: durable. Kept only as the fallback for a service constructed without a
+    #: control plane; a wired control plane never consults it.
+    _LEGACY_FEATURE_FAMILIES = {
+        "slack_conversational_reads": (
+            "slack_channel_discovery", "slack_private_reads",
+            "slack_conversation_reads",
+        ),
+        "slack_writes": ("slack_messaging",),
+        "slack_dms": ("slack_direct_messages",),
+    }
+
+    def _disabled_slack_feature(self, operation, tenant_id=None):
+        reads = operation in {
+            "read", "summarize", "list_channels", "list_private_channels"
+        }
+        writes = operation in {"post", "reply", "dm"}
+        if self.control_plane is not None:
+            families = self._slack_family_state(tenant_id)
+            if reads and not any(
+                families.get(name) is True for name in
+                self._LEGACY_FEATURE_FAMILIES["slack_conversational_reads"]
+            ):
+                return "slack_conversational_reads"
+            if writes and families.get("slack_messaging") is not True:
+                return "slack_writes"
+            if operation == "dm" and families.get(
+                "slack_direct_messages"
+            ) is not True:
+                return "slack_dms"
+            return None
+        if reads and not self.conversational_reads_enabled:
             return "slack_conversational_reads"
-        if operation in {"post", "reply", "dm"} and not self.slack_writes_enabled:
+        if writes and not self.slack_writes_enabled:
             return "slack_writes"
         if operation == "dm" and not self.slack_dms_enabled:
             return "slack_dms"
         return None
 
-    def _slack_family_state(self):
+    def _slack_family_state(self, tenant_id=None):
+        """Which families this tenant currently holds.
+
+        With a control plane wired, the answer is durable per-tenant state and
+        nothing else: two tenants sharing this process must be able to hold
+        different answers, and an administrator must be able to change theirs
+        without anyone restarting anything. The constructor defaults below are
+        the pre-control-plane fallback and are process-wide by construction,
+        which is exactly why they cannot be the authority.
+        """
+        if self.control_plane is not None:
+            return dict(self.control_plane.family_flags(tenant_id))
         state = {
             "slack_connection_status": True,
             "slack_channel_discovery": self.conversational_reads_enabled,
@@ -811,17 +927,32 @@ class DynamicWorkflowService:
         state.update(self.slack_family_flags)
         return state
 
-    @staticmethod
-    def _runtime_slack_operation_ids():
-        return frozenset({
-            "slack.connection.status", "slack.channels.list",
-            "slack.private_channels.list", "slack.conversation.read",
-            "slack.conversation.summarize", "slack.message.send",
-            "slack.thread.reply", "slack.direct_message.send",
-        })
+    #: The rollout allowlist that predates durable family state. A service
+    #: with a control plane derives the same answer from family state instead,
+    #: so there is one place to change and not two that can disagree.
+    _STATIC_RUNTIME_SLACK_OPERATION_IDS = frozenset({
+        "slack.connection.status", "slack.channels.list",
+        "slack.private_channels.list", "slack.conversation.read",
+        "slack.conversation.summarize", "slack.message.send",
+        "slack.thread.reply", "slack.direct_message.send",
+    })
 
-    def _policy_allows_slack_operation(self, operation):
-        if operation.operation_id not in self._runtime_slack_operation_ids():
+    def _runtime_slack_operation_ids(self, tenant_id=None):
+        if self.control_plane is None:
+            return self._STATIC_RUNTIME_SLACK_OPERATION_IDS
+        if self.slack_operation_registry is None:
+            return frozenset()
+        families = self._slack_family_state(tenant_id)
+        return frozenset(
+            operation.operation_id
+            for operation in self.slack_operation_registry.operations
+            if families.get(operation.family_flag) is True
+        )
+
+    def _policy_allows_slack_operation(self, operation, tenant_id=None):
+        if operation.operation_id not in self._runtime_slack_operation_ids(
+            tenant_id
+        ):
             return False
         if self.slack_policy_visible is None:
             return True
@@ -830,7 +961,7 @@ class DynamicWorkflowService:
         except Exception:
             return False
 
-    def _slack_operation_projection(self, installations):
+    def _slack_operation_projection(self, installations, tenant_id=None):
         connected = [
             item for item in installations if item.get("status") == "connected"
         ]
@@ -846,11 +977,14 @@ class DynamicWorkflowService:
                 ):
                     installed.add(definition.capability_id)
         return self.slack_operation_registry.model_projection(
-            installed, self._slack_family_state(), self._policy_allows_slack_operation,
+            installed, self._slack_family_state(tenant_id),
+            lambda operation: self._policy_allows_slack_operation(
+                operation, tenant_id
+            ),
         )
 
     def _interpretation_limitation(
-        self, text, interpretation, installations, projection,
+        self, text, interpretation, installations, projection, tenant_id=None,
     ):
         proposed = [item.operation_id for item in interpretation.operations]
         visible = {item["operation_id"] for item in projection}
@@ -863,11 +997,13 @@ class DynamicWorkflowService:
                         operation_id=operation_id,
                     )
                 if operation_id not in visible:
-                    return self._operation_unavailable(descriptor, installations)
+                    return self._operation_unavailable(
+                        descriptor, installations, tenant_id
+                    )
             return None
         alias = self.slack_operation_registry.lookup_alias(text)
         if alias is not None and alias.operation_id not in visible:
-            return self._operation_unavailable(alias, installations)
+            return self._operation_unavailable(alias, installations, tenant_id)
         blockers = list(getattr(interpretation, "blockers", ()) or ())
         if blockers and blockers[0].kind == "unsupported_operation":
             return self._slack_limitation(
@@ -875,18 +1011,30 @@ class DynamicWorkflowService:
             )
         return None
 
-    def _operation_unavailable(self, descriptor, installations):
-        if descriptor.operation_id not in self._runtime_slack_operation_ids():
-            return self._slack_limitation(
-                "operation_unavailable", "wait_for_family_rollout",
-                operation_id=descriptor.operation_id,
-            )
-        families = self._slack_family_state()
+    def _operation_unavailable(self, descriptor, installations, tenant_id=None):
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            # Say the account is stopped rather than blaming the family. An
+            # operator who hit the stop needs the message to name the stop,
+            # not send them hunting for a family switch they did not touch.
+            return self._slack_limitation("emergency_stop", "contact_admin")
+        families = self._slack_family_state(tenant_id)
+        # The family is checked before the rollout allowlist: an operator who
+        # turned a family off should be told that, not told to wait for a
+        # rollout that already happened.
         if families.get(descriptor.family_flag) is not True:
             return self._slack_limitation(
                 "feature_disabled", "contact_admin", feature=descriptor.family_flag,
             )
-        if not self._policy_allows_slack_operation(descriptor):
+        if descriptor.operation_id not in self._runtime_slack_operation_ids(
+            tenant_id
+        ):
+            return self._slack_limitation(
+                "operation_unavailable", "wait_for_family_rollout",
+                operation_id=descriptor.operation_id,
+            )
+        if not self._policy_allows_slack_operation(descriptor, tenant_id):
             return self._slack_limitation(
                 "policy_denied", "contact_admin", operation_id=descriptor.operation_id,
             )

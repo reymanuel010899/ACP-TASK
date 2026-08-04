@@ -869,9 +869,24 @@ turns. Funding this slice does not remove the need to fix multi-turn slot
 carrying, which is the path anyone takes who cannot state a complete request
 in one sentence.
 
-**Not yet done:** dispatching an approved group through the broker, and the
-accessibility sweep the unit lists (axe checks, reduced motion, keyboard
-integration tests for asynchronous updates).
+**Dispatch and accessibility are done.** An approved effect runs when it is
+approved and owed nothing; a sibling failing neither blocks it nor drags it
+along, and a write whose read failed never becomes dispatchable because its
+content was never produced.
+
+Dependencies come from what the interpretation declared, not from every write
+waiting on every read. The first implementation linked them wholesale, which a
+test caught: reacting to a message does not derive its content from a summary,
+and linking them would let one failing silently strand the other.
+
+Accessibility is covered by axe checks in both the awaiting and mixed-outcome
+states, keyboard-only approval, deterministic focus on detail toggles, focus
+restoration to the last-used control after a server re-render, per-effect
+`aria-controls` association, and a guard that keeps an unconditional animation
+from shipping without a `motion-reduce` variant. `vitest-axe` and `axe-core`
+were added as dev dependencies for this.
+
+**U7 is complete.**
 
 
 **Goal:** Execute broad and composed Slack requests as one coherent server-authoritative conversation with exact effect groups, corrections, progress, and partial outcomes.

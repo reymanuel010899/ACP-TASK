@@ -36,10 +36,11 @@ def test_a_compound_request_becomes_one_row_per_effect():
 
 
 def test_reads_resolve_before_effects_are_offered():
+    # The interpretation declares that the write derives from the read.
     group = build_effect_group("conversation:1", [
         {"operation_id": "slack.conversation.read", "confidence": 0.9},
         {"operation_id": "slack.message.send", "confidence": 0.9},
-    ], {})
+    ], {}, dependencies=[{"operation_index": 1, "depends_on_index": 0}])
 
     read, write = group["effects"]
     assert read["effect_kind"] == "read"
@@ -114,3 +115,17 @@ def test_a_group_is_not_terminal_while_anything_can_still_happen():
                                   "succeeded")
 
     assert group_outcome(group)["terminal"] is False
+
+
+def test_independent_effects_are_not_linked_just_because_one_reads():
+    group = build_effect_group("conversation:1", [
+        {"operation_id": "slack.conversation.read"},
+        {"operation_id": "slack.reaction.add"},
+    ], {})
+
+    read, reaction = group["effects"]
+    # Reacting to a message does not derive its content from a summary, so
+    # linking them would let one failing silently strand the other.
+    assert reaction["depends_on"] == []
+    assert reaction["status"] == "awaiting_approval"
+    assert read["status"] == "awaiting_approval"
