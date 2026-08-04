@@ -209,6 +209,27 @@ def test_idle_and_absolute_expiry_are_enforced_server_side():
         assert status == 401
 
 
+def test_idle_window_is_served_to_the_client_on_create_and_resolve():
+    """The browser enforces the SAME idle cutoff this service does, so the
+    number has to travel rather than be hardcoded on both sides and drift.
+    `SessionProvider.tsx` reads it as `idle_ttl_seconds`."""
+    clock = Clock()
+    _, proof = _assertion()
+
+    with _running_session_service(clock, idle_ttl=1800, absolute_ttl=43200) as (port, _):
+        status, body, _, cookie = _create(port, proof)
+        assert status == 201
+        assert body["idle_ttl_seconds"] == 1800
+        # The absolute cutoff stays absolute: it is not slid by activity.
+        assert body["expires_at"] == clock() + 43200
+
+        clock.value += 600
+        status, current, _ = _request(port, "GET", cookie=cookie)
+        assert status == 200
+        assert current["idle_ttl_seconds"] == 1800
+        assert current["expires_at"] == NOW + 43200
+
+
 def test_revoke_requires_matching_csrf_and_cannot_cross_users():
     clock = Clock()
     _, alice_proof = _assertion()

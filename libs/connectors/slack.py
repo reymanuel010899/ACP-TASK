@@ -30,6 +30,7 @@ SLACK_SCOPE_CATALOG = {
     "slack.reaction.remove": "reactions:write",
     "slack.message.pin": "pins:write",
     "slack.message.unpin": "pins:write",
+    "slack.bookmark.add": "bookmarks:write",
     "slack.private_channels.list": "groups:read",
     "slack.private_conversation.read": "groups:history",
     "slack.private_thread.read": "groups:history",
@@ -204,6 +205,7 @@ class SlackActionExecutor:
             "slack.reaction.remove": self._remove_reaction,
             "slack.message.pin": self._pin_message,
             "slack.message.unpin": self._unpin_message,
+            "slack.bookmark.add": self._add_bookmark,
             "slack.file.upload": self._upload_file,
         }
         handler = routes.get(capability_id)
@@ -438,6 +440,32 @@ class SlackActionExecutor:
             "team_id": context.get("team_id"),
             "channel_id": channel_id,
             "message_ts": message_ts,
+        }
+
+    def _add_bookmark(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        title = _required_str(payload, "title")
+        link = _required_str(payload, "link")
+        if not link.startswith("https://"):
+            raise SlackAPIError("bookmarks.add", "insecure_link", "validation")
+        data = self._api("bookmarks.add", context, json={
+            "channel_id": channel_id, "title": title,
+            "type": "link", "link": link,
+        })
+        bookmark = data.get("bookmark") if isinstance(
+            data.get("bookmark"), dict
+        ) else {}
+        bookmark_id = bookmark.get("id")
+        if not isinstance(bookmark_id, str) or not bookmark_id:
+            raise SlackAPIError("bookmarks.add", "missing_bookmark_id")
+        return {
+            "provider": "slack",
+            "capability_id": "slack.bookmark.add",
+            "provider_id": bookmark_id,
+            "team_id": context.get("team_id"),
+            "channel_id": channel_id,
+            "bookmark_id": bookmark_id,
+            "title": title,
         }
 
     def _upload_file(self, payload, context):

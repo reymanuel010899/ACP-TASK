@@ -380,3 +380,53 @@ def test_a_pin_refused_on_its_merits_still_fails():
 
     assert failure.value.code == "not_in_channel"
     assert failure.value.category == "membership"
+
+
+def test_adding_a_bookmark_stores_the_exact_link_and_title():
+    http = FakeHTTP([Response(payload={
+        "ok": True, "bookmark": {"id": "Bk01", "title": "Runbook"},
+    })])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.bookmark.add", {
+        "channel_id": "C1", "title": "Runbook",
+        "link": "https://acme.example/runbook",
+    }, context())
+
+    _method, url, kwargs = http.calls[0]
+    assert url.endswith("/bookmarks.add")
+    assert kwargs["json"] == {
+        "channel_id": "C1", "title": "Runbook", "type": "link",
+        "link": "https://acme.example/runbook",
+    }
+    assert receipt["bookmark_id"] == "Bk01"
+    assert receipt["provider_id"] == "Bk01"
+    assert receipt["title"] == "Runbook"
+
+
+def test_a_bookmark_link_must_be_https():
+    http = FakeHTTP([])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.execute("slack.bookmark.add", {
+            "channel_id": "C1", "title": "Runbook",
+            "link": "http://acme.example/runbook",
+        }, context())
+
+    assert failure.value.code == "insecure_link"
+    assert failure.value.category == "validation"
+    assert http.calls == []
+
+
+def test_a_bookmark_without_a_provider_id_is_not_a_receipt():
+    http = FakeHTTP([Response(payload={"ok": True, "bookmark": {}})])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.execute("slack.bookmark.add", {
+            "channel_id": "C1", "title": "Runbook",
+            "link": "https://acme.example/runbook",
+        }, context())
+
+    assert failure.value.code == "missing_bookmark_id"

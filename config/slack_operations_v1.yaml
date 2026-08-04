@@ -388,6 +388,31 @@
       "prerequisites": ["connected_installation", "channel_membership"],
       "recovery": {"missing_slot": "clarify_message", "unavailable": "explain_message_access"},
       "presentation": {"kind": "exact_effect_preview", "label": "Unpin message"}
+    },
+    {
+      "operation_id": "slack.bookmark.add",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["add bookmark", "bookmark this link", "guarda el enlace", "a\u00f1adir marcador", "anadir marcador", "guarda este link", "marca el enlace"],
+      "slots": [
+        {"name": "channel", "entity_kind": "slack.channel", "required": true},
+        {"name": "title", "entity_kind": "slack.text", "required": true},
+        {"name": "link", "entity_kind": "slack.link", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "add_bookmark",
+          "capability_id": "slack.bookmark.add",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "channel.channel_id", "title": "title", "link": "link"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_bookmarks",
+      "prerequisites": ["connected_installation", "channel_membership"],
+      "recovery": {"missing_slot": "clarify_channel_or_link", "unavailable": "explain_channel_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Add bookmark"}
     }
   ],
   "method_coverage": {
@@ -405,7 +430,7 @@
       {"method": "reactions.remove", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
       {"method": "pins.add", "family": "pins", "state": "runtime", "prerequisites": ["channel_membership"]},
       {"method": "pins.remove", "family": "pins", "state": "runtime", "prerequisites": ["channel_membership"]},
-      {"method": "bookmarks.add", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "bookmarks.add", "family": "bookmarks", "state": "runtime", "prerequisites": ["channel_membership"]},
       {"method": "bookmarks.edit", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "bookmarks.remove", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "conversations.create", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},

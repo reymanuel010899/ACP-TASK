@@ -77,7 +77,8 @@ def test_v1_manifest_is_exact_and_separates_conversation_from_authority():
     } >= {"reactions.remove"}
     assert "pins.add" not in future
     assert "pins.remove" not in future
-    assert future["bookmarks.add"] == "planned"
+    assert "bookmarks.add" not in future
+    assert future["bookmarks.edit"] == "planned"
     assert future["conversations.create"] == "planned"
     assert future["search.messages"] == "planned"
     assert future["files.getUploadURLExternal"] == "dormant"

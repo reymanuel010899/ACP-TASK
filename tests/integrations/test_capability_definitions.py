@@ -180,6 +180,10 @@ def test_slack_capabilities_declare_allowlisted_output_fields():
             "provider", "capability_id", "provider_id", "team_id",
             "channel_id", "message_ts",
         },
+        "slack.bookmark.add": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "bookmark_id", "title",
+        },
         "slack.file.upload": {
             "provider", "capability_id", "provider_id", "team_id",
             "channel_id", "file_id",

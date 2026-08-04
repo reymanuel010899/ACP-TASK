@@ -220,6 +220,7 @@ def slack_definitions():
         "slack.reaction.remove": ("reactions:write", "write", ("channel_id", "message_ts", "reaction"), "slack.reaction"),
         "slack.message.pin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
         "slack.message.unpin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
+        "slack.bookmark.add": ("bookmarks:write", "write", ("channel_id", "title", "link"), "slack.bookmark"),
         "slack.file.upload": ("files:write", "write", ("channel_id", "filename", "content_hash"), "slack.file"),
     }
     schemas = {
@@ -238,6 +239,7 @@ def slack_definitions():
         "slack.reaction.remove": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
         "slack.message.pin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.message.unpin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
+        "slack.bookmark.add": {"type": "object", "required": ["channel_id", "title", "link"], "properties": {"channel_id": {"type": "string"}, "title": {"type": "string", "minLength": 1, "maxLength": 250}, "link": {"type": "string", "pattern": "^https://"}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
     nullable_string = {"type": ["string", "null"]}
@@ -350,6 +352,12 @@ def slack_definitions():
         ),
         "slack.message.unpin": receipt_output(
             "slack.message.unpin", {"message_ts": {"type": "string"}},
+        ),
+        "slack.bookmark.add": receipt_output(
+            "slack.bookmark.add", {
+                "bookmark_id": {"type": "string"},
+                "title": {"type": "string"},
+            },
         ),
         "slack.file.upload": receipt_output(
             "slack.file.upload", {
