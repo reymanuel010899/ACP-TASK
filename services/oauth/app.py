@@ -98,9 +98,67 @@ class OAuthService(object):
                 "status": item["status"],
                 "enabled_capabilities": item["enabled_capabilities"],
                 "owner": item["principal_id"] == current["principal_id"],
+                # The server owns which families exist and what each needs, so
+                # the UI can offer an upgrade without keeping its own copy of
+                # the capability-to-scope map to drift out of date.
+                "missing_families": self._slack_missing_families(item),
             }
             for item in connections
         ]}
+
+    def _slack_missing_families(self, installation):
+        registry = self._slack_registry()
+        if registry is None:
+            return []
+        return [
+            {
+                "family": bundle["family"],
+                "missing_scopes": bundle["missing_scopes"],
+                "operations": bundle["operations"],
+            }
+            for bundle in registry.missing_scope_bundles(
+                registry.definitions, installation.get("granted_scopes") or (),
+            )
+        ]
+
+    def _slack_family_request(self, families, target):
+        """Turn requested families into the smallest grant that enables them.
+
+        A caller asks for what it wants to do — pin messages — not for the
+        capability ids that happen to implement it. When the connection
+        already holds some of the scopes, only the absent ones are requested,
+        so an upgrade prompt shows what it actually adds.
+        """
+        if not isinstance(families, list) or not families:
+            return None
+        registry = self._slack_registry()
+        if registry is None:
+            return None
+        definitions = registry.definitions
+        bundles = registry.scope_bundles(definitions)
+        if any(family not in bundles for family in families):
+            return None
+        granted = frozenset((target or {}).get("granted_scopes") or ())
+        capabilities, scopes = set(), set()
+        for family in sorted(set(families)):
+            capabilities |= set(bundles[family]["capabilities"])
+            scopes |= set(bundles[family]["scopes"])
+        return sorted(capabilities), sorted(scopes - granted)
+
+    def _slack_registry(self):
+        if getattr(self, "_slack_operations", None) is None:
+            try:
+                from agents.orchestrator.slack_operations import (
+                    load_slack_operations,
+                )
+                from libs.integrations.catalog import slack_definitions
+
+                registry = load_slack_operations(slack_definitions())
+                registry.definitions = slack_definitions()
+                self._slack_operations = registry
+            except Exception:
+                self._slack_operations = False
+        return self._slack_operations or None
 
     def initiate_slack(self, session_id, csrf_token, body):
         current = self.session_repository.resolve(
@@ -127,18 +185,29 @@ class OAuthService(object):
         return_to = body.get("return_to", "/integrations")
         if not _safe_return_to(return_to):
             return 422, {"error": "unsafe return target"}
-        capabilities = body.get("capabilities")
         catalog = self.slack_connector.scope_catalog()
-        if (
-            not isinstance(capabilities, list)
-            or not capabilities
-            or any(capability not in catalog for capability in capabilities)
-        ):
-            return 422, {"error": "unsupported or missing capabilities"}
-        capabilities = sorted(set(capabilities))
-        # A capability can need several scopes; asking for one of them
-        # authorises a connection that cannot run what it advertises.
-        scopes = sorted(set().union(*(catalog[item] for item in capabilities)))
+        families = body.get("families")
+        if families is not None:
+            resolved = self._slack_family_request(
+                families, target if target_connection_id else None,
+            )
+            if resolved is None:
+                return 422, {"error": "unsupported or missing families"}
+            capabilities, scopes = resolved
+            if not scopes:
+                return 409, {"error": "requested families are already granted"}
+        else:
+            capabilities = body.get("capabilities")
+            if (
+                not isinstance(capabilities, list)
+                or not capabilities
+                or any(capability not in catalog for capability in capabilities)
+            ):
+                return 422, {"error": "unsupported or missing capabilities"}
+            capabilities = sorted(set(capabilities))
+            # A capability can need several scopes; asking for one of them
+            # authorises a connection that cannot run what it advertises.
+            scopes = sorted(set().union(*(catalog[item] for item in capabilities)))
         state = secrets.token_urlsafe(32)
         self.repository.create_transaction(
             transaction_id=secrets.token_urlsafe(24),

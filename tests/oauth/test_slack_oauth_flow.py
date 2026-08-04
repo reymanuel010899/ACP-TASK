@@ -1,3 +1,5 @@
+import pytest
+
 import json
 from urllib.parse import parse_qs, urlsplit
 
@@ -255,3 +257,87 @@ def test_configured_local_tenant_fallback_survives_principal_rotation(monkeypatc
     monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
 
     assert _configured_tenant_resolver()("new-principal") == "org:local"
+
+
+def _granted(service, scopes):
+    return service.repository.upsert_installation(
+        tenant_id="org:acme", principal_id="user:alice", provider="slack",
+        app_id="A123", team_id="T123", credential_id="cred:1",
+        granted_scopes=scopes, enabled_capabilities=[], now_ts=1,
+    )
+
+
+def test_a_family_request_asks_for_that_family_and_nothing_else(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"families": ["slack_pins"]},
+    )
+
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    assert set(scopes.split(",")) == {"pins:write"}
+
+
+def test_an_upgrade_asks_only_for_the_scopes_the_connection_lacks(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = _granted(service, ["chat:write"])
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_direct_messages"],
+            "target_connection_id": connection["connection_id"],
+        },
+    )
+
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    # chat:write is already held, so the prompt shows only what it adds.
+    assert set(scopes.split(",")) == {"im:write"}
+
+
+def test_an_already_granted_family_is_refused_rather_than_re_prompted(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = _granted(service, ["pins:write"])
+
+    status, body = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_pins"],
+            "target_connection_id": connection["connection_id"],
+        },
+    )
+
+    assert status == 409
+    assert body["error"] == "requested families are already granted"
+
+
+@pytest.mark.parametrize("families", [[], ["not_a_family"], "slack_pins"])
+def test_an_unknown_family_is_rejected(tmp_path, families):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, body = service.initiate_slack(
+        "session-1", "csrf-1", {"families": families},
+    )
+
+    assert status == 422
+    assert body["error"] == "unsupported or missing families"
+
+
+def test_status_tells_the_ui_which_families_are_missing_and_why(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    _granted(service, ["channels:read", "channels:history", "chat:write"])
+
+    status, body = service.slack_status("session-1")
+
+    assert status == 200
+    families = {
+        item["family"]: item
+        for item in body["connections"][0]["missing_families"]
+    }
+    assert "slack_messaging" not in families
+    assert families["slack_pins"]["missing_scopes"] == ["pins:write"]
+    assert families["slack_pins"]["operations"] == [
+        "slack.message.pin", "slack.message.unpin",
+    ]
+    # The DM already holds chat:write, so only the absent scope is offered.
+    assert families["slack_direct_messages"]["missing_scopes"] == ["im:write"]

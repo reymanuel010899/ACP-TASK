@@ -7,8 +7,8 @@ import ConnectSlackCard from "./ConnectSlackCard";
 
 
 beforeEach(() => {
-  window.sessionStorage.clear();
-  window.sessionStorage.setItem("tessera-csrf", "csrf-test");
+  window.sessionStorage.clear(); window.localStorage.clear();
+  window.localStorage.setItem("tessera-csrf", "csrf-test");
   window.history.replaceState({}, "", "/integrations");
 });
 
@@ -49,32 +49,55 @@ describe("ConnectSlackCard", () => {
     );
   });
 
-  it("starts bot consent and surfaces missing optional capabilities", async () => {
+  it("offers one upgrade per missing family and asks only for that family", async () => {
     const redirect = vi.fn();
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => response({ provider: "slack", connections: [
-        { connection_id: "conn-a", team_id: "T-A", team_name: "Acme", status: "connected", enabled_capabilities: ["slack.message.send"], owner: true },
+        {
+          connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+          status: "connected", enabled_capabilities: ["slack.message.send"],
+          owner: true,
+          missing_families: [
+            { family: "slack_pins", missing_scopes: ["pins:write"], operations: ["slack.message.pin"] },
+            { family: "slack_direct_messages", missing_scopes: ["im:write"], operations: ["slack.direct_message.send"] },
+          ],
+        },
       ] }))
       .mockImplementationOnce(() => response({ authorization_url: "https://slack.test/consent" }));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<ConnectSlackCard redirect={redirect} />);
-    expect(await screen.findByText("File uploads need an additional scope")).toBeInTheDocument();
-    expect(screen.getByText("Private channels need additional scopes")).toBeInTheDocument();
-    expect(screen.getByText("Finding people needs the users:read scope")).toBeInTheDocument();
-    expect(screen.getByText("Direct messages need the im:write scope")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Upgrade Acme permissions" }));
+
+    // Each prompt says what the grant buys and what it costs.
+    expect(await screen.findByText("To pin and unpin messages, Tessera needs pins:write")).toBeInTheDocument();
+    expect(screen.getByText("To send direct messages, Tessera needs im:write")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Allow pin and unpin messages" }));
 
     await waitFor(() => expect(redirect).toHaveBeenCalledWith("https://slack.test/consent"));
     const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
     expect(body.target_connection_id).toBe("conn-a");
-    expect(body.capabilities).toEqual(expect.arrayContaining([
-      "slack.private_channels.list",
-      "slack.private_conversation.read",
-      "slack.private_thread.read",
-      "slack.users.list",
-      "slack.direct_message.send",
-    ]));
+    expect(body.families).toEqual(["slack_pins"]);
+    // Asking for pins must not drag every other capability along.
+    expect(body.capabilities).toBeUndefined();
+  });
+
+  it("shows no upgrade prompts when nothing is missing", async () => {
+    const fetchMock = vi.fn().mockImplementationOnce(() => response({
+      provider: "slack", connections: [
+        {
+          connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+          status: "connected", enabled_capabilities: ["slack.message.send"],
+          owner: true, missing_families: [],
+        },
+      ],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ConnectSlackCard redirect={vi.fn()} />);
+
+    await screen.findByRole("group", { name: "Acme workspace" });
+    expect(screen.queryByText(/Tessera needs/)).not.toBeInTheDocument();
   });
 
   it("shows a tenant-authorized workspace to members without lifecycle controls", async () => {
