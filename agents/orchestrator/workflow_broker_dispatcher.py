@@ -5,8 +5,25 @@ import time
 from agents.orchestrator.action_repository import canonical_payload_hash
 from libs.integrations.catalog import capability_retry_policy
 from agents.orchestrator.workflow_executor import (
-    AmbiguousStepError, CorrectableStepError, RetryableStepError,
+    AmbiguousStepError, CorrectableStepError, PausedStepError,
+    RetryableStepError,
 )
+
+
+def _pre_dispatch_rejection(exc):
+    """Classify a failure raised before the broker call.
+
+    Nothing has reached the provider yet, so this outcome is known: no effect
+    occurred. Letting it fall through to the executor's bare exception handler
+    would record it as `execution_unknown` and manufacture uncertainty about
+    an effect that provably never left this process.
+    """
+    if isinstance(exc, (
+        PermissionError, CorrectableStepError, RetryableStepError,
+        PausedStepError, AmbiguousStepError,
+    )):
+        return exc
+    return CorrectableStepError("pre_dispatch:%s" % type(exc).__name__)
 
 
 def _matches_approved_template(template, resolved):
@@ -89,7 +106,9 @@ class WorkflowBrokerDispatcher:
             step["connection_id"], step["tenant_id"]
         )
         if not connection or connection.get("status") != "connected":
-            raise RetryableStepError("connection is unavailable")
+            # A provider outage is not the step's fault, so it waits rather
+            # than spending an attempt it can never win back.
+            raise PausedStepError("connection is unavailable")
         approved_credential_version = int(step.get("credential_version") or 0)
         if approved_credential_version and int(
             connection.get("credential_version") or 0
@@ -127,6 +146,11 @@ class WorkflowBrokerDispatcher:
             "connection_id": step["connection_id"],
             "tenant_id": step["tenant_id"],
             "authority_profile": connection.get("authority_profile", "bot"),
+            # Whose token this acts as travels with the dispatch, so the
+            # approval, the lease, and the receipt all name the same subject.
+            "authority_profile_id": connection.get("authority_profile_id"),
+            "slack_subject_id": connection.get("slack_subject_id"),
+            "authority_authorization": connection.get("authority_authorization"),
             "credential_version": connection["credential_version"],
             "capability_version": step["capability_version"],
             "descriptor_snapshot_hash": step["descriptor_snapshot_hash"],
@@ -159,21 +183,28 @@ class WorkflowBrokerDispatcher:
                 )
             binding["policy_decision"] = decision
         if step["effect"] == "write":
-            proposal = self.actions.create_proposal(
-                run["user_principal_id"], self.agent_principal_id,
-                connection["credential_id"], step["capability_id"], step["input"],
-                approval_expires_at,
-                proposal_id="proposal:%s" % task_id,
-                idempotency_key="workflow:%s:%s" % (claim["workflow_revision_id"], step["step_id"]),
-                workflow_revision_id=claim["workflow_revision_id"], step_id=step["step_id"],
-                plan_graph_hash=revision["plan_graph_hash"], connection_id=step["connection_id"],
-                attempt=claim["attempt"],
-            )
-            if not self.actions.decide(
-                proposal["proposal_id"], proposal["version"],
-                run["user_principal_id"], True, now,
-            ):
-                raise PermissionError("exact action approval could not be materialized")
+            # Materializing the exact action can refuse — most importantly when
+            # a prior attempt is still unresolved — and every such refusal
+            # happens before dispatch, so it must be classified here rather
+            # than escaping as an unknown provider outcome.
+            try:
+                proposal = self.actions.create_proposal(
+                    run["user_principal_id"], self.agent_principal_id,
+                    connection["credential_id"], step["capability_id"], step["input"],
+                    approval_expires_at,
+                    proposal_id="proposal:%s" % task_id,
+                    idempotency_key="workflow:%s:%s" % (claim["workflow_revision_id"], step["step_id"]),
+                    workflow_revision_id=claim["workflow_revision_id"], step_id=step["step_id"],
+                    plan_graph_hash=revision["plan_graph_hash"], connection_id=step["connection_id"],
+                    attempt=claim["attempt"],
+                )
+                if not self.actions.decide(
+                    proposal["proposal_id"], proposal["version"],
+                    run["user_principal_id"], True, now,
+                ):
+                    raise PermissionError("exact action approval could not be materialized")
+            except Exception as exc:
+                raise _pre_dispatch_rejection(exc)
             binding.update({
                 "proposal_id": proposal["proposal_id"], "version": proposal["version"],
                 "payload_hash": canonical_payload_hash(step["input"]),
@@ -189,10 +220,7 @@ class WorkflowBrokerDispatcher:
                 now_ts=now,
             )
         except Exception as exc:
-            # Nothing has reached the provider yet, so this outcome is known:
-            # no effect occurred. Reporting it as ambiguous would strand the
-            # step in reconciliation instead of letting it retry.
-            raise CorrectableStepError("pre_dispatch:%s" % type(exc).__name__)
+            raise _pre_dispatch_rejection(exc)
         status, body = self.broker.execute(lease, binding, step["input"])
         if status != 200:
             _raise_for_broker_failure(

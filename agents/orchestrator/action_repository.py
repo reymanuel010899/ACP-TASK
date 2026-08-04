@@ -494,6 +494,66 @@ class ActionRepository(object):
             )
         return cursor.rowcount == 1
 
+    def resolve_unknown_as_absent(self, proposal_id, version, reason, now_ts):
+        """Close an unknown proposal that reconciliation proved never landed.
+
+        Until this happens the proposal id stays unresolved forever, and
+        `create_proposal` refuses every later attempt on that step.
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE action_proposals
+                SET status = 'failed', execution_finished_at = ?,
+                    failure_reason = ?
+                WHERE proposal_id = ? AND version = ?
+                  AND status = 'execution_unknown'
+                """,
+                (int(now_ts), str(reason)[:500], proposal_id, int(version)),
+            )
+        return cursor.rowcount == 1
+
+    def sweep_stalled_executions(self, now_ts, limit=100):
+        """Give every claimed proposal past its deadline a way out.
+
+        A claim that never dispatched is safe to hand back. One that did
+        dispatch has an outcome nobody observed, so it becomes explicitly
+        unknown and enters reconciliation instead of sitting in `executing`
+        with no path to any verdict at all.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT p.proposal_id, p.version, p.dispatched_at,
+                       COALESCE(MAX(l.expires_at), p.expires_at) AS deadline
+                  FROM action_proposals p
+                  LEFT JOIN capability_leases l
+                    ON l.workflow_revision_id = p.workflow_revision_id
+                   AND l.step_id = p.step_id
+                   AND l.attempt = p.attempt
+                   AND p.workflow_revision_id != 'legacy'
+                 WHERE p.status = 'executing'
+                 GROUP BY p.proposal_id, p.version
+                HAVING deadline < ?
+                 LIMIT ?
+                """,
+                (int(now_ts), int(limit)),
+            ).fetchall()
+        swept = {"recovered": [], "unknown": []}
+        for row in rows:
+            if row["dispatched_at"] is None:
+                if self.recover_pre_dispatch_claim(
+                    row["proposal_id"], row["version"]
+                ):
+                    swept["recovered"].append(row["proposal_id"])
+            elif self.fail_execution(
+                row["proposal_id"], row["version"],
+                "dispatch lease expired without an observed outcome",
+                now_ts, unknown=True,
+            ):
+                swept["unknown"].append(row["proposal_id"])
+        return swept
+
     def close(self):
         with self._lock:
             self._connection.close()

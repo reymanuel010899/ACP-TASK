@@ -268,3 +268,110 @@ def test_dynamic_retry_is_blocked_while_prior_attempt_is_dispatched_or_unknown(
 
     with pytest.raises(ValueError, match="prior attempt"):
         repository.create_proposal(attempt=2, **common)
+
+
+def _dynamic_common(proposal_id="proposal:revision:1:send"):
+    return {
+        "user_principal_id": "user:alice",
+        "agent_principal_id": "agent:orchestrator",
+        "credential_id": "credential:slack",
+        "capability_id": "slack.message.send",
+        "payload": {"channel_id": "C1", "text": "hello"},
+        "expires_at": NOW + 300,
+        "proposal_id": proposal_id,
+        "idempotency_key": "workflow:revision:1:send",
+        "workflow_revision_id": "revision:1",
+        "step_id": "send",
+        "plan_graph_hash": "graph:1",
+        "connection_id": "conn:1",
+    }
+
+
+def _claim(repository, common, attempt=1, dispatched=False):
+    proposal = repository.create_proposal(attempt=attempt, **common)
+    repository.decide(
+        proposal["proposal_id"], proposal["version"], "user:alice", True, NOW,
+    )
+    binding = {key: proposal[key] for key in (
+        "proposal_id", "version", "user_principal_id", "agent_principal_id",
+        "credential_id", "capability_id", "payload_hash", "idempotency_key",
+        "workflow_revision_id", "step_id", "plan_graph_hash", "connection_id",
+        "attempt")}
+    repository.consume_approval(binding, NOW)
+    repository.issue_lease(
+        "user:alice", "agent:orchestrator", "revision:1:send",
+        "credential:slack", ["slack.message.send"], NOW + 60,
+        workflow_revision_id="revision:1", step_id="send",
+        plan_graph_hash="graph:1", connection_id="conn:1", attempt=attempt,
+        now_ts=NOW,
+    )
+    if dispatched:
+        repository.mark_dispatched(
+            proposal["proposal_id"], proposal["version"], NOW,
+        )
+    return proposal
+
+
+def test_a_dispatched_claim_stuck_past_its_lease_is_swept_into_reconciliation(
+    tmp_path,
+):
+    """`executing` has no exit of its own, so a dead worker strands it forever."""
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    common = _dynamic_common()
+    proposal = _claim(repository, common, dispatched=True)
+
+    assert repository.sweep_stalled_executions(NOW + 30) == {
+        "recovered": [], "unknown": [],
+    }
+    swept = repository.sweep_stalled_executions(NOW + 61)
+
+    assert swept["unknown"] == [proposal["proposal_id"]]
+    assert repository.get(
+        proposal["proposal_id"]
+    )["status"] == "execution_unknown"
+
+
+def test_a_claim_that_never_dispatched_is_swept_back_to_approved(tmp_path):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    common = _dynamic_common()
+    proposal = _claim(repository, common, dispatched=False)
+
+    swept = repository.sweep_stalled_executions(NOW + 61)
+
+    assert swept["recovered"] == [proposal["proposal_id"]]
+    assert repository.get(proposal["proposal_id"])["status"] == "approved"
+
+
+def test_reconciled_absence_releases_the_proposal_id_for_a_new_attempt(tmp_path):
+    """An unresolved proposal id blocks its step until a verdict closes it."""
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    common = _dynamic_common()
+    proposal = _claim(repository, common, dispatched=True)
+    repository.fail_execution(
+        proposal["proposal_id"], proposal["version"], "timeout", NOW,
+        unknown=True,
+    )
+    with pytest.raises(ValueError, match="prior attempt"):
+        repository.create_proposal(attempt=2, **common)
+
+    assert repository.resolve_unknown_as_absent(
+        proposal["proposal_id"], proposal["version"],
+        "reconciliation proved no effect occurred", NOW + 5,
+    )
+
+    retried = repository.create_proposal(attempt=2, **common)
+    assert retried["version"] == proposal["version"] + 1
+    assert repository.get(
+        proposal["proposal_id"], proposal["version"]
+    )["status"] == "failed"
+
+
+def test_only_an_unknown_proposal_can_be_resolved_as_absent(tmp_path):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    common = _dynamic_common()
+    proposal = _claim(repository, common, dispatched=True)
+
+    assert repository.resolve_unknown_as_absent(
+        proposal["proposal_id"], proposal["version"], "guessing", NOW + 5,
+    ) is False
+    assert repository.get(proposal["proposal_id"])["status"] == "executing"

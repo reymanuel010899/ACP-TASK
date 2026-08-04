@@ -8,8 +8,146 @@ from agents.orchestrator.workflow_broker_dispatcher import (
 )
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from agents.orchestrator.workflow_executor import (
-    AmbiguousStepError, CorrectableStepError, RetryableStepError,
+    AmbiguousStepError, CorrectableStepError, PausedStepError,
+    RetryableStepError, WorkflowExecutor,
 )
+
+
+def _write_revision(workflows, tenant="org:1"):
+    run = workflows.create_run(tenant, "user:1", "goal", 1)
+    revision = workflows.create_revision(run["workflow_run_id"], tenant, "graph", [{
+        "step_id": "send", "capability_id": "slack.message.send",
+        "capability_version": "1.0.0", "connection_id": "conn:1",
+        "descriptor_snapshot_hash": "d", "input_hash": "i",
+        "input": {"channel_id": "C1", "text": "Hola"},
+        "depends_on": [], "effect": "write",
+    }], 2)
+    workflows.record_approval(
+        run["workflow_run_id"], revision["workflow_revision_id"], tenant,
+        "graph", "user:1", 3, ttl_seconds=10 ** 6,
+    )
+    return run, revision
+
+
+def _strand_prior_attempt(actions, revision_id):
+    """Leave the step's proposal id unresolved, exactly as a timeout would."""
+    common = {
+        "user_principal_id": "user:1",
+        "agent_principal_id": "agent:orchestrator",
+        "credential_id": "cred:1", "capability_id": "slack.message.send",
+        "payload": {"channel_id": "C1", "text": "Hola"}, "expires_at": 10_000,
+        "proposal_id": "proposal:%s:send" % revision_id,
+        "idempotency_key": "workflow:%s:send" % revision_id,
+        "workflow_revision_id": revision_id, "step_id": "send",
+        "plan_graph_hash": "graph", "connection_id": "conn:1",
+    }
+    prior = actions.create_proposal(attempt=1, **common)
+    actions.decide(prior["proposal_id"], prior["version"], "user:1", True, 4)
+    binding = {key: prior[key] for key in (
+        "proposal_id", "version", "user_principal_id", "agent_principal_id",
+        "credential_id", "capability_id", "payload_hash", "idempotency_key",
+        "workflow_revision_id", "step_id", "plan_graph_hash", "connection_id",
+        "attempt")}
+    actions.consume_approval(binding, 4)
+    actions.mark_dispatched(prior["proposal_id"], prior["version"], 4)
+    actions.fail_execution(
+        prior["proposal_id"], prior["version"], "timeout", 4, unknown=True,
+    )
+    return prior
+
+
+class _Connections:
+    def __init__(self, status="connected"):
+        self.status = status
+
+    def get_installation(self, connection_id, tenant_id):
+        return {"connection_id": connection_id, "status": self.status,
+                "credential_id": "cred:1", "credential_version": 1,
+                "granted_scopes": ["chat:write"], "team_id": "T1",
+                "bot_user_id": "B1"}
+
+
+class _UnreachableBroker:
+    def execute(self, *_args):
+        raise AssertionError("provider must not be reached before dispatch")
+
+
+def test_a_duplicate_prevention_refusal_is_reported_as_a_pre_dispatch_rejection(
+    tmp_path,
+):
+    """A refusal that means "nothing was sent" must not become "we might have sent it"."""
+    workflows = WorkflowRepository(str(tmp_path / "w.db"))
+    actions = ActionRepository(str(tmp_path / "a.db"))
+    run, revision = _write_revision(workflows)
+    revision_id = revision["workflow_revision_id"]
+    _strand_prior_attempt(actions, revision_id)
+
+    dispatcher = WorkflowBrokerDispatcher(
+        actions, _UnreachableBroker(), _Connections(), workflows, clock=lambda: 5,
+    )
+    result = WorkflowExecutor(workflows, dispatcher, clock=lambda: 5).run_next(
+        run["workflow_run_id"], revision_id, "org:1", "worker",
+    )
+
+    assert result["status"] == "retryable_failure"
+    assert result["recovery"] == "pre_dispatch:ValueError"
+    step = workflows.get_revision(
+        run["workflow_run_id"], revision_id, "org:1"
+    )["steps"][0]
+    assert step["execution_status"] != "execution_unknown"
+    assert step["step_id"] not in WorkflowRepository.recovery_options(
+        workflows.get_revision(run["workflow_run_id"], revision_id, "org:1")
+    )["unknownStepIds"]
+
+
+def test_an_unavailable_connection_waits_without_spending_retry_attempts(tmp_path):
+    """A provider outage must not convert queued work into permanent failure."""
+    workflows = WorkflowRepository(str(tmp_path / "w.db"))
+    actions = ActionRepository(str(tmp_path / "a.db"))
+    run, revision = _write_revision(workflows)
+    revision_id = revision["workflow_revision_id"]
+    clock = [5]
+    executor = WorkflowExecutor(
+        workflows,
+        WorkflowBrokerDispatcher(
+            actions, _UnreachableBroker(), _Connections("disconnected"),
+            workflows, clock=lambda: clock[0],
+        ),
+        clock=lambda: clock[0],
+    )
+
+    for _outage_tick in range(8):
+        assert executor.run_next(
+            run["workflow_run_id"], revision_id, "org:1", "worker",
+        )["status"] == "retry_wait"
+        clock[0] += 600
+
+    step = workflows.get_revision(
+        run["workflow_run_id"], revision_id, "org:1"
+    )["steps"][0]
+    assert step["execution_status"] == "queued"
+    assert step["terminal_reason"] == "connection is unavailable"
+    # Eight outage ticks, and the whole retry budget is still intact.
+    assert step["attempt"] - step["uncounted_attempts"] == 0
+
+
+def test_an_unavailable_connection_pauses_rather_than_retrying(tmp_path):
+    workflows = WorkflowRepository(str(tmp_path / "w.db"))
+    actions = ActionRepository(str(tmp_path / "a.db"))
+    run, revision = _write_revision(workflows)
+    revision_id = revision["workflow_revision_id"]
+    claim = workflows.claim_ready_step(
+        run["workflow_run_id"], revision_id, "org:1", "worker", 4, 60,
+    )
+    step = workflows.get_revision(
+        run["workflow_run_id"], revision_id, "org:1"
+    )["steps"][0]
+
+    with pytest.raises(PausedStepError, match="connection is unavailable"):
+        WorkflowBrokerDispatcher(
+            actions, _UnreachableBroker(), _Connections("disconnected"),
+            workflows, clock=lambda: 5,
+        )(step, claim)
 
 
 def test_safe_write_failures_remain_retryable_instead_of_requiring_reconciliation():
@@ -212,7 +350,7 @@ def test_write_rechecks_credential_version_and_connection_before_dispatch(
             raise AssertionError("provider must not be called")
     dispatcher = WorkflowBrokerDispatcher(actions, Broker(), Connections(), workflows,
                                           clock=lambda: 5)
-    with pytest.raises((PermissionError, RetryableStepError)):
+    with pytest.raises((PermissionError, RetryableStepError, PausedStepError)):
         dispatcher(step, claim)
 
 

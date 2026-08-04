@@ -356,6 +356,13 @@ class WorkflowRepository(object):
         self._ensure_step_column("retry_at", "INTEGER")
         self._ensure_step_column("content_expires_at", "INTEGER")
         self._ensure_step_column("credential_version", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_step_column("reconcile_after", "INTEGER")
+        self._ensure_step_column(
+            "uncounted_attempts", "INTEGER NOT NULL DEFAULT 0"
+        )
+        self._ensure_step_column(
+            "reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"
+        )
         self._ensure_table_column("workflow_approvals", "expires_at", "INTEGER")
         self._ensure_table_column(
             "workflow_approvals", "authorization_mode",
@@ -834,11 +841,14 @@ class WorkflowRepository(object):
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                # Only attempts that actually reached a provider count against
+                # the budget; waiting out an outage must not exhaust it.
                 self._connection.execute(
                     "UPDATE workflow_steps SET execution_status = 'failed', "
                     "terminal_reason = 'maximum attempts exceeded' "
                     "WHERE workflow_run_id = ? AND workflow_revision_id = ? "
-                    "AND tenant_id = ? AND execution_status = 'queued' AND attempt >= ?",
+                    "AND tenant_id = ? AND execution_status = 'queued' "
+                    "AND (attempt - uncounted_attempts) >= ?",
                     (workflow_run_id, revision_id, tenant_id, int(max_attempts)),
                 )
                 rows = self._connection.execute(
@@ -995,6 +1005,90 @@ class WorkflowRepository(object):
                 "terminal_reason = ?, claimed_by = NULL, claimed_at = NULL, retry_at = ? "
                 "WHERE workflow_revision_id = ? AND step_id = ? AND tenant_id = ?",
                 (reason, int(retry_at), revision_id, step_id, tenant_id),
+            )
+        return cursor.rowcount == 1
+
+    def release_without_consuming_attempt(
+        self, revision_id, step_id, tenant_id, reason, retry_at, attempt
+    ):
+        """Requeue a step that never dispatched, without spending its budget.
+
+        `claim_ready_step` increments the attempt on every claim and fails the
+        step once it reaches `max_attempts`. A step blocked by something
+        outside itself, such as a disconnected connection, must not be spent
+        that way. The attempt number still moves — leases and idempotency keys
+        are identified by it — but this attempt is recorded as uncounted, so a
+        provider outage cannot exhaust work that never left the queue.
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE workflow_steps SET execution_status = 'queued', "
+                "terminal_reason = ?, claimed_by = NULL, claimed_at = NULL, "
+                "retry_at = ?, uncounted_attempts = uncounted_attempts + 1 "
+                "WHERE workflow_revision_id = ? AND step_id = ? AND tenant_id = ? "
+                "AND attempt = ? AND execution_status = 'running'",
+                (reason, int(retry_at), revision_id, step_id, tenant_id,
+                 int(attempt)),
+            )
+        return cursor.rowcount == 1
+
+    def list_unresolved_write_steps(self, now_ts, limit=50):
+        """Writes whose outcome is unknown and whose reconciliation is due."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT s.workflow_run_id, s.workflow_revision_id, s.step_id,
+                          s.tenant_id, s.attempt, s.capability_id,
+                          s.connection_id, s.input_hash, s.terminal_reason,
+                          s.reconcile_attempts, r.plan_graph_hash
+                     FROM workflow_steps s
+                     JOIN workflow_revisions r
+                       ON r.workflow_revision_id = s.workflow_revision_id
+                      AND r.tenant_id = s.tenant_id
+                    WHERE s.execution_status = 'execution_unknown'
+                      AND s.effect = 'write'
+                      AND (s.reconcile_after IS NULL OR s.reconcile_after <= ?)
+                    ORDER BY s.claimed_at, s.rowid LIMIT ?""",
+                (int(now_ts), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_unresolved_write_step(
+        self, revision_id, step_id, tenant_id, attempt, worker_id, now_ts,
+        visibility_seconds=60
+    ):
+        """Take exclusive ownership of one unknown outcome.
+
+        Two ticks that observe the same unknown effect must not each ask the
+        provider and each write a verdict; only the claim winner proceeds.
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE workflow_steps
+                      SET claimed_by = ?, reconcile_after = ?,
+                          reconcile_attempts = reconcile_attempts + 1
+                    WHERE workflow_revision_id = ? AND step_id = ?
+                      AND tenant_id = ? AND attempt = ?
+                      AND execution_status = 'execution_unknown'
+                      AND (reconcile_after IS NULL OR reconcile_after <= ?)""",
+                (worker_id, int(now_ts) + int(visibility_seconds), revision_id,
+                 step_id, tenant_id, int(attempt), int(now_ts)),
+            )
+        return cursor.rowcount == 1
+
+    def defer_reconciliation(
+        self, revision_id, step_id, tenant_id, attempt, reason, retry_at
+    ):
+        """Keep an unresolved effect unknown, and keep it on the work queue."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE workflow_steps
+                      SET terminal_reason = ?, claimed_by = NULL,
+                          reconcile_after = ?
+                    WHERE workflow_revision_id = ? AND step_id = ?
+                      AND tenant_id = ? AND attempt = ?
+                      AND execution_status = 'execution_unknown'""",
+                (reason, int(retry_at), revision_id, step_id, tenant_id,
+                 int(attempt)),
             )
         return cursor.rowcount == 1
 

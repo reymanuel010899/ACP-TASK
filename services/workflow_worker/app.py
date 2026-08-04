@@ -11,6 +11,7 @@ from agents.orchestrator.broker_client import ActionBrokerClient
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.policy import PolicyEvaluator
+from agents.orchestrator.reconciliation import WorkflowReconciler
 from agents.orchestrator.workflow_broker_dispatcher import WorkflowBrokerDispatcher
 from agents.orchestrator.workflow_executor import WorkflowExecutor
 from agents.orchestrator.workflow_repository import WorkflowRepository
@@ -27,10 +28,12 @@ class WorkflowWorker:
     OUTBOX_RETRY_SECONDS = 5
 
     def __init__(self, workflows, executor, worker_id=None,
-                 conversation_resolver=None):
+                 conversation_resolver=None, reconciler=None, actions=None):
         self.workflows = workflows
         self.executor = executor
         self.conversation_resolver = conversation_resolver
+        self.reconciler = reconciler
+        self.actions = actions
         self.worker_id = worker_id or "workflow-worker:%s:%s" % (socket.gethostname(), os.getpid())
 
     def run_once(self):
@@ -38,6 +41,8 @@ class WorkflowWorker:
         now = int(time.time())
         if hasattr(self.workflows, "recover_expired_claims"):
             self.workflows.recover_expired_claims(now)
+        self._sweep_stalled_dispatches(now)
+        self._reconcile_unknown_effects(now)
         if hasattr(self.workflows, "purge_expired_content"):
             self.workflows.purge_expired_content(now)
         if hasattr(self.workflows, "recover_unprojected_conversation_outcomes"):
@@ -72,6 +77,30 @@ class WorkflowWorker:
         self._resume_slack_resolver_runs(now)
         self._resume_slack_reads(now)
         return outcomes
+
+    def _sweep_stalled_dispatches(self, now):
+        """Free claims whose lease died mid-flight.
+
+        A proposal left in `executing` has no path to any verdict on its own,
+        and it blocks every later attempt on that step forever.
+        """
+        if self.actions is None or not hasattr(
+            self.actions, "sweep_stalled_executions"
+        ):
+            return None
+        try:
+            return self.actions.sweep_stalled_executions(now)
+        except Exception:
+            return None
+
+    def _reconcile_unknown_effects(self, now):
+        """Ask the provider what happened, so unknown is never the last word."""
+        if self.reconciler is None:
+            return []
+        try:
+            return self.reconciler.run_once(now)
+        except Exception:
+            return []
 
     def _resume_slack_reads(self, now):
         """Fetch the next page of a read still inside its budget."""
@@ -232,7 +261,21 @@ def build_worker():
         conversation_resolver=_build_conversation_resolver(
             workflows, connections, rollout_version
         ),
+        reconciler=WorkflowReconciler(
+            workflows, actions, reconcilers=_provider_reconcilers()
+        ),
+        actions=actions,
     )
+
+
+def _provider_reconcilers():
+    """Provider-side reconcilers, keyed by capability family.
+
+    Registering nothing is a deliberate, visible state: an unknown effect is
+    still swept, bounded, and escalated for a human, rather than silently
+    stranded. A family becomes self-healing the moment it registers here.
+    """
+    return {}
 
 
 def _build_conversation_resolver(workflows, connections, rollout_version):
