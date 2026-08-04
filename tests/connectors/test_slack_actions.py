@@ -324,3 +324,59 @@ def test_a_direct_message_declares_both_scopes_its_executor_uses():
     # conversations.open needs im:write and chat.postMessage needs chat:write;
     # declaring one would let a workspace pass the check and fail at Slack.
     assert definition.required_scopes == frozenset({"im:write", "chat:write"})
+
+
+def test_pinning_a_message_targets_the_exact_message():
+    http = FakeHTTP([Response(payload={"ok": True})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.message.pin", {
+        "channel_id": "C1", "message_ts": "10.1",
+    }, context())
+
+    _method, url, kwargs = http.calls[0]
+    assert url.endswith("/pins.add")
+    assert kwargs["json"] == {"channel": "C1", "timestamp": "10.1"}
+    assert receipt["capability_id"] == "slack.message.pin"
+    assert receipt["provider_id"] == "C1:10.1"
+
+
+def test_unpinning_uses_the_removal_method():
+    http = FakeHTTP([Response(payload={"ok": True})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.message.unpin", {
+        "channel_id": "C1", "message_ts": "10.1",
+    }, context())
+
+    assert http.calls[0][1].endswith("/pins.remove")
+    assert receipt["capability_id"] == "slack.message.unpin"
+
+
+@pytest.mark.parametrize("capability,code", [
+    ("slack.message.pin", "already_pinned"),
+    ("slack.message.unpin", "no_pin"),
+    ("slack.message.unpin", "not_pinned"),
+])
+def test_a_pin_already_in_the_requested_state_succeeds(capability, code):
+    http = FakeHTTP([Response(payload={"ok": False, "error": code})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute(capability, {
+        "channel_id": "C1", "message_ts": "10.1",
+    }, context())
+
+    assert receipt["message_ts"] == "10.1"
+
+
+def test_a_pin_refused_on_its_merits_still_fails():
+    http = FakeHTTP([Response(payload={"ok": False, "error": "not_in_channel"})])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.execute("slack.message.pin", {
+            "channel_id": "C1", "message_ts": "10.1",
+        }, context())
+
+    assert failure.value.code == "not_in_channel"
+    assert failure.value.category == "membership"

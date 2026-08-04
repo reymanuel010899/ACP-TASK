@@ -75,7 +75,8 @@ def test_v1_manifest_is_exact_and_separates_conversation_from_authority():
         item["method"] for item in payload["method_coverage"]["conditional"]
         if item["state"] == "runtime"
     } >= {"reactions.remove"}
-    assert future["pins.add"] == "planned"
+    assert "pins.add" not in future
+    assert "pins.remove" not in future
     assert future["bookmarks.add"] == "planned"
     assert future["conversations.create"] == "planned"
     assert future["search.messages"] == "planned"

@@ -172,6 +172,14 @@ def test_slack_capabilities_declare_allowlisted_output_fields():
             "provider", "capability_id", "provider_id", "team_id",
             "channel_id", "message_ts", "reaction",
         },
+        "slack.message.pin": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts",
+        },
+        "slack.message.unpin": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts",
+        },
         "slack.file.upload": {
             "provider", "capability_id", "provider_id", "team_id",
             "channel_id", "file_id",

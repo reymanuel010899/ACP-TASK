@@ -28,6 +28,8 @@ SLACK_SCOPE_CATALOG = {
     "slack.users.list": "users:read",
     "slack.message.permalink": "channels:history",
     "slack.reaction.remove": "reactions:write",
+    "slack.message.pin": "pins:write",
+    "slack.message.unpin": "pins:write",
     "slack.private_channels.list": "groups:read",
     "slack.private_conversation.read": "groups:history",
     "slack.private_thread.read": "groups:history",
@@ -200,6 +202,8 @@ class SlackActionExecutor:
             "slack.direct_message.send": self._send_direct_message,
             "slack.reaction.add": self._add_reaction,
             "slack.reaction.remove": self._remove_reaction,
+            "slack.message.pin": self._pin_message,
+            "slack.message.unpin": self._unpin_message,
             "slack.file.upload": self._upload_file,
         }
         handler = routes.get(capability_id)
@@ -404,6 +408,36 @@ class SlackActionExecutor:
             "channel_id": channel_id,
             "message_ts": payload["message_ts"],
             "reaction": name,
+        }
+
+    def _pin_message(self, payload, context):
+        return self._set_pin(payload, context, "slack.message.pin")
+
+    def _unpin_message(self, payload, context):
+        return self._set_pin(payload, context, "slack.message.unpin")
+
+    def _set_pin(self, payload, context, capability_id):
+        channel_id = _required_str(payload, "channel_id")
+        message_ts = _required_str(payload, "message_ts")
+        pinning = capability_id == "slack.message.pin"
+        # Already pinned, or already unpinned, is the state the caller asked
+        # for; only a genuine refusal should surface as a failure.
+        tolerated = ("already_pinned",) if pinning else ("no_pin", "not_pinned")
+        try:
+            self._api(
+                "pins.add" if pinning else "pins.remove", context,
+                json={"channel": channel_id, "timestamp": message_ts},
+            )
+        except SlackAPIError as exc:
+            if exc.code not in tolerated:
+                raise
+        return {
+            "provider": "slack",
+            "capability_id": capability_id,
+            "provider_id": "%s:%s" % (channel_id, message_ts),
+            "team_id": context.get("team_id"),
+            "channel_id": channel_id,
+            "message_ts": message_ts,
         }
 
     def _upload_file(self, payload, context):

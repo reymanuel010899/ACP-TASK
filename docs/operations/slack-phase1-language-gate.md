@@ -1,5 +1,21 @@
 # Slack Phase 1 language-quality exit gate
 
+## Corpus changed after the recorded run (2026-08-03)
+
+The result recorded below was measured against the corpus as it stood before
+U5 shipped. U5 promoted `reactions.remove` and `pins.add` from planned methods
+to runtime descriptors, which made three cases factually wrong: they asserted
+those operations were unsupported, and the ground truth changed because the
+product changed, not because the model improved.
+
+Those cases now expect the operation instead of expecting a refusal, which
+makes them harder to pass, not easier. This is the one edit the gate's rules
+permit — correcting ground truth that the product invalidated — and it is
+recorded here rather than made silently.
+
+The pass below therefore describes the prior corpus. A re-run is needed before
+the number is quoted against the current one.
+
 ## Decision contract
 
 This gate decides whether the Phase 1 Slack interpretation contract is ready

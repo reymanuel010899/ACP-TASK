@@ -218,6 +218,8 @@ def slack_definitions():
         "slack.direct_message.send": (("im:write", "chat:write"), "write", ("user_id", "text"), "slack.message"),
         "slack.reaction.add": ("reactions:write", "write", ("channel_id", "message_ts", "reaction"), "slack.reaction"),
         "slack.reaction.remove": ("reactions:write", "write", ("channel_id", "message_ts", "reaction"), "slack.reaction"),
+        "slack.message.pin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
+        "slack.message.unpin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
         "slack.file.upload": ("files:write", "write", ("channel_id", "filename", "content_hash"), "slack.file"),
     }
     schemas = {
@@ -234,6 +236,8 @@ def slack_definitions():
         "slack.direct_message.send": {"type": "object", "required": ["user_id", "text"], "properties": {"user_id": {"type": "string"}, "text": {"type": "string", "maxLength": 40000}}, "additionalProperties": False},
         "slack.reaction.add": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
         "slack.reaction.remove": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
+        "slack.message.pin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
+        "slack.message.unpin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
     nullable_string = {"type": ["string", "null"]}
@@ -340,6 +344,12 @@ def slack_definitions():
                 "message_ts": {"type": "string"},
                 "reaction": {"type": "string"},
             },
+        ),
+        "slack.message.pin": receipt_output(
+            "slack.message.pin", {"message_ts": {"type": "string"}},
+        ),
+        "slack.message.unpin": receipt_output(
+            "slack.message.unpin", {"message_ts": {"type": "string"}},
         ),
         "slack.file.upload": receipt_output(
             "slack.file.upload", {

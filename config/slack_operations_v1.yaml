@@ -342,6 +342,52 @@
       "prerequisites": ["connected_installation", "message_visible_to_requester"],
       "recovery": {"missing_slot": "clarify_message_or_reaction", "unavailable": "explain_message_access"},
       "presentation": {"kind": "exact_effect_preview", "label": "Remove reaction"}
+    },
+    {
+      "operation_id": "slack.message.pin",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["pin message", "pin this", "fija el mensaje", "fijar mensaje", "ancla el mensaje", "anclar mensaje"],
+      "slots": [
+        {"name": "message", "entity_kind": "slack.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "pin_message",
+          "capability_id": "slack.message.pin",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "message.channel_id", "message_ts": "message.message_ts"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_pins",
+      "prerequisites": ["connected_installation", "channel_membership"],
+      "recovery": {"missing_slot": "clarify_message", "unavailable": "explain_message_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Pin message"}
+    },
+    {
+      "operation_id": "slack.message.unpin",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["unpin message", "remove pin", "quita el fijado", "desfija el mensaje", "desfijar mensaje", "quitar anclaje"],
+      "slots": [
+        {"name": "message", "entity_kind": "slack.message", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "unpin_message",
+          "capability_id": "slack.message.unpin",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "message.channel_id", "message_ts": "message.message_ts"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_pins",
+      "prerequisites": ["connected_installation", "channel_membership"],
+      "recovery": {"missing_slot": "clarify_message", "unavailable": "explain_message_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Unpin message"}
     }
   ],
   "method_coverage": {
@@ -357,8 +403,8 @@
       {"method": "conversations.open", "family": "direct_messages", "state": "runtime", "prerequisites": ["direct_messaging_enabled"]},
       {"method": "reactions.add", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
       {"method": "reactions.remove", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
-      {"method": "pins.add", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
-      {"method": "pins.remove", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
+      {"method": "pins.add", "family": "pins", "state": "runtime", "prerequisites": ["channel_membership"]},
+      {"method": "pins.remove", "family": "pins", "state": "runtime", "prerequisites": ["channel_membership"]},
       {"method": "bookmarks.add", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "bookmarks.edit", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "bookmarks.remove", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
