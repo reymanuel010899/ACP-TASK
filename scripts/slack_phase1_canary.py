@@ -167,6 +167,28 @@ def report_baseline(workflows, tenant_id, since, until):
         ))
 
 
+def report_promotion_gates(workflows, tenant_id, since, until):
+    """Per-family evidence, which is what a family enablement decision needs."""
+    rows = workflows.family_promotion_report(tenant_id, since, until)
+    print("\n=== Puertas de promocion por familia (R25) ===")
+    if not rows:
+        print("  sin evidencia en la ventana")
+        return
+    print("  %-16s %6s %6s %6s  %10s %10s  %s" % (
+        "familia", "intent", "compl", "aband", "clarif/int", "prev->compl",
+        "evidencia",
+    ))
+    for row in rows:
+        def rate(value):
+            return "n/a" if value is None else ("%.2f" % value)
+        print("  %-16s %6d %6d %6d  %10s %10s  %s" % (
+            row["family"], row["attempted"], row["completed"],
+            row["abandoned"], rate(row["clarification_rate"]),
+            rate(row["preview_conversion"]),
+            "suficiente" if row["sufficient_evidence"] else "INSUFICIENTE",
+        ))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jobs", type=int, default=10)
@@ -187,6 +209,7 @@ def main(argv=None):
 
     if args.baseline_only:
         report_baseline(workflows, args.tenant, 0, since + 1)
+        report_promotion_gates(workflows, args.tenant, 0, since + 1)
         return 0
 
     service = build_service(workflows)
@@ -245,6 +268,7 @@ def main(argv=None):
             print("  comparacion no concluyente: requiere escrituras habilitadas")
 
     report_baseline(workflows, args.tenant, since, int(time.time()) + 1)
+    report_promotion_gates(workflows, args.tenant, 0, int(time.time()) + 1)
     return 0
 
 

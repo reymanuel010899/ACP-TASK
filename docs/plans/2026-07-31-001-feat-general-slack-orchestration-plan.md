@@ -1023,6 +1023,45 @@ were added as dev dependencies for this.
 
 ### U8. Prove operation families end to end and roll out safely
 
+**Progress (2026-08-04). Partially delivered; the unit cannot close yet.**
+
+U8 depends on U1-U7 **and U9-U10**, and those two are gated on the R25 demand
+checkpoint. Its browser acceptance covers file and edit/delete flows that do
+not exist, so the unit stays open by design rather than by omission.
+
+Delivered:
+
+| Piece | State |
+|---|---|
+| Descriptor conformance suite | **Done** — 118 assertions over the registered set |
+| Per-family promotion gate report | **Done** — `family_promotion_report`, surfaced by the canary |
+| Read completion instrumentation | **Written, not verified live** |
+
+The conformance suite asserts over the *registered set* rather than a
+hand-kept list, so a new descriptor faces the same bar the day it is added:
+closed input and output schemas, declared scopes and authority profile, an
+executor route, and for writes a preview whose fields are real inputs, a
+verifier, and a retry policy that matches what a repeat actually does.
+
+The gate report answers R25's question per family — attempted, completed,
+abandoned, clarification rate, preview conversion, correction rate — and says
+`INSUFICIENTE` below twenty attempts rather than presenting a 100% completion
+rate drawn from one job. Attempts at disabled families are counted, because
+someone asking for something the product refuses is the demand signal that
+decides whether it gets built.
+
+Using the report immediately found a hole in the instrumentation: the read
+family showed 131 attempts and 0 completions, because a read finishes in the
+projection rather than in the service and nothing recorded it. A gate reading
+that would have judged a working family as broken. The fix is committed and
+unit-tested; it could not be confirmed against live traffic because the vault
+credential emptied again mid-run.
+
+Not started: the security and reliability matrices as consolidated suites, the
+authority matrix, the versioned concierge evaluation corpus, browser
+acceptance over local HTTPS, and the runbook documentation.
+
+
 **Goal:** Validate security, reliability, language quality, and operability across the complete Slack expansion before enabling each family.
 
 **Requirements:** R1-R25.

@@ -9,6 +9,13 @@ import threading
 import uuid
 
 
+def _ratio(numerator, denominator):
+    """A rate nobody can misread as zero when there is simply no data."""
+    if not denominator:
+        return None
+    return round(numerator / denominator, 3)
+
+
 class WorkflowRepository(object):
     DEFAULT_CONTENT_TTL_SECONDS = 30 * 24 * 60 * 60
     CONVERSATION_STATUSES = frozenset({
@@ -1146,15 +1153,71 @@ class WorkflowRepository(object):
         )
 
     def resume_policy_paused(self):
-        """Resume only kill-switch pauses; binding changes still require replanning."""
+        """Resume only kill-switch pauses; binding changes still require replanning.
+
+        Control-plane denials join the two original literals. An administrator
+        who lifts an emergency stop or re-enables a family has said the work
+        may proceed; if the parked steps only resumed on a replan, every
+        switch here would be one-way in practice and "prevented" work would
+        never become "dispatched".
+
+        Everything else stays parked on purpose: a binding that changed under
+        a step is not something a later tick can make safe again.
+        """
         with self._lock:
             cursor = self._connection.execute(
                 "UPDATE workflow_steps SET execution_status = 'queued', "
                 "terminal_reason = NULL WHERE execution_status = 'paused_by_policy' "
-                "AND terminal_reason IN ('dispatch policy disabled', "
-                "'capability rollout is disabled')"
+                "AND (terminal_reason IN ('dispatch policy disabled', "
+                "'capability rollout is disabled') "
+                "OR terminal_reason LIKE 'control_plane:%')"
             )
         return cursor.rowcount
+
+    def effect_disposition_counts(self, tenant_id):
+        """What actually happened to this tenant's effects, in four buckets.
+
+        An administrator who hits emergency stop needs to know what was
+        already dispatched, what was prevented, what is still in flight, and
+        what is uncertain. Collapsing prevented into failed, or uncertain into
+        completed, would make the stop's own report the least trustworthy
+        thing on the screen.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT execution_status, terminal_reason, COUNT(*) AS total "
+                "FROM workflow_steps WHERE tenant_id = ? "
+                "GROUP BY execution_status, terminal_reason",
+                (tenant_id,),
+            ).fetchall()
+        counts = {
+            "dispatched": 0, "prevented": 0, "in_progress": 0, "uncertain": 0,
+            "failed": 0,
+        }
+        for row in rows:
+            status = row["execution_status"]
+            total = int(row["total"])
+            if status == "completed":
+                counts["dispatched"] += total
+            elif status == "execution_unknown":
+                counts["uncertain"] += total
+            elif status in ("queued", "running"):
+                counts["in_progress"] += total
+            elif status == "paused_by_policy":
+                reason = row["terminal_reason"] or ""
+                # Only a control-plane pause is "prevented". A step parked
+                # because its input reference vanished was not prevented by an
+                # administrator, and counting it as such would overstate what
+                # the stop did.
+                if reason.startswith("control_plane:") or reason in (
+                    "dispatch policy disabled", "capability rollout is disabled"
+                ):
+                    counts["prevented"] += total
+                else:
+                    counts["failed"] += total
+            elif status == "failed":
+                counts["failed"] += total
+        return counts
 
     def cancel_revision(self, workflow_run_id, revision_id, tenant_id):
         with self._lock:
@@ -2311,6 +2374,80 @@ class WorkflowRepository(object):
             "created_at": row["created_at"],
         } for row in rows]
 
+    #: The metric set a family must be judged on before it is enabled or
+    #: widened. Named here so a gate report cannot quietly omit one.
+    PROMOTION_METRICS = (
+        "attempted", "completed", "abandoned", "rejected",
+        "clarification_rate", "preview_conversion", "correction_rate",
+        "failure_rate",
+    )
+
+    def family_promotion_report(self, tenant_id, since_ts, until_ts):
+        """Report each family against the gate R25 actually asks for.
+
+        Enablement decisions were being made from whether a connector method
+        worked. This reports what the plan requires instead — completion,
+        clarification burden, preview conversion, correction, abandonment —
+        per family, so a decision can be argued from evidence.
+
+        Demand is deliberately counted as *attempts*, including attempts at
+        families that are switched off: someone asking for something the
+        product refuses is the clearest demand signal there is, and it is the
+        only one that can justify funding a family nobody has built.
+        """
+        rows = self.conversation_outcome_baseline(tenant_id, since_ts, until_ts)
+        families = {}
+        for row in rows:
+            family = row["operation_family"] or "unknown"
+            bucket = families.setdefault(family, {
+                "family": family,
+                **{metric: 0 for metric in ("attempted", "completed",
+                                            "abandoned", "rejected",
+                                            "previewed", "clarified",
+                                            "corrected", "failed")},
+            })
+            counted = {
+                "operation_attempted": "attempted",
+                "completed": "completed",
+                "abandoned": "abandoned",
+                "rejected": "rejected",
+                "previewed": "previewed",
+                "clarification_requested": "clarified",
+                "corrected": "corrected",
+                "failed": "failed",
+            }.get(row["event_type"])
+            if counted:
+                bucket[counted] += row["total"]
+        report = []
+        for bucket in families.values():
+            attempted = bucket["attempted"] or 0
+            previewed = bucket["previewed"] or 0
+            report.append({
+                **bucket,
+                "clarification_rate": _ratio(bucket["clarified"], attempted),
+                "preview_conversion": _ratio(bucket["completed"], previewed),
+                "correction_rate": _ratio(bucket["corrected"], attempted),
+                "failure_rate": _ratio(bucket["failed"], attempted),
+                # Nothing here decides. A gate is a judgement made from
+                # evidence, and evidence this thin should say so.
+                "sufficient_evidence": attempted >= 20,
+            })
+        return sorted(report, key=lambda item: item["family"])
+
+    def _record_read_completion(self, conversation_id, tenant_id, principal_id,
+                                now_ts):
+        current = self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+        try:
+            self.append_conversation_outcome_event(
+                conversation_id, tenant_id, principal_id, "completed", now_ts,
+                operation_family=(current or {}).get("operation"),
+                metrics={"terminal_outcome": "answered"},
+            )
+        except (KeyError, ValueError):
+            return None
+
     def conversation_outcome_baseline(self, tenant_id, since_ts, until_ts):
         """Aggregate the Phase 1 baseline without reading any content."""
         if not tenant_id:
@@ -2729,6 +2866,13 @@ class WorkflowRepository(object):
             return True
         if status == "complete" and effects == {"read"}:
             changes["status"] = "ready"
+            # A read finishes here, in the projection, not in the service. Its
+            # completion went unrecorded, so the read family reported zero
+            # completions against a hundred attempts and any gate reading that
+            # would have judged a working family as broken.
+            self._record_read_completion(
+                row["conversation_id"], tenant_id, row["principal_id"], now_ts,
+            )
             outputs = [step.get("output") or {} for step in revision["steps"]]
             channels = next((list(item.get("channels") or []) for item in reversed(outputs)
                              if item.get("channels") is not None), None)
