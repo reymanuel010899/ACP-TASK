@@ -1946,6 +1946,52 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
+    def _present_slack_evidence(self, output, step_input, locale):
+        """Answer only from cited evidence, never by echoing channel text.
+
+        The raw provider payload is untrusted: it carries other people's words
+        and anything they chose to write, including instructions aimed at this
+        system. Routing it through the presenter attributes every line to an
+        author and a timestamp, and keeps the reviewed period and partiality
+        attached to the answer rather than implied by it.
+        """
+        from agents.orchestrator.result_presenter import GroundedResultPresenter
+
+        channel_id = step_input.get("channel_id")
+        messages, citations = [], []
+        for message in (output.get("messages") or []):
+            if not isinstance(message, dict) or not message.get("ts"):
+                continue
+            messages.append({
+                "channel_id": channel_id,
+                "message_ts": message.get("ts"),
+                "author_id": message.get("user"),
+                "text": message.get("text", ""),
+                "thread_ts": message.get("thread_ts"),
+            })
+            citations.append({
+                "citation_id": "slack:%s:%s" % (channel_id, message["ts"]),
+                "channel_id": channel_id,
+                "message_ts": message["ts"],
+                "author_id": message.get("user"),
+            })
+        period = ({"oldest": step_input["oldest"], "latest": step_input["latest"]}
+                  if step_input.get("oldest") and step_input.get("latest")
+                  else None)
+        truncated = bool(output.get("next_cursor")) or bool(output.get("partial"))
+        presented = GroundedResultPresenter().present(
+            step_input.get("question") or "", {
+                "messages": messages, "citations": citations,
+                "period": period, "partial": truncated,
+                "partial_reason": "page_budget_reached" if truncated else None,
+            }, locale,
+        )
+        # Permalinks require a per-message fan-out this slice does not perform,
+        # so citations carry stable references and say so rather than implying
+        # a link that was never fetched.
+        presented["citation_complete"] = False
+        return presented
+
     def append_conversation_outcome_event(
         self, conversation_id, tenant_id, principal_id, event_type, now_ts,
         operation_family=None, metrics=None,
@@ -2477,21 +2523,19 @@ class WorkflowRepository(object):
                     changes, now_ts,
                 )
                 return True
-            evidence = next((item for item in reversed(outputs)
-                             if item.get("messages") is not None), {})
-            messages = list(evidence.get("messages") or [])
-            answer = evidence.get("answer") or "\n".join(
-                str(item.get("text") or "") for item in messages
-                if isinstance(item, dict) and item.get("text")
+            read_step = next((step for step in reversed(revision["steps"])
+                              if (step.get("output") or {}).get("messages")
+                              is not None), None)
+            evidence = (read_step or {}).get("output") or {}
+            current = self.get_conversation(
+                row["conversation_id"], tenant_id, row["principal_id"], now_ts
             )
             self.store_conversation_presentation(
-                row["conversation_id"], tenant_id, row["principal_id"], {
-                    "answer": answer or "No messages found.",
-                    "citations": list(evidence.get("citations") or []),
-                    "period": evidence.get("period"),
-                    "partial": bool(evidence.get("partial")),
-                    "partial_reason": evidence.get("partial_reason"),
-                }, now_ts,
+                row["conversation_id"], tenant_id, row["principal_id"],
+                self._present_slack_evidence(
+                    evidence, (read_step or {}).get("input") or {},
+                    (current or {}).get("locale", "es"),
+                ), now_ts,
             )
         if status == "complete" and effects == {"write"}:
             changes["pending_draft"] = None
