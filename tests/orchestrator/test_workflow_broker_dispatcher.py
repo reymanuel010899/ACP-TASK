@@ -296,3 +296,59 @@ def test_resolved_effect_may_change_only_declared_references():
     assert not _matches_approved_template(approved, {
         "to": "attacker@example.com", "subject": "Resumen", "body": "Contenido",
     })
+
+
+@pytest.mark.parametrize("capability", [
+    "slack.reaction.add", "slack.reaction.remove",
+    "slack.message.pin", "slack.message.unpin",
+])
+def test_an_idempotent_write_retries_instead_of_demanding_reconciliation(
+    capability,
+):
+    from libs.integrations.catalog import capability_retry_policy
+
+    policy = capability_retry_policy(capability, "write")
+    assert policy == "idempotent"
+
+    # Repeating these converges on the same state, so an unknown outcome is
+    # a retry, not a case for a human to reconcile.
+    with pytest.raises(RetryableStepError):
+        _raise_for_broker_failure(202, {"status": "execution_unknown"},
+                                  "write", policy)
+    with pytest.raises(RetryableStepError):
+        _raise_for_broker_failure(503, {"error": "unavailable"}, "write", policy)
+
+
+@pytest.mark.parametrize("capability", [
+    "slack.message.send", "slack.thread.reply",
+    "slack.direct_message.send", "slack.bookmark.add",
+])
+def test_an_appending_write_still_requires_reconciliation(capability):
+    from libs.integrations.catalog import capability_retry_policy
+
+    policy = capability_retry_policy(capability, "write")
+    assert policy == "reconcile"
+
+    # Repeating these creates a second message or bookmark, so the outcome
+    # must be established before anything retries.
+    with pytest.raises(AmbiguousStepError):
+        _raise_for_broker_failure(202, {"status": "execution_unknown"},
+                                  "write", policy)
+    with pytest.raises(AmbiguousStepError):
+        _raise_for_broker_failure(503, {"error": "unavailable"}, "write", policy)
+
+
+def test_a_read_is_never_ambiguous():
+    from libs.integrations.catalog import capability_retry_policy
+
+    assert capability_retry_policy("slack.conversation.read", "read") == "safe"
+    with pytest.raises(RetryableStepError):
+        _raise_for_broker_failure(202, {}, "read", "safe")
+
+
+def test_a_deterministic_refusal_is_correctable_whatever_the_retry_policy():
+    with pytest.raises(CorrectableStepError, match="membership"):
+        _raise_for_broker_failure(
+            403, {"error": "not_in_channel", "category": "membership"},
+            "write", "idempotent",
+        )

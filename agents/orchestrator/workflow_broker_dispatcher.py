@@ -3,6 +3,7 @@
 import time
 
 from agents.orchestrator.action_repository import canonical_payload_hash
+from libs.integrations.catalog import capability_retry_policy
 from agents.orchestrator.workflow_executor import (
     AmbiguousStepError, CorrectableStepError, RetryableStepError,
 )
@@ -27,11 +28,20 @@ def _matches_approved_template(template, resolved):
     return template == resolved
 
 
-def _raise_for_broker_failure(status, body, effect):
+def _raise_for_broker_failure(status, body, effect, retry_policy="reconcile"):
+    # An idempotent write converges on the same state however many times it
+    # runs, so an unknown outcome is a retry rather than a reconciliation.
+    # Treating every write as ambiguous strands operations that were never at
+    # risk of duplicating anything.
+    repeatable = effect != "write" or retry_policy == "idempotent"
     if status == 202:
+        if repeatable:
+            raise RetryableStepError(
+                "provider outcome is unknown but the effect is repeatable"
+            )
         raise AmbiguousStepError("provider outcome requires reconciliation")
     if status >= 500:
-        if effect == "write" and body.get("outcome_certainty") != "safe":
+        if not repeatable and body.get("outcome_certainty") != "safe":
             raise AmbiguousStepError(
                 "provider write outcome requires reconciliation"
             )
@@ -185,7 +195,10 @@ class WorkflowBrokerDispatcher:
             raise CorrectableStepError("pre_dispatch:%s" % type(exc).__name__)
         status, body = self.broker.execute(lease, binding, step["input"])
         if status != 200:
-            _raise_for_broker_failure(status, body, step["effect"])
+            _raise_for_broker_failure(
+                status, body, step["effect"],
+                capability_retry_policy(step["capability_id"], step["effect"]),
+            )
         return {
             "receipt": body.get("receipt", {}),
             "output": body.get("receipt", {}),

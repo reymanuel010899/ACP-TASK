@@ -203,6 +203,22 @@ def google_definitions():
     return tuple(definitions)
 
 
+#: Writes Slack itself treats as set-state rather than append. Repeating one
+#: converges on the same result, so an ambiguous dispatch can simply retry
+#: instead of demanding reconciliation. Sending a message is not here: a
+#: repeat posts twice.
+IDEMPOTENT_WRITES = frozenset({
+    "slack.reaction.add", "slack.reaction.remove",
+    "slack.message.pin", "slack.message.unpin",
+})
+
+
+def capability_retry_policy(capability_id, effect):
+    if effect != "write":
+        return "safe"
+    return "idempotent" if capability_id in IDEMPOTENT_WRITES else "reconcile"
+
+
 def slack_definitions():
     matrix = {
         "slack.channels.list": ("channels:read", "read", (), None),
@@ -381,7 +397,7 @@ def slack_definitions():
         ),
         effect=effect,
         risk="medium" if effect == "write" else "low",
-        retry_policy="reconcile" if effect == "write" else "safe",
+        retry_policy=capability_retry_policy(capability_id, effect),
         preview_fields=preview,
         verifier=verifier,
     ) for capability_id, (scope, effect, preview, verifier) in matrix.items())
