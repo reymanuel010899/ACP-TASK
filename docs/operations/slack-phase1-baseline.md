@@ -100,27 +100,42 @@ gap is not silently reported as a product failure rate.
 
 ## Open: the vault credential disappears
 
-Twice during this session `vault.credentials` emptied while
+`vault.credentials` emptied five times during this session while
 `integration_connections` still reported `status: connected` against a
-credential id that no longer existed. Every Slack operation then failed as a
-bare 502, because the broker funnels unexpected exceptions into
-`return 502, body` without logging them.
+credential id that no longer existed. Every Slack operation then failed.
 
-A controlled experiment exonerated the obvious suspect: stopping and starting
-the whole stack left the row intact (1 before, 1 after). The deleting path was
-not identified. All four delete sites in `services/oauth/app.py` are explicit
-user actions, and the rotator uses compare-and-swap rather than delete, so a
-disconnect or repeated connect from the UI remains the most likely cause.
+### What has been eliminated
 
-Two defects make this far more expensive to diagnose than it should be, and
-both are worth fixing before the next person hits it:
+Each of these was tested, not assumed:
 
-- **A connection can claim health it does not have.** The authorizer checks
-  that the credential id *matches*, never that the credential *exists*, so a
-  missing credential surfaces as an opaque provider error rather than a named
-  `credential_missing` state with a reconnect action.
-- **The broker swallows unexpected exceptions.** `action_broker.log` stayed
-  empty through every failure above.
+| Hypothesis | Result |
+|---|---|
+| Stack restart deletes it | **No** — a controlled down/up left the row intact (1 before, 1 after) |
+| Row-level security hides it | **No** — connecting as `postgres`, RLS is neither enabled nor forced |
+| A background sweeper deletes it | **No** — 120 s of continuous polling at 0.4 s resolution caught only reconnect-driven transitions |
+| The write is never committed | **No** — `store_credential` uses `transaction()`, which commits |
+| Shutdown hooks clean up | **No** — `dev-stack.sh down` only kills PIDs; no signal handlers exist |
+| Startup runs migrations that reset the schema | **No** — `up` starts processes and nothing else |
+| A cascading delete from `identity.principals` | **No** — the foreign key has no `ON DELETE CASCADE`, and all principals remain |
+
+### What remains
+
+Deletion must therefore come from `delete_managed_oauth_credential`, whose only
+callers are four explicit paths in `services/oauth/app.py`: connection
+conflict, disconnect, revoke, and reconnect-retire.
+
+The leading hypothesis is the conflict path at `services/oauth/app.py:268`,
+which deletes the credential it just created and returns 409 when
+`upsert_installation` raises `ConnectionConflict`. That would leave exactly
+the observed state: a connection pointing at an id the vault never kept. It
+has **not** been reproduced, so it stays a hypothesis.
+
+### Why this is now cheaper to hit
+
+Before, the symptom was `provider is temporarily unavailable` after five
+retries, which is a lie: nothing was temporary and retrying could never help.
+The step now reports `credential_unavailable` on its first attempt, and the
+broker logs a traceback for anything it still cannot classify.
 
 ## Reproducing
 
