@@ -214,3 +214,59 @@ def test_alias_lookup_is_deterministic_for_available_and_unavailable_operations(
         "slack.private_channels.list"
     )
     assert registry.lookup_alias("do something mysterious") is None
+
+
+def test_scope_bundles_group_by_family_and_carry_every_needed_scope():
+    definitions = slack_definitions()
+    bundles = load_slack_operations(definitions).scope_bundles(definitions)
+
+    assert bundles["slack_pins"]["scopes"] == ["pins:write"]
+    assert bundles["slack_pins"]["operations"] == [
+        "slack.message.pin", "slack.message.unpin",
+    ]
+    # The DM family carries both scopes its executor uses, so granting the
+    # bundle cannot produce a connection that fails at Slack.
+    assert bundles["slack_direct_messages"]["scopes"] == [
+        "chat:write", "im:write",
+    ]
+    assert "slack.connection.status" not in {
+        operation
+        for bundle in bundles.values()
+        for operation in bundle["operations"]
+    }
+
+
+def test_missing_bundles_name_only_what_a_connection_cannot_run():
+    definitions = slack_definitions()
+    registry = load_slack_operations(definitions)
+    granted = ["channels:read", "channels:history", "chat:write", "users:read"]
+
+    missing = registry.missing_scope_bundles(definitions, granted)
+    families = {bundle["family"]: bundle for bundle in missing}
+
+    assert "slack_messaging" not in families
+    assert "slack_conversation_reads" not in families
+    assert families["slack_pins"]["missing_scopes"] == ["pins:write"]
+    assert families["slack_direct_messages"]["missing_scopes"] == ["im:write"]
+    # Already-granted scopes are not re-requested, so the prompt stays minimal.
+    assert "chat:write" not in families["slack_direct_messages"]["missing_scopes"]
+
+
+def test_asking_for_one_family_does_not_drag_in_the_others():
+    definitions = slack_definitions()
+    registry = load_slack_operations(definitions)
+
+    missing = registry.missing_scope_bundles(
+        definitions, ["channels:read"], families=["slack_pins"],
+    )
+
+    assert [bundle["family"] for bundle in missing] == ["slack_pins"]
+
+
+def test_a_fully_granted_family_asks_for_nothing():
+    definitions = slack_definitions()
+    registry = load_slack_operations(definitions)
+
+    assert registry.missing_scope_bundles(
+        definitions, ["pins:write"], families=["slack_pins"],
+    ) == []

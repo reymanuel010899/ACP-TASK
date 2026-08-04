@@ -136,7 +136,9 @@ class OAuthService(object):
         ):
             return 422, {"error": "unsupported or missing capabilities"}
         capabilities = sorted(set(capabilities))
-        scopes = sorted({catalog[item] for item in capabilities})
+        # A capability can need several scopes; asking for one of them
+        # authorises a connection that cannot run what it advertises.
+        scopes = sorted(set().union(*(catalog[item] for item in capabilities)))
         state = secrets.token_urlsafe(32)
         self.repository.create_transaction(
             transaction_id=secrets.token_urlsafe(24),
@@ -211,8 +213,9 @@ class OAuthService(object):
             ):
                 return 409, {"error": "scope upgrade target changed"}
         enabled = sorted(
-            capability for capability, scope in self.slack_connector.scope_catalog().items()
-            if scope in authority.granted_scopes
+            capability
+            for capability, required in self.slack_connector.scope_catalog().items()
+            if required.issubset(authority.granted_scopes)
         )
         document = {
             "access_token": authority.access_token,

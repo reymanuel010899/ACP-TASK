@@ -21,25 +21,21 @@ AUTHORIZATION_URL = "https://slack.com/oauth/v2/authorize"
 TOKEN_URL = "https://slack.com/api/oauth.v2.access"
 UNINSTALL_URL = "https://slack.com/api/apps.uninstall"
 
-SLACK_SCOPE_CATALOG = {
-    "slack.channels.list": "channels:read",
-    "slack.conversation.read": "channels:history",
-    "slack.thread.read": "channels:history",
-    "slack.users.list": "users:read",
-    "slack.message.permalink": "channels:history",
-    "slack.reaction.remove": "reactions:write",
-    "slack.message.pin": "pins:write",
-    "slack.message.unpin": "pins:write",
-    "slack.bookmark.add": "bookmarks:write",
-    "slack.private_channels.list": "groups:read",
-    "slack.private_conversation.read": "groups:history",
-    "slack.private_thread.read": "groups:history",
-    "slack.message.send": "chat:write",
-    "slack.thread.reply": "chat:write",
-    "slack.direct_message.send": "im:write",
-    "slack.reaction.add": "reactions:write",
-    "slack.file.upload": "files:write",
-}
+def slack_scope_catalog():
+    """Derive install scopes from the trusted descriptors, never a copy.
+
+    This used to be a hand-maintained dict of one scope per capability. It
+    drifted the moment a capability needed two: the DM descriptor required
+    im:write and chat:write while the install still asked for im:write alone,
+    which authorises a connection that cannot run what it advertises.
+    """
+    from libs.integrations.catalog import slack_definitions
+
+    return {
+        definition.capability_id: frozenset(definition.required_scopes)
+        for definition in slack_definitions()
+    }
+
 
 SLACK_API = "https://slack.com/api"
 
@@ -108,7 +104,7 @@ class SlackCredentialConnector(CredentialConnector):
         return payload.get("ok") is True
 
     def scope_catalog(self):
-        return dict(SLACK_SCOPE_CATALOG)
+        return slack_scope_catalog()
 
     def _token_request(self, data, operation):
         payload = self._request("POST", TOKEN_URL, operation, data=data)

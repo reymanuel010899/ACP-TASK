@@ -109,6 +109,56 @@ class SlackOperationRegistry:
     def get(self, operation_id):
         return self._operation_index.get(operation_id)
 
+    def scope_bundles(self, definitions):
+        """Group install scopes by the family that needs them.
+
+        Asking for every scope at install trains people to approve without
+        reading. A bundle is the smallest grant that makes one family work,
+        named by the family so the request can say what it buys.
+        """
+        scopes_by_capability = {
+            definition.capability_id: frozenset(definition.required_scopes)
+            for definition in definitions
+        }
+        bundles = {}
+        for operation in self.operations:
+            capabilities = {
+                step.capability_id for step in operation.capability_recipe
+            }
+            known = capabilities & set(scopes_by_capability)
+            if not known:
+                continue
+            bundle = bundles.setdefault(operation.family_flag, {
+                "family": operation.family_flag,
+                "capabilities": set(), "scopes": set(), "operations": set(),
+            })
+            bundle["capabilities"] |= known
+            bundle["operations"].add(operation.operation_id)
+            for capability_id in known:
+                bundle["scopes"] |= scopes_by_capability[capability_id]
+        return {
+            family: {
+                "family": family,
+                "capabilities": sorted(bundle["capabilities"]),
+                "operations": sorted(bundle["operations"]),
+                "scopes": sorted(bundle["scopes"]),
+            }
+            for family, bundle in bundles.items()
+        }
+
+    def missing_scope_bundles(self, definitions, granted_scopes, families=None):
+        """Return only the families a connection cannot yet run, and why."""
+        granted = frozenset(granted_scopes or ())
+        bundles = self.scope_bundles(definitions)
+        wanted = set(families) if families else set(bundles)
+        missing = []
+        for family in sorted(wanted & set(bundles)):
+            bundle = bundles[family]
+            absent = sorted(set(bundle["scopes"]) - granted)
+            if absent:
+                missing.append(dict(bundle, missing_scopes=absent))
+        return missing
+
     def lookup_alias(self, text):
         """Find one manifest operation from deterministic human-language aliases."""
         normalized = _normalize_alias(text)

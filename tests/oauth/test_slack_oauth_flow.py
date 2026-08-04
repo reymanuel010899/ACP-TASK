@@ -21,15 +21,17 @@ class SessionRepository:
 
 class SlackConnector:
     def scope_catalog(self):
+        # Mirrors the real contract: a capability declares every scope its
+        # executor needs, so the DM carries both of its.
         return {
-            "slack.channels.list": "channels:read",
-            "slack.private_channels.list": "groups:read",
-            "slack.private_conversation.read": "groups:history",
-            "slack.private_thread.read": "groups:history",
-            "slack.message.send": "chat:write",
-            "slack.users.list": "users:read",
-            "slack.message.permalink": "channels:history",
-            "slack.direct_message.send": "im:write",
+            "slack.channels.list": frozenset({"channels:read"}),
+            "slack.private_channels.list": frozenset({"groups:read"}),
+            "slack.private_conversation.read": frozenset({"groups:history"}),
+            "slack.private_thread.read": frozenset({"groups:history"}),
+            "slack.message.send": frozenset({"chat:write"}),
+            "slack.users.list": frozenset({"users:read"}),
+            "slack.message.permalink": frozenset({"channels:history"}),
+            "slack.direct_message.send": frozenset({"im:write", "chat:write"}),
         }
 
     def authorization_url(self, state, code_challenge, scopes):
@@ -146,7 +148,8 @@ def test_people_and_dm_upgrade_requests_only_optional_bot_scopes(tmp_path):
     )
     assert status == 200
     scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
-    assert set(scopes.split(",")) == {"users:read", "im:write"}
+    # chat:write travels with the DM: its executor posts after opening.
+    assert set(scopes.split(",")) == {"users:read", "im:write", "chat:write"}
 
 
 def test_tenant_member_can_see_owner_installation_but_cannot_mutate_it(tmp_path):
