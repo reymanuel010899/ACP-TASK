@@ -564,7 +564,85 @@ def _conversation_response(conversation):
             "workflowId": conversation["workflow_run_id"],
             "revisionId": conversation.get("workflow_revision_id"),
         }
+    result.update(_projection_envelope(conversation))
+    group = _effect_group_projection(conversation)
+    if group is not None:
+        result["effectGroup"] = group
     return result
+
+
+#: Statuses from which nothing further can happen on this conversation.
+TERMINAL_STATES = frozenset({
+    "succeeded", "ready", "failed", "retryable_failure", "unknown_outcome",
+    "cancelled", "expired", "closed",
+})
+
+#: What the server will accept next, keyed by where the conversation is. The
+#: client renders from this rather than inferring, so it can never offer an
+#: action the server would refuse.
+ALLOWED_ACTIONS = {
+    "awaiting_approval": ("approve", "reject", "correct"),
+    "needs_input": ("answer", "correct"),
+    "interpreting": ("correct",),
+    "resolving": ("correct",),
+    "retrieving": ("cancel",),
+}
+
+
+def _projection_envelope(conversation):
+    """State the client needs to trust a snapshot, not just render it."""
+    status = conversation["status"]
+    state_version = int(conversation.get("state_version") or 1)
+    projected = conversation.get("projected_version")
+    return {
+        "stateVersion": state_version,
+        "terminal": status in TERMINAL_STATES,
+        "allowedActions": list(ALLOWED_ACTIONS.get(status, ())),
+        # A read model can lag its source. Saying so lets the client show
+        # "catching up" instead of presenting stale state as settled.
+        "projectionLag": (
+            projected is not None and int(projected) < state_version
+        ),
+    }
+
+
+def _effect_group_projection(conversation):
+    """One row per effect, each answerable on its own.
+
+    A group is not a transaction. Approving one effect must never authorise
+    another, and a mixed outcome must not be flattened into a verdict the
+    group never had.
+    """
+    group = conversation.get("effect_group")
+    if not isinstance(group, dict) or not group.get("effects"):
+        return None
+    effects, completed = [], 0
+    for effect in group["effects"]:
+        status = effect.get("status")
+        if status in ("succeeded", "completed"):
+            completed += 1
+        reinforced = bool(effect.get("reinforced"))
+        row = {
+            "effectId": effect.get("effect_id"),
+            "capabilityId": effect.get("capability_id"),
+            "summary": effect.get("summary"),
+            "status": status,
+            "reinforced": reinforced,
+            "allowedActions": (
+                ["approve", "reject"] if status == "awaiting_approval" else []
+            ),
+            # Risk should not be one click away from invisible: an effect that
+            # needs reinforced approval opens its details by default.
+            "detailsExpanded": reinforced,
+        }
+        if effect.get("recovery"):
+            row["recovery"] = effect["recovery"]
+        effects.append(row)
+    return {
+        "groupId": group.get("group_id"),
+        "effects": effects,
+        "summary": "%d of %d completed" % (completed, len(effects)),
+    }
 
 
 def _classified_recovery(exc, conversation_id=None):

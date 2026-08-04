@@ -124,11 +124,9 @@ Deletion must therefore come from `delete_managed_oauth_credential`, whose only
 callers are four explicit paths in `services/oauth/app.py`: connection
 conflict, disconnect, revoke, and reconnect-retire.
 
-The leading hypothesis is the conflict path at `services/oauth/app.py:268`,
-which deletes the credential it just created and returns 409 when
-`upsert_installation` raises `ConnectionConflict`. That would leave exactly
-the observed state: a connection pointing at an id the vault never kept. It
-has **not** been reproduced, so it stays a hypothesis.
+~~The leading hypothesis is the conflict path.~~ **Disproven on 2026-08-04**:
+instrumentation showed the retirement path firing every time and the conflict
+path never. See "Open defect: credential retirement is not atomic" below.
 
 ### Why this is now cheaper to hit
 
@@ -136,6 +134,60 @@ Before, the symptom was `provider is temporarily unavailable` after five
 retries, which is a lie: nothing was temporary and retrying could never help.
 The step now reports `credential_unavailable` on its first attempt, and the
 broker logs a traceback for anything it still cannot classify.
+
+## Chaining versus composition (2026-08-04)
+
+Phase 1 requires this comparison before U7's compound-DAG slice is funded. Four
+jobs of each shape, same workspace, same channel.
+
+| Shape | Completed | Clarifications/job | Median |
+|---|---|---|---|
+| Chained, three turns | **1 of 4** | 2.75 | 3.34 s |
+| Composed, one turn | **4 of 4** | 0.00 | 1.82 s |
+
+**The gate passes: composition measurably improves completion, clarification
+count, and time-to-outcome.** U7's compound slice is therefore funded.
+
+**But read what it measures.** Three of the four chained jobs died in
+`needs_input` after repeated clarification. The sequence was "quiero mandar un
+mensaje" → "en #tessera-test" → the text, and it did not arrive. That is not
+composition proving itself superior; it is chaining failing to carry slots
+across turns.
+
+The finding matters more than the verdict. Chaining is the path taken by anyone
+who cannot state a complete request in one sentence, and it currently completes
+a quarter of the time. Funding the compound slice does not remove the need to
+fix multi-turn slot carrying.
+
+**Read latency also moved.** The median read went from 3.06 s in the earlier
+baseline to 8.84 s here, most likely because the channel accumulated messages
+during the session. Recorded as a change against the prior figure rather than
+explained away.
+
+## Open defect: credential retirement is not atomic
+
+The vault appeared empty six times during these sessions while the connection
+reported itself connected. Instrumenting the delete paths named the cause on
+the first reconnect after:
+
+```
+deleting managed OAuth credential: slack_previous_retired credential=f0f500e4 replaced_by=8dc27d2c
+deleting managed OAuth credential: slack_previous_retired credential=8dc27d2c replaced_by=8781f82b
+deleting managed OAuth credential: slack_previous_retired credential=8781f82b replaced_by=d1b6e0ff
+```
+
+Successive reconnects each create a credential and retire its predecessor. The
+chain ends consistent. What was being observed was the **window between
+retiring the old credential and the connection pointing at the new one**: in it,
+the connection is `connected` against an id that is gone or not yet written,
+and any dispatch fails.
+
+The `ConnectionConflict` hypothesis recorded above was **wrong** — that path
+never fired. Retirement did, every time.
+
+The defect is that retirement and replacement are not atomic, and the
+connection advertises health throughout. Making the swap a single transaction,
+or marking the connection unhealthy for the duration, would close it.
 
 ## Reproducing
 
@@ -154,5 +206,5 @@ workspace only.
   single run.
 - **Correction and rejection rates** need jobs that deliberately correct a
   slot or reject a preview; the canary currently approves everything.
-- **The chaining-versus-composition comparison** (`--compare`) has not been
-  run, so U7's compound-DAG slice remains unscoped.
+- **Correction and rejection rates** still need jobs that deliberately correct
+  a slot or reject a preview; the canary approves everything.

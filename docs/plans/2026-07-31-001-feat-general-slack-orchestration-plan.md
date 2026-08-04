@@ -55,7 +55,7 @@ code:
 | V1 operation manifest frozen | **Not started** |
 | High-frequency bot message/read canary | **Built and run** — `scripts/slack_phase1_canary.py` |
 | Measured per-method rate tier + explicit strategy decision | **Measured 2026-08-03 — resolved** — evidence in `docs/operations/slack-phase1-rate-tier.md`; see the note below |
-| Sequential-chaining vs. composition comparison | **Not started** — scopes U7's compound-DAG slice |
+| Sequential-chaining vs. composition comparison | **Run 2026-08-04 — gate passes** — composed 4/4 vs chained 1/4; U7's compound slice is funded. Evidence in `docs/operations/slack-phase1-baseline.md` |
 | First 2-3 bot-authorized jobs released behind a tenant flag | **Not started** |
 | R25 go/no-go checkpoint per hypothesis family | **Not started** — gates U9 and U10 |
 

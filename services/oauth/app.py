@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import time
@@ -16,6 +17,11 @@ from libs.config import ConfigurationError, get_slack_oauth_config
 from libs.connectors.base import ProviderError
 from libs.connectors.google import GoogleCredentialConnector
 from libs.connectors.slack import SlackCredentialConnector
+from libs.integrations.catalog import (
+    CapabilityUnavailable,
+    account_state,
+    derive_synthetic_scopes,
+)
 from services.oauth.repository import ConnectionConflict, OAuthRepository
 from services.session.app import session_cookie_value
 from services.session.repository import SessionRepository
@@ -23,6 +29,8 @@ from vault.app import VaultService
 from vault.managed_oauth_crypto import ManagedOAuthCrypto, ManagedOAuthError
 from vault.repository import VaultRepository
 
+
+logger = logging.getLogger(__name__)
 
 PROVIDER = "google"
 DEFAULT_PORT = 8121
@@ -58,6 +66,7 @@ class OAuthService(object):
         slack_connector=None,
         slack_app_id=None,
         tenant_resolver=None,
+        account_connectors=None,
     ):
         self.repository = repository
         self.session_repository = session_repository
@@ -70,6 +79,10 @@ class OAuthService(object):
         self.slack_connector = slack_connector
         self.slack_app_id = slack_app_id
         self.tenant_resolver = tenant_resolver or (lambda _principal_id: None)
+        #: Providers whose credential is an account identifier plus an auth
+        #: token, keyed by provider. Absence is a refusal, not a fallback: a
+        #: provider with no configured connector cannot be account-connected.
+        self.account_connectors = dict(account_connectors or {})
 
     def _tenant_id(self, current):
         return current.get("tenant_id") or self.tenant_resolver(
@@ -102,6 +115,11 @@ class OAuthService(object):
                 # the UI can offer an upgrade without keeping its own copy of
                 # the capability-to-scope map to drift out of date.
                 "missing_families": self._slack_missing_families(item),
+                # Only this person's own grants: another member's personal
+                # consent is not theirs to see.
+                "personal_authority": self._slack_personal_authority(
+                    tenant_id, item, current["principal_id"],
+                ),
             }
             for item in connections
         ]}
@@ -160,6 +178,53 @@ class OAuthService(object):
             # act, as the unit requires.
             enabled=False,
         )
+
+    def _slack_personal_authority(self, tenant_id, installation, principal_id):
+        if not hasattr(self.repository, "list_personal_authority"):
+            return []
+        return [
+            {
+                "profile_kind": profile["profile_kind"],
+                "slack_subject_id": profile["slack_subject_id"],
+                "granted_scopes": profile["granted_scopes"],
+                "enabled": profile["enabled"],
+            }
+            for profile in self.repository.list_personal_authority(
+                tenant_id, installation["connection_id"], principal_id,
+            )
+        ]
+
+    def slack_personal_authority_decision(self, session_id, csrf_token,
+                                          connection_id, profile_kind, body):
+        """Let a person enable, disable, or withdraw their own grant."""
+        current = self.session_repository.resolve(
+            session_id, self.clock(), touch=True
+        )
+        if current is None:
+            return 401, {"error": "authentication required"}
+        if not self.session_repository.csrf_matches(session_id, csrf_token):
+            return 403, {"error": "invalid CSRF token"}
+        tenant_id = self._tenant_id(current)
+        if not tenant_id:
+            return 409, {"error": "tenant membership is required"}
+        action = (body or {}).get("action")
+        if action not in ("enable", "disable", "revoke"):
+            return 422, {"error": "unsupported authority action"}
+        if action == "revoke":
+            changed = self.repository.revoke_authority_profile(
+                tenant_id, connection_id, profile_kind,
+                current["principal_id"], self.clock(),
+            )
+        else:
+            changed = self.repository.set_authority_profile_enabled(
+                tenant_id, connection_id, profile_kind,
+                current["principal_id"], action == "enable", self.clock(),
+            )
+        if not changed:
+            # Either it is not there or it is not theirs; both answer the same
+            # so the endpoint cannot be used to discover other people's grants.
+            return 404, {"error": "personal authority not found"}
+        return 200, {"status": action, "profile_kind": profile_kind}
 
     def _slack_missing_families(self, installation):
         registry = self._slack_registry()
@@ -417,6 +482,12 @@ class OAuthService(object):
                 connection_id=target_id,
             )
         except ConnectionConflict:
+            # Named, because a credential that vanishes should say which path
+            # removed it rather than leaving the connection quietly unusable.
+            logger.warning(
+                "deleting managed OAuth credential: slack_connection_conflict "
+                "credential=%s", credential_id,
+            )
             self.vault_service.delete_managed_oauth_credential(
                 credential_id, current["principal_id"]
             )
@@ -426,6 +497,11 @@ class OAuthService(object):
             and previous_installation.get("credential_id")
             and previous_installation["credential_id"] != credential_id
         ):
+            logger.warning(
+                "deleting managed OAuth credential: slack_previous_retired "
+                "credential=%s replaced_by=%s",
+                previous_installation["credential_id"], credential_id,
+            )
             self.vault_service.delete_managed_oauth_credential(
                 previous_installation["credential_id"],
                 previous_installation["principal_id"],
@@ -483,6 +559,174 @@ class OAuthService(object):
         self.repository.tombstone_installation(connection_id, tenant_id, self.clock())
         return 200, {"status": "disconnected", "provider": "slack",
                      "connection_id": connection_id}
+
+    def _account_capabilities(self, connector, scopes):
+        """Capabilities the derived scopes actually cover, and no others."""
+        catalog = connector.scope_catalog()
+        held = set(scopes)
+        return sorted(
+            capability for capability, required in catalog.items()
+            if required and set(required).issubset(held)
+        )
+
+    def connect_provider_account(self, session_id, csrf_token, body):
+        """Connect a provider whose credential is an account plus a token.
+
+        Nothing about this path is OAuth-shaped: there is no redirect, no code
+        to exchange, and no consent callback to read authority out of. The
+        account is verified instead, and the scopes recorded on the connection
+        are derived from what it verifiably holds. The credential version
+        starts at one and means only that this is the first sealing of this
+        secret.
+        """
+        current = self.session_repository.resolve(
+            session_id, self.clock(), touch=True
+        )
+        if current is None:
+            return 401, {"error": "authentication required"}
+        if not self.session_repository.csrf_matches(session_id, csrf_token):
+            return 403, {"error": "invalid CSRF token"}
+        if not isinstance(body, dict):
+            return 422, {"error": "request body must be an object"}
+        provider = body.get("provider")
+        connector = self.account_connectors.get(provider)
+        if connector is None:
+            return 503, {"error": "provider is not configured"}
+        tenant_id = self._tenant_id(current)
+        if not tenant_id:
+            return 409, {"error": "tenant membership is required"}
+        account_id = body.get("account_id")
+        auth_token = body.get("auth_token")
+        if not isinstance(account_id, str) or not account_id:
+            return 422, {"error": "an account identifier is required"}
+        if not isinstance(auth_token, str) or not auth_token:
+            return 422, {"error": "an account auth token is required"}
+        try:
+            state = account_state(connector.verify_account(account_id, auth_token))
+        except (ProviderError, CapabilityUnavailable):
+            return 502, {"error": "provider account could not be verified"}
+        if state.account_id != account_id or state.provider != provider:
+            return 409, {"error": "provider account identity does not match"}
+        if state.status != "verified":
+            # Unverified is not a lesser connection, it is no connection: an
+            # account that cannot be checked must not hold sealed authority.
+            return 409, {
+                "error": "provider account is not verified",
+                "account_status": state.status,
+            }
+        scopes = sorted(derive_synthetic_scopes(state))
+        if not scopes:
+            return 409, {"error": "provider account carries no authority"}
+        capabilities = self._account_capabilities(connector, scopes)
+        document = {
+            "account_id": account_id,
+            "auth_token": auth_token,
+            "granted_scopes": scopes,
+            "token_type": "account",
+        }
+        context = {
+            "provider": provider,
+            "tenant_id": tenant_id,
+            "user_principal_id": current["principal_id"],
+            "provider_account_id": account_id,
+            "credential_version": "1",
+        }
+        try:
+            envelope = self.managed_oauth_crypto.seal(
+                json.dumps(document, sort_keys=True, separators=(",", ":")),
+                context,
+                caller_identity=self.ingestion_identity,
+            )
+            vault_status, vault_response = self.vault_service.store_managed_oauth({
+                "user_principal_id": current["principal_id"],
+                "provider": provider,
+                "granted_scopes": scopes,
+                "envelope": envelope,
+            }, signer=current["principal_id"])
+        except ManagedOAuthError:
+            return 502, {"error": "credential custody unavailable"}
+        if vault_status != 200:
+            return 502, {"error": "credential custody unavailable"}
+        credential_id = vault_response["credential_id"]
+        try:
+            connection = self.repository.upsert_installation(
+                tenant_id=tenant_id,
+                principal_id=current["principal_id"],
+                provider=provider,
+                app_id=account_id,
+                credential_id=credential_id,
+                credential_version=1,
+                granted_scopes=scopes,
+                enabled_capabilities=capabilities,
+                now_ts=self.clock(),
+            )
+        except ConnectionConflict:
+            self.vault_service.delete_managed_oauth_credential(
+                credential_id, current["principal_id"]
+            )
+            return 409, {"error": "provider account is already connected"}
+        del document, auth_token
+        return 200, {
+            "result": "connected",
+            "provider": provider,
+            "connection_id": connection["connection_id"],
+            "provider_account_id": account_id,
+            "effective_scopes": scopes,
+            "enabled_capabilities": capabilities,
+        }
+
+    def apply_verified_account_state(self, tenant_id, connection_id, state):
+        """Re-derive a connection's authority from fresh account state.
+
+        Re-verification, not a callback: account state moves when a sender is
+        disabled or a family is withdrawn, and nobody visits a browser when it
+        does. Scope removal is the whole mechanism — a sender that is gone
+        stops appearing in the derived set, so every in-flight binding naming
+        it fails the subset check the policy evaluator already runs, while
+        bindings naming a different sender on the same connection are
+        untouched.
+
+        The credential version is passed through unchanged on purpose. It
+        answers whether the sealed secret is still the one the binding was made
+        against, and re-verifying an account does not replace a secret.
+        Bumping it here would fail every queued effect on the connection, in
+        every family, with a reason that reads as tampering.
+        """
+        installation = self.repository.get_installation(connection_id, tenant_id)
+        if installation is None:
+            return 404, {"error": "connection not found"}
+        try:
+            state = account_state(state)
+        except CapabilityUnavailable:
+            return 422, {"error": "verified account state is malformed"}
+        if installation["provider"] != state.provider:
+            return 409, {"error": "provider account identity does not match"}
+        connector = self.account_connectors.get(state.provider)
+        if connector is None:
+            return 503, {"error": "provider is not configured"}
+        scopes = sorted(derive_synthetic_scopes(state))
+        capabilities = self._account_capabilities(connector, scopes)
+        connection = self.repository.upsert_installation(
+            tenant_id=tenant_id,
+            principal_id=installation["principal_id"],
+            provider=state.provider,
+            app_id=installation["app_id"],
+            credential_id=installation["credential_id"],
+            credential_version=installation["credential_version"],
+            granted_scopes=scopes,
+            enabled_capabilities=capabilities,
+            now_ts=self.clock(),
+            connection_id=connection_id,
+        )
+        return 200, {
+            "result": "reverified",
+            "provider": state.provider,
+            "connection_id": connection["connection_id"],
+            "account_status": state.status,
+            "effective_scopes": scopes,
+            "enabled_capabilities": capabilities,
+            "credential_version": connection["credential_version"],
+        }
 
     def google_status(self, session_id):
         current = self.session_repository.resolve(
@@ -753,6 +997,14 @@ class OAuthRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/oauth/slack/connect":
             status, body = self.server.service.initiate_slack(
+                session_cookie_value(self.headers.get("Cookie")),
+                self.headers.get("X-CSRF-Token"),
+                self._json_body(),
+            )
+            self._respond(status, body)
+            return
+        if path == "/oauth/account/connect":
+            status, body = self.server.service.connect_provider_account(
                 session_cookie_value(self.headers.get("Cookie")),
                 self.headers.get("X-CSRF-Token"),
                 self._json_body(),
