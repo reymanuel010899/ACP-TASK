@@ -6,10 +6,15 @@ import pytest
 
 from agents.orchestrator.slack_operations import (
     MANIFEST_VERSION,
+    OperationManifestSpec,
     SlackOperationManifestError,
+    load_operations,
     load_slack_operations,
 )
-from libs.integrations.catalog import slack_definitions
+from libs.integrations.catalog import (
+    TrustedCapabilityDefinition,
+    slack_definitions,
+)
 
 
 MANIFEST = Path(__file__).parents[2] / "config" / "slack_operations_v1.yaml"
@@ -79,7 +84,9 @@ def test_v1_manifest_is_exact_and_separates_conversation_from_authority():
     assert "pins.remove" not in future
     assert "bookmarks.add" not in future
     assert future["bookmarks.edit"] == "planned"
-    assert future["conversations.create"] == "planned"
+    # Promoted by U6 slice B: channel management runs behind reinforced
+    # approval and incremental bot authority.
+    assert "conversations.create" not in future
     # Promoted by U6 slice B: search runs, but only as a user profile.
     assert "search.messages" not in future
     assert future["files.getUploadURLExternal"] == "dormant"
@@ -271,3 +278,192 @@ def test_a_fully_granted_family_asks_for_nothing():
     assert registry.missing_scope_bundles(
         definitions, ["pins:write"], families=["slack_pins"],
     ) == []
+
+
+# A second provider joins the same registry rather than copying the join. The
+# provider below is deliberately synthetic: the point is that nothing in the
+# code path knows which provider it is holding.
+
+
+def _synthetic_definitions():
+    return (
+        TrustedCapabilityDefinition(
+            capability_id="synthetic.note.send",
+            version="1.0.0",
+            provider="synthetic",
+            input_schema={
+                "type": "object",
+                "required": ["destination", "body"],
+                "properties": {
+                    "destination": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object", "additionalProperties": True},
+            required_scopes=frozenset({"notes:write", "notes:address"}),
+            effect="write",
+            risk="medium",
+            retry_policy="reconcile",
+            preview_fields=("destination", "body"),
+            verifier="synthetic.receipt",
+        ),
+    )
+
+
+def _synthetic_operation(**overrides):
+    operation = {
+        "operation_id": "synthetic.note.send",
+        "operation_kind": "capability",
+        "availability": "supported",
+        "aliases": ["send a note", "envía una nota"],
+        "slots": [
+            {
+                "name": "destination",
+                "entity_kind": "synthetic.destination",
+                "required": True,
+            },
+            {"name": "body", "entity_kind": "synthetic.text", "required": True},
+        ],
+        "capability_recipe": [{
+            "step_id": "send",
+            "capability_id": "synthetic.note.send",
+            "capability_version": "1.0.0",
+            "input_bindings": {"destination": "destination", "body": "body"},
+            "depends_on": [],
+        }],
+        "authority_profile": "bot",
+        "family_flag": "synthetic_notes",
+        "prerequisites": ["tenant_context"],
+        "recovery": {"unavailable": "explain_connection_state"},
+        "presentation": {"kind": "note_receipt", "label": "Note"},
+    }
+    operation.update(overrides)
+    return operation
+
+
+def _synthetic_manifest(tmp_path, operations=None, provider="synthetic"):
+    payload = {
+        "manifest_version": "%s.operations.v1" % provider,
+        "provider": provider,
+        "operations": operations or [_synthetic_operation()],
+        "method_coverage": {
+            "supported": [{
+                "method": "notes.send", "family": "synthetic_notes",
+                "state": "runtime", "prerequisites": ["connected_account"],
+            }],
+            "conditional": [{
+                "method": "notes.schedule", "family": "synthetic_notes",
+                "state": "planned", "prerequisites": ["connected_account"],
+            }],
+            "excluded": [{
+                "method": "notes.purge", "family": "synthetic_notes",
+                "state": "dormant", "prerequisites": ["connected_account"],
+                "reason": "irreversible with no provider receipt",
+            }],
+        },
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / ("%s-operations.json" % provider)
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    return OperationManifestSpec(
+        provider=provider,
+        manifest_version="%s.operations.v1" % provider,
+        manifest_path=target,
+    )
+
+
+def test_a_second_providers_manifest_joins_its_catalog_and_projects_no_authority(
+    tmp_path,
+):
+    spec = _synthetic_manifest(tmp_path)
+
+    registry = load_operations(spec, _synthetic_definitions())
+    projection = registry.model_projection(
+        {"synthetic.note.send"}, {"synthetic_notes": True},
+    )
+
+    assert registry.provider == "synthetic"
+    assert registry.manifest_version == "synthetic.operations.v1"
+    assert [item["operation_id"] for item in projection] == ["synthetic.note.send"]
+    serialized = json.dumps(projection)
+    for authority_field in (
+        "capability_recipe", "required_scopes", "input_schema", "output_schema",
+        "effect", "risk", "retry_policy", "verifier", "rollout_version",
+        "authority_profile", "family_flag",
+    ):
+        assert authority_field not in serialized
+    resolved = registry.resolve_visible(
+        {"synthetic.note.send"}, {"synthetic_notes": True},
+    )
+    definition = resolved[0].trusted_capabilities[0]
+    assert definition.required_scopes == frozenset({"notes:write", "notes:address"})
+    assert definition.effect == "write"
+    assert definition.verifier == "synthetic.receipt"
+
+
+def test_a_second_providers_manifest_may_not_declare_trusted_authority(tmp_path):
+    for trusted_only_field, value in (
+        ("required_scopes", ["notes:write"]),
+        ("effect", "write"),
+        ("input_schema", {"type": "object"}),
+        ("verifier", "synthetic.receipt"),
+        ("retry_policy", "reconcile"),
+        ("risk", "low"),
+        ("output_schema", {"type": "object"}),
+        ("rollout_version", "production-v1"),
+    ):
+        spec = _synthetic_manifest(
+            tmp_path / trusted_only_field,
+            operations=[_synthetic_operation(**{trusted_only_field: value})],
+        )
+        with pytest.raises(
+            SlackOperationManifestError,
+            match="may not define trusted capability authority",
+        ):
+            load_operations(spec, _synthetic_definitions())
+
+
+def test_a_second_providers_operation_without_a_definition_fails_closed(tmp_path):
+    spec = _synthetic_manifest(tmp_path)
+
+    with pytest.raises(SlackOperationManifestError, match="not trusted"):
+        load_operations(spec, ())
+
+
+def test_a_second_providers_manifest_cannot_borrow_another_providers_catalog(
+    tmp_path,
+):
+    """Slack's definitions must not satisfy another provider's recipe."""
+    spec = _synthetic_manifest(tmp_path)
+    borrowed = _synthetic_definitions() + tuple(
+        replace(definition, capability_id="synthetic.note.send", provider="slack")
+        for definition in slack_definitions()
+        if definition.capability_id == "slack.message.send"
+    )
+
+    with pytest.raises(SlackOperationManifestError, match="duplicated"):
+        load_operations(spec, borrowed)
+
+    impostor = tuple(
+        replace(definition, provider="slack")
+        for definition in _synthetic_definitions()
+    )
+    with pytest.raises(SlackOperationManifestError, match="provider"):
+        load_operations(spec, impostor)
+
+
+def test_an_operation_id_must_be_namespaced_by_its_own_provider(tmp_path):
+    spec = _synthetic_manifest(
+        tmp_path, operations=[_synthetic_operation(operation_id="slack.note.send")],
+    )
+
+    with pytest.raises(SlackOperationManifestError, match="namespaced by its provider"):
+        load_operations(spec, _synthetic_definitions())
+
+
+def test_a_manifest_version_from_another_provider_is_refused(tmp_path):
+    spec = _synthetic_manifest(tmp_path)
+
+    with pytest.raises(SlackOperationManifestError, match="namespaced by its provider"):
+        replace(spec, manifest_version=MANIFEST_VERSION)

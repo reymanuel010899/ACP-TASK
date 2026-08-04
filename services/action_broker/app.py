@@ -17,6 +17,7 @@ from agents.orchestrator.approval import requires_action_approval
 from libs.connectors.base import ProviderError, ProviderNetworkError
 from libs.connectors.slack import SlackAPIError, SlackRateLimitError
 from libs.integrations.catalog import (
+    REFRESHED_OAUTH_CREDENTIAL,
     CapabilityUnavailable,
     ConnectionCapabilitySnapshot,
 )
@@ -336,6 +337,11 @@ class ActionBroker(object):
                 runtime_binding.definition.provider
                 if runtime_binding is not None else "google"
             )
+            credential_strategy = (
+                runtime_binding.credential_strategy
+                if runtime_binding is not None
+                else REFRESHED_OAUTH_CREDENTIAL
+            )
             rotator = self.credential_rotators.get(provider)
             if rotator is not None:
                 rotator.rotate(
@@ -344,37 +350,30 @@ class ActionBroker(object):
                     self.broker_identity,
                 )
 
-            def provider_operation(refresh_token):
+            def provider_operation(sealed_secret):
                 nonlocal provider_dispatch_started
-                if provider == "slack":
-                    try:
-                        document = json.loads(refresh_token.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError) as exc:
-                        raise PermissionError("Slack credential document is invalid") from exc
-                    access_token = document.get("access_token")
-                    if not isinstance(access_token, str) or not access_token:
-                        raise PermissionError("Slack access authority is unavailable")
-                    authority_scopes = frozenset(document.get("granted_scopes", ()))
-                else:
-                    authority = connector.refresh(refresh_token.decode("utf-8"))
-                    access_token = authority.access_token
-                    authority_scopes = authority.granted_scopes
-                required_scope = (
-                    next(iter(runtime_binding.definition.required_scopes), None)
-                    if runtime_binding is not None
-                    else connector.scope_catalog().get(capability_id)
+                authority = credential_strategy.authority(
+                    sealed_secret, connector
                 )
-                if required_scope is None:
+                required_scopes = (
+                    frozenset(runtime_binding.definition.required_scopes)
+                    if runtime_binding is not None
+                    else _connector_required_scopes(connector, capability_id)
+                )
+                if not required_scopes:
                     raise PermissionError("capability has no provider scope")
-                if (
-                    authority_scopes
-                    and required_scope not in authority_scopes
+                # Every scope the capability declares, not the first one that
+                # happened to come out of a frozenset. A compound capability
+                # that opens a conversation and then posts to it needs both, and
+                # checking one lets a partial grant reach the provider.
+                if authority.granted_scopes and not required_scopes.issubset(
+                    authority.granted_scopes
                 ):
                     raise PermissionError(
                         "provider did not grant the required scope"
                     )
                 context = {
-                    "access_token": access_token,
+                    "access_token": authority.access_token,
                     "connection_id": binding.get("connection_id"),
                     "team_id": binding.get("team_id"),
                     "bot_user_id": binding.get("bot_user_id"),
@@ -501,6 +500,22 @@ class ActionBroker(object):
             # retried independently; never claim it happened.
             response["evidence_status"] = "pending"
         return response
+
+
+def _connector_required_scopes(connector, capability_id):
+    """Scopes for a legacy dispatch that has no trusted runtime binding.
+
+    A connector's catalog entry may be a single scope or a set of them, so
+    normalise both into the same subset check the trusted definition gets.
+    """
+    if connector is None:
+        return frozenset()
+    scope = connector.scope_catalog().get(capability_id)
+    if scope is None:
+        return frozenset()
+    if isinstance(scope, str):
+        return frozenset({scope})
+    return frozenset(scope)
 
 
 def canonical_hash(payload):

@@ -21,7 +21,11 @@ def _hash(value):
 class PolicyEvaluator(object):
     """Evaluate one immutable dynamic binding against live bot authority."""
 
-    VERSION = "policy-v1"
+    #: Dispatch compares a stored decision hash against a freshly computed one,
+    #: so any change to what the evaluator considers must change this. Bumped
+    #: when the evaluator became provider-neutral: it now decides for any
+    #: registered provider's definitions, not Google's and Slack's alone.
+    VERSION = "policy-v2"
 
     def __init__(self, definitions, rollout_version, version=None):
         self.version = version or self.VERSION

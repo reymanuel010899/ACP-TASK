@@ -5,8 +5,9 @@ Connection snapshots are live tenant authority.  External offers are
 discovery input only and intentionally cannot enter the runtime registry.
 """
 
+import json
 from dataclasses import dataclass
-from typing import Any, FrozenSet, Mapping, Optional, Tuple
+from typing import Any, Callable, FrozenSet, Mapping, Optional, Tuple
 
 
 class CapabilityUnavailable(Exception):
@@ -30,6 +31,10 @@ class TrustedCapabilityDefinition:
     #: stays the single source of truth, rather than a second copy that can
     #: drift the way the install scope list already did.
     authority_profile: str = "bot"
+    #: Effects whose approval must come from someone provably present. Channel
+    #: administration reshapes shared space for everyone in it, so a session
+    #: left open all day is not consent.
+    reinforced: bool = False
 
     def __post_init__(self):
         if not self.capability_id or "." not in self.capability_id:
@@ -81,15 +86,92 @@ class ExternalAgentOffer:
 
 
 @dataclass(frozen=True)
+class ProviderAuthority:
+    """Short-lived authority to act at one provider, plus what it may do."""
+
+    access_token: str
+    granted_scopes: FrozenSet[str] = frozenset()
+
+
+class CredentialStrategy(object):
+    """Turn one sealed vault secret into short-lived provider authority.
+
+    Every provider seals something, but not the same thing: an OAuth refresh
+    token must be exchanged, a workspace install token already is the
+    authority, and an account-identifier-plus-token pair is neither. Naming
+    that per runtime is what keeps the dispatch path from growing one branch
+    per provider, which is how it read before.
+    """
+
+    name = "credential"
+
+    def authority(self, secret, connector=None):
+        raise NotImplementedError
+
+
+class RefreshedOAuthCredential(CredentialStrategy):
+    """Exchange a sealed refresh token for a short-lived access token."""
+
+    name = "oauth_refresh"
+
+    def authority(self, secret, connector=None):
+        if connector is None:
+            raise PermissionError("credential refresh is not configured")
+        refreshed = connector.refresh(secret.decode("utf-8"))
+        return ProviderAuthority(
+            access_token=refreshed.access_token,
+            granted_scopes=frozenset(refreshed.granted_scopes or ()),
+        )
+
+
+class SealedTokenDocumentCredential(CredentialStrategy):
+    """Read authority straight out of the sealed document.
+
+    Some providers issue no refresh exchange at all, so the sealed document is
+    the authority rather than a way of obtaining one. Reading it here rather
+    than in the broker means the next such provider adds a registration, not
+    a branch.
+    """
+
+    name = "sealed_document"
+
+    def authority(self, secret, connector=None):
+        try:
+            document = json.loads(secret.decode("utf-8"))
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise PermissionError(
+                "sealed credential document is invalid"
+            ) from exc
+        if not isinstance(document, dict):
+            raise PermissionError("sealed credential document is invalid")
+        access_token = document.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise PermissionError("provider access authority is unavailable")
+        return ProviderAuthority(
+            access_token=access_token,
+            granted_scopes=frozenset(document.get("granted_scopes") or ()),
+        )
+
+
+REFRESHED_OAUTH_CREDENTIAL = RefreshedOAuthCredential()
+SEALED_TOKEN_DOCUMENT_CREDENTIAL = SealedTokenDocumentCredential()
+
+
+@dataclass(frozen=True)
 class ProviderRuntime:
     provider: str
     connector: Any
     executor: Any
     definitions: Tuple[TrustedCapabilityDefinition, ...]
+    #: How this provider's sealed secret becomes provider authority. Declared
+    #: with the runtime so the broker never asks which provider it is holding.
+    credential_strategy: CredentialStrategy = REFRESHED_OAUTH_CREDENTIAL
 
     def __post_init__(self):
         if not self.provider or self.connector is None or self.executor is None:
             raise ValueError("provider, connector and executor are required")
+        if not isinstance(self.credential_strategy, CredentialStrategy):
+            raise TypeError("runtime credential strategy must be trusted")
         for definition in self.definitions:
             if not isinstance(definition, TrustedCapabilityDefinition):
                 raise TypeError("runtime definitions must be trusted")
@@ -103,6 +185,7 @@ class CapabilityBinding:
     connector: Any
     executor: Any
     snapshot: ConnectionCapabilitySnapshot
+    credential_strategy: CredentialStrategy = REFRESHED_OAUTH_CREDENTIAL
 
 
 class ProviderRuntimeRegistry:
@@ -148,6 +231,7 @@ class ProviderRuntimeRegistry:
             connector=runtime.connector,
             executor=runtime.executor,
             snapshot=snapshot,
+            credential_strategy=runtime.credential_strategy,
         )
 
 
@@ -213,6 +297,15 @@ def google_definitions():
 #: converges on the same result, so an ambiguous dispatch can simply retry
 #: instead of demanding reconciliation. Sending a message is not here: a
 #: repeat posts twice.
+#: Channel administration reshapes space shared by everyone in it, so its
+#: approval must come from someone provably present rather than from a session
+#: that happens to still be valid.
+REINFORCED_CAPABILITIES = frozenset({
+    "slack.channel.create", "slack.channel.rename",
+    "slack.channel.set_topic", "slack.channel.archive",
+    "slack.channel.invite",
+})
+
 #: Capabilities that act as a person rather than as the installation. Slack's
 #: message search reads what one user can see, so a bot token cannot stand in
 #: for it without silently widening or narrowing the result.
@@ -222,6 +315,11 @@ IDEMPOTENT_WRITES = frozenset({
     "slack.reaction.add", "slack.reaction.remove",
     "slack.message.pin", "slack.message.unpin",
 })
+
+
+def capability_reinforced(capability_id):
+    """Whether approving this effect requires someone provably present."""
+    return capability_id in REINFORCED_CAPABILITIES
 
 
 def capability_retry_policy(capability_id, effect):
@@ -249,6 +347,11 @@ def slack_definitions():
         "slack.message.unpin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
         "slack.bookmark.add": ("bookmarks:write", "write", ("channel_id", "title", "link"), "slack.bookmark"),
         "slack.search.messages": ("search:read", "read", (), None),
+        "slack.channel.create": ("channels:manage", "write", ("name", "is_private"), "slack.channel"),
+        "slack.channel.rename": ("channels:manage", "write", ("channel_id", "name"), "slack.channel"),
+        "slack.channel.set_topic": ("channels:manage", "write", ("channel_id", "topic"), "slack.channel"),
+        "slack.channel.archive": ("channels:manage", "write", ("channel_id",), "slack.channel"),
+        "slack.channel.invite": ("channels:manage", "write", ("channel_id", "user_ids"), "slack.channel"),
         "slack.file.upload": ("files:write", "write", ("channel_id", "filename", "content_hash"), "slack.file"),
     }
     schemas = {
@@ -268,6 +371,11 @@ def slack_definitions():
         "slack.message.pin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.message.unpin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.bookmark.add": {"type": "object", "required": ["channel_id", "title", "link"], "properties": {"channel_id": {"type": "string"}, "title": {"type": "string", "minLength": 1, "maxLength": 250}, "link": {"type": "string", "pattern": "^https://"}}, "additionalProperties": False},
+        "slack.channel.create": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-z0-9_-]+$"}, "is_private": {"type": "boolean"}}, "additionalProperties": False},
+        "slack.channel.rename": {"type": "object", "required": ["channel_id", "name"], "properties": {"channel_id": {"type": "string"}, "name": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-z0-9_-]+$"}}, "additionalProperties": False},
+        "slack.channel.set_topic": {"type": "object", "required": ["channel_id", "topic"], "properties": {"channel_id": {"type": "string"}, "topic": {"type": "string", "maxLength": 250}}, "additionalProperties": False},
+        "slack.channel.archive": {"type": "object", "required": ["channel_id"], "properties": {"channel_id": {"type": "string"}}, "additionalProperties": False},
+        "slack.channel.invite": {"type": "object", "required": ["channel_id", "user_ids"], "properties": {"channel_id": {"type": "string"}, "user_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}}, "additionalProperties": False},
         "slack.search.messages": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 500}, "cursor": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
@@ -343,6 +451,11 @@ def slack_definitions():
         "slack.private_thread.read": page_output("messages", message),
         "slack.users.list": page_output("users", user),
         "slack.search.messages": page_output("messages", message),
+        "slack.channel.create": receipt_output("slack.channel.create", {"name": {"type": "string"}}),
+        "slack.channel.rename": receipt_output("slack.channel.rename", {"name": {"type": "string"}}),
+        "slack.channel.set_topic": receipt_output("slack.channel.set_topic", {"topic": {"type": "string"}}),
+        "slack.channel.archive": receipt_output("slack.channel.archive", {}),
+        "slack.channel.invite": receipt_output("slack.channel.invite", {"invited": {"type": "integer"}}),
         "slack.message.permalink": {
             "type": "object",
             "required": ["channel_id", "message_ts", "permalink"],
@@ -417,4 +530,73 @@ def slack_definitions():
         authority_profile=(
             "user" if capability_id in USER_AUTHORITY_CAPABILITIES else "bot"
         ),
+        reinforced=capability_id in REINFORCED_CAPABILITIES,
     ) for capability_id, (scope, effect, preview, verifier) in matrix.items())
+
+
+@dataclass(frozen=True)
+class ProviderRegistration:
+    """Everything provider-specific that is not a secret, in one place.
+
+    Composition sites used to name each provider's definitions individually,
+    so adding one meant editing every site and forgetting one meant a
+    capability the planner could see and the broker could not execute.
+    """
+
+    provider: str
+    definitions: Callable[[], Tuple[TrustedCapabilityDefinition, ...]]
+    credential_strategy: CredentialStrategy = REFRESHED_OAUTH_CREDENTIAL
+    #: The manifest version this provider's conversational operations speak,
+    #: or ``None`` while the provider has no operation manifest yet.
+    manifest_version: Optional[str] = None
+
+
+PROVIDER_REGISTRATIONS = (
+    ProviderRegistration(
+        provider="google",
+        definitions=google_definitions,
+        credential_strategy=REFRESHED_OAUTH_CREDENTIAL,
+    ),
+    ProviderRegistration(
+        provider="slack",
+        definitions=slack_definitions,
+        # A workspace install token has no refresh exchange, so the sealed
+        # document is the authority rather than a way of getting one.
+        credential_strategy=SEALED_TOKEN_DOCUMENT_CREDENTIAL,
+        manifest_version="slack.operations.v1",
+    ),
+)
+
+_REGISTRATIONS_BY_PROVIDER = {
+    registration.provider: registration
+    for registration in PROVIDER_REGISTRATIONS
+}
+
+
+def registered_providers():
+    return tuple(registration.provider for registration in PROVIDER_REGISTRATIONS)
+
+
+def provider_registration(provider):
+    """Fail closed on an unregistered provider rather than degrade quietly."""
+    registration = _REGISTRATIONS_BY_PROVIDER.get(provider)
+    if registration is None:
+        raise CapabilityUnavailable("provider is not registered")
+    return registration
+
+
+def provider_definitions(*providers):
+    """Trusted definitions for the named providers, or for all of them.
+
+    One registration point, so a new provider is added once instead of at
+    every composition site that happened to list the existing two.
+    """
+    names = providers or registered_providers()
+    definitions = []
+    for provider in names:
+        definitions.extend(provider_registration(provider).definitions())
+    return tuple(definitions)
+
+
+def credential_strategy_for(provider):
+    return provider_registration(provider).credential_strategy

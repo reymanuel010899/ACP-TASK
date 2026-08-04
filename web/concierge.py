@@ -39,7 +39,7 @@ from agents.orchestrator.workflow_repository import WorkflowRepository
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.slack_conversation import normalize_name
-from libs.integrations.catalog import google_definitions, slack_definitions
+from libs.integrations.catalog import provider_definitions
 from services.oauth.repository import OAuthRepository
 from services.session.app import session_cookie_value
 from services.session.repository import SessionRepository
@@ -627,7 +627,7 @@ def main(argv=None):
     tenant_resolver = _tenant_resolver()
     dynamic_service = DynamicWorkflowService(
         agent.brain,
-        google_definitions() + slack_definitions(),
+        provider_definitions(),
         connection_repository,
         workflow_repository,
         rollout_version=os.environ.get("TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"),

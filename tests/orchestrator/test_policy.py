@@ -102,7 +102,7 @@ def test_bot_policy_decision_is_versioned_deterministic_and_allows_read_write(
     assert first == second
     assert first["allowed"] is True
     assert first["reason"] == "allowed"
-    assert first["version"] == "policy-v1"
+    assert first["version"] == "policy-v2"
     assert len(first["input_hash"]) == 64
     assert len(first["decision_hash"]) == 64
 

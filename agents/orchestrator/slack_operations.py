@@ -1,20 +1,29 @@
-"""Versioned conversational Slack operations joined to trusted capabilities.
+"""Versioned conversational operations joined to trusted capabilities.
 
 The JSON-compatible YAML manifest describes language and product behavior. It
 never defines executable authority: schemas, scopes, effects, risk, retry,
 verification, and rollout remain properties of ``TrustedCapabilityDefinition``.
+
+The registry is provider-parameterised. Slack was the first provider through
+it, so the names read Slack-first; a second provider registers a manifest spec
+and joins the same catalog rather than copying this join.
 """
 
 import json
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Tuple
 
-from libs.integrations.catalog import TrustedCapabilityDefinition
+from libs.integrations.catalog import (
+    TrustedCapabilityDefinition,
+    provider_registration,
+)
 
 
-MANIFEST_VERSION = "slack.operations.v1"
+#: Read from the provider registration rather than restated here: a second copy
+#: of a version string is a second thing to forget to bump.
+MANIFEST_VERSION = provider_registration("slack").manifest_version
 DEFAULT_MANIFEST_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "slack_operations_v1.yaml"
 )
@@ -34,19 +43,48 @@ _RECIPE_FIELDS = frozenset({
 })
 
 
-class SlackOperationManifestError(ValueError):
+class OperationManifestError(ValueError):
     """The operation manifest cannot safely join the trusted catalog."""
 
 
+#: Retained name: Slack was the first provider through this registry, and
+#: existing importers raise and catch it by that name.
+SlackOperationManifestError = OperationManifestError
+
+
 @dataclass(frozen=True)
-class SlackSlotDescriptor:
+class OperationManifestSpec:
+    """Which manifest belongs to which provider, at which version.
+
+    A provider is added by declaring one of these, not by editing the join.
+    """
+
+    provider: str
+    manifest_version: str
+    manifest_path: Path
+
+    def __post_init__(self):
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise OperationManifestError("manifest provider is required")
+        if not isinstance(self.manifest_version, str) or not self.manifest_version:
+            raise OperationManifestError("manifest version is required")
+        # A manifest version names its provider, so one provider's manifest can
+        # never be loaded as another's by version alone.
+        if not self.manifest_version.startswith("%s." % self.provider):
+            raise OperationManifestError(
+                "manifest version must be namespaced by its provider"
+            )
+
+
+@dataclass(frozen=True)
+class SlotDescriptor:
     name: str
     entity_kind: str
     required: bool
 
 
 @dataclass(frozen=True)
-class SlackCapabilityRecipeStep:
+class CapabilityRecipeStep:
     step_id: str
     capability_id: str
     capability_version: str
@@ -55,13 +93,13 @@ class SlackCapabilityRecipeStep:
 
 
 @dataclass(frozen=True)
-class SlackOperationDescriptor:
+class OperationDescriptor:
     operation_id: str
     operation_kind: str
     availability: str
     aliases: Tuple[str, ...]
-    slots: Tuple[SlackSlotDescriptor, ...]
-    capability_recipe: Tuple[SlackCapabilityRecipeStep, ...]
+    slots: Tuple[SlotDescriptor, ...]
+    capability_recipe: Tuple[CapabilityRecipeStep, ...]
     authority_profile: str
     family_flag: str
     prerequisites: Tuple[str, ...]
@@ -70,19 +108,33 @@ class SlackOperationDescriptor:
 
 
 @dataclass(frozen=True)
-class ResolvedSlackOperation:
+class ResolvedOperation:
     """Internal operation binding; never accept one from a model or client."""
 
-    descriptor: SlackOperationDescriptor
+    descriptor: OperationDescriptor
     trusted_capabilities: Tuple[TrustedCapabilityDefinition, ...]
 
 
-class SlackOperationRegistry:
-    def __init__(self, manifest_version, operations, method_coverage, definitions):
-        if manifest_version != MANIFEST_VERSION:
-            raise SlackOperationManifestError(
-                "unsupported Slack operation manifest version"
+#: Retained names for existing Slack importers.
+SlackSlotDescriptor = SlotDescriptor
+SlackCapabilityRecipeStep = CapabilityRecipeStep
+SlackOperationDescriptor = OperationDescriptor
+ResolvedSlackOperation = ResolvedOperation
+
+
+class OperationRegistry:
+    def __init__(
+        self, provider, manifest_version, operations, method_coverage, definitions,
+    ):
+        if not isinstance(provider, str) or not provider.strip():
+            raise OperationManifestError("manifest provider is required")
+        if not isinstance(manifest_version, str) or not manifest_version.startswith(
+            "%s." % provider
+        ):
+            raise OperationManifestError(
+                "unsupported operation manifest version"
             )
+        self.provider = provider
         self.manifest_version = manifest_version
         self.operations = tuple(operations)
         self.method_coverage = method_coverage
@@ -210,7 +262,7 @@ class SlackOperationRegistry:
                 self._definitions[(step.capability_id, step.capability_version)]
                 for step in operation.capability_recipe
             )
-            visible.append(ResolvedSlackOperation(operation, definitions))
+            visible.append(ResolvedOperation(operation, definitions))
         return tuple(visible)
 
     def model_projection(
@@ -264,7 +316,7 @@ class SlackOperationRegistry:
                 raise SlackOperationManifestError(
                     "operation capability version is not trusted"
                 )
-            if definition.provider != "slack":
+            if definition.provider != self.provider:
                 raise SlackOperationManifestError(
                     "operation capability provider is incompatible"
                 )
@@ -301,46 +353,74 @@ class SlackOperationRegistry:
                 )
 
 
-def load_slack_operations(definitions, manifest_path=DEFAULT_MANIFEST_PATH):
+#: Retained name for existing Slack importers.
+SlackOperationRegistry = OperationRegistry
+
+
+SLACK_MANIFEST = OperationManifestSpec(
+    provider="slack",
+    manifest_version=MANIFEST_VERSION,
+    manifest_path=DEFAULT_MANIFEST_PATH,
+)
+
+
+def load_operations(spec, definitions):
+    """Join one provider's manifest to the trusted catalog, fail-closed.
+
+    The manifest supplies language and presentation. Every executable
+    property — schema, scope, effect, risk, retry, verifier — comes from the
+    definitions, and a manifest that tries to declare one is refused.
+    """
+    if not isinstance(spec, OperationManifestSpec):
+        raise SlackOperationManifestError("an operation manifest spec is required")
     try:
-        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(spec.manifest_path).read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError) as exc:
         raise SlackOperationManifestError(
-            "Slack operation manifest is unreadable"
+            "operation manifest is unreadable"
         ) from exc
     if not isinstance(payload, Mapping):
-        raise SlackOperationManifestError("Slack operation manifest must be an object")
+        raise SlackOperationManifestError("operation manifest must be an object")
     if set(payload) != {"manifest_version", "provider", "operations", "method_coverage"}:
-        raise SlackOperationManifestError("Slack operation manifest fields are invalid")
-    if payload.get("manifest_version") != MANIFEST_VERSION:
+        raise SlackOperationManifestError("operation manifest fields are invalid")
+    if payload.get("manifest_version") != spec.manifest_version:
         raise SlackOperationManifestError(
-            "unsupported Slack operation manifest version"
+            "unsupported operation manifest version"
         )
-    if payload.get("provider") != "slack":
-        raise SlackOperationManifestError("Slack operation provider is invalid")
+    if payload.get("provider") != spec.provider:
+        raise SlackOperationManifestError("operation manifest provider is invalid")
     operations = payload.get("operations")
     if not isinstance(operations, list) or not operations:
-        raise SlackOperationManifestError("Slack operations must be a non-empty list")
-    parsed = tuple(_parse_operation(item) for item in operations)
+        raise SlackOperationManifestError("manifest operations must be a non-empty list")
+    parsed = tuple(_parse_operation(item, spec.provider) for item in operations)
     coverage = _parse_method_coverage(payload.get("method_coverage"))
-    return SlackOperationRegistry(
-        payload["manifest_version"], parsed, coverage, definitions,
+    return OperationRegistry(
+        spec.provider, payload["manifest_version"], parsed, coverage, definitions,
     )
 
 
-def _parse_operation(value):
+def load_slack_operations(definitions, manifest_path=DEFAULT_MANIFEST_PATH):
+    """Slack's manifest, loaded through the provider-neutral path."""
+    return load_operations(
+        replace(SLACK_MANIFEST, manifest_path=Path(manifest_path)), definitions,
+    )
+
+
+def _parse_operation(value, provider):
     if not isinstance(value, Mapping):
-        raise SlackOperationManifestError("Slack operation fields are invalid")
+        raise SlackOperationManifestError("manifest operation fields are invalid")
     forbidden = set(value) & _TRUSTED_ONLY_FIELDS
     if forbidden:
         raise SlackOperationManifestError(
             "manifest may not define trusted capability authority"
         )
     if set(value) != _OPERATION_FIELDS:
-        raise SlackOperationManifestError("Slack operation fields are invalid")
+        raise SlackOperationManifestError("manifest operation fields are invalid")
     operation_id = _required_string(value.get("operation_id"), "operation_id")
-    if not operation_id.startswith("slack."):
-        raise SlackOperationManifestError("operation_id must be Slack-namespaced")
+    if not operation_id.startswith("%s." % provider):
+        raise SlackOperationManifestError(
+            "operation_id must be namespaced by its provider"
+        )
     availability = value.get("availability")
     if availability not in {"supported", "conditional"}:
         raise SlackOperationManifestError("operation availability is invalid")
@@ -367,7 +447,7 @@ def _parse_operation(value):
     prerequisites = _string_tuple(value.get("prerequisites"), "prerequisites")
     recovery = _string_mapping(value.get("recovery"), "recovery")
     presentation = _string_mapping(value.get("presentation"), "presentation")
-    return SlackOperationDescriptor(
+    return OperationDescriptor(
         operation_id=operation_id,
         operation_kind=operation_kind,
         availability=availability,
@@ -393,7 +473,7 @@ def _parse_slot(value):
         raise SlackOperationManifestError("entity kind must be namespaced")
     if not isinstance(value.get("required"), bool):
         raise SlackOperationManifestError("slot required must be boolean")
-    return SlackSlotDescriptor(name, entity_kind, value["required"])
+    return SlotDescriptor(name, entity_kind, value["required"])
 
 
 def _parse_recipe_step(value):
@@ -405,7 +485,7 @@ def _parse_recipe_step(value):
         for key, source in bindings.items()
     ):
         raise SlackOperationManifestError("recipe input bindings are invalid")
-    return SlackCapabilityRecipeStep(
+    return CapabilityRecipeStep(
         step_id=_required_string(value.get("step_id"), "recipe step id"),
         capability_id=_required_string(
             value.get("capability_id"), "recipe capability id"
@@ -436,9 +516,11 @@ def _parse_method_coverage(value):
                 expected.add("reason")
             if not isinstance(entry, Mapping) or set(entry) != expected:
                 raise SlackOperationManifestError("method coverage entry is invalid")
-            method = _required_string(entry.get("method"), "Slack method")
+            method = _required_string(entry.get("method"), "provider method")
             if method in methods:
-                raise SlackOperationManifestError("Slack method coverage is duplicated")
+                raise SlackOperationManifestError(
+                    "provider method coverage is duplicated"
+                )
             methods.add(method)
             state = entry.get("state")
             valid_states = {

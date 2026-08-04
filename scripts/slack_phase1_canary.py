@@ -37,7 +37,7 @@ from agents.orchestrator.brain import make_brain
 from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.workflow_repository import WorkflowRepository
-from libs.integrations.catalog import google_definitions, slack_definitions
+from libs.integrations.catalog import provider_definitions
 from services.oauth.repository import OAuthRepository
 
 TERMINAL_STATES = {"succeeded", "ready", "failed", "retryable_failure",
@@ -51,7 +51,7 @@ def _flag(name, default="false"):
 def build_service(workflows):
     return DynamicWorkflowService(
         make_brain(),
-        google_definitions() + slack_definitions(),
+        provider_definitions(),
         OAuthRepository(os.environ.get("OAUTH_DATABASE", "tessera-oauth.db")),
         workflows,
         rollout_version=os.environ.get(

@@ -18,8 +18,8 @@ from libs.connectors.slack import SlackActionExecutor, SlackCredentialConnector
 from libs.integrations.catalog import (
     ProviderRuntime,
     ProviderRuntimeRegistry,
-    google_definitions,
-    slack_definitions,
+    credential_strategy_for,
+    provider_definitions,
 )
 from libs.db import Database
 from libs.signing import load_signing_key
@@ -117,7 +117,8 @@ def build_broker():
         provider="google",
         connector=connector,
         executor=executor,
-        definitions=google_definitions(),
+        definitions=provider_definitions("google"),
+        credential_strategy=credential_strategy_for("google"),
     )]
     credential_rotators = {}
     vault_service = VaultService(
@@ -133,7 +134,8 @@ def build_broker():
             provider="slack",
             connector=slack_connector,
             executor=slack_executor,
-            definitions=slack_definitions(),
+            definitions=provider_definitions("slack"),
+            credential_strategy=credential_strategy_for("slack"),
         ))
         credential_rotators["slack"] = ManagedOAuthRotator(
             vault_service, slack_connector

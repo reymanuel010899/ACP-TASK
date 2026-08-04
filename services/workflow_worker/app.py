@@ -16,7 +16,7 @@ from agents.orchestrator.workflow_broker_dispatcher import WorkflowBrokerDispatc
 from agents.orchestrator.workflow_executor import WorkflowExecutor
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from services.oauth.repository import OAuthRepository
-from libs.integrations.catalog import google_definitions, slack_definitions
+from libs.integrations.catalog import provider_definitions
 
 
 def _enabled():
@@ -252,7 +252,7 @@ def build_worker():
         actions, broker, connections, workflows,
         rollout_version=rollout_version,
         policy_evaluator=PolicyEvaluator(
-            google_definitions() + slack_definitions(), rollout_version
+            provider_definitions(), rollout_version
         ),
     )
     executor = WorkflowExecutor(workflows, dispatcher, policy=lambda _step: _enabled())
@@ -282,7 +282,7 @@ def _build_conversation_resolver(workflows, connections, rollout_version):
     """Own resolver continuation here so HTTP polling stays read-only."""
     return DynamicWorkflowService(
         make_brain(),
-        google_definitions() + slack_definitions(),
+        provider_definitions(),
         connections,
         workflows,
         rollout_version=rollout_version,
