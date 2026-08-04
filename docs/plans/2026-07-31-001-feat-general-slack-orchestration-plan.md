@@ -608,6 +608,26 @@ flowchart TB
 
 ### U4. Complete grounded reads, search, and evidence presentation
 
+**Progress (2026-08-03).** Four slices are built, tested, and — except the
+last — verified against the live Airobotix workspace. Reads went from 0% to
+100% completion at a ~3.1 s median.
+
+| Slice | State |
+|---|---|
+| Deterministic read compilation, no planner brain | **Done, verified live** (`daf8515`, `89f3e59`) |
+| Cited evidence: attribution, period, partiality | **Done, verified live** (`8a2088e`) |
+| Author names from the member directory | **Done, verified live** (`1311e2f`) |
+| Requester visibility for private reads | **Done, tests only** (`3fd829b`) |
+| Multi-page pagination, author filter, thread expansion | Not started |
+| Permalink fan-out | Not started — `citation_complete` is false meanwhile |
+| Distribution-aware rate policy | Not started — deprioritised by the rate-tier measurement |
+| Search abstraction | **Blocked on U6**: `search.messages` needs a user token |
+
+Requester visibility ships fail-closed: with no `private_read_authorizer`
+configured, every private read is denied with a named limitation. Wiring an
+audited tenant-grant source is what turns it from a block into a policy.
+
+
 **Goal:** Support broad Slack questions and searches with bounded retrieval, typed evidence, citations, and transparent partial results.
 
 **Requirements:** R3-R10, R15, R17-R21.
