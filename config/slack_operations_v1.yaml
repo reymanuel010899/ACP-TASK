@@ -318,6 +318,30 @@
       "prerequisites": ["connected_installation", "message_visible_to_requester"],
       "recovery": {"missing_slot": "clarify_message_or_reaction", "unavailable": "explain_message_access"},
       "presentation": {"kind": "exact_effect_preview", "label": "Add reaction"}
+    },
+    {
+      "operation_id": "slack.reaction.remove",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["remove reaction", "unreact", "quitar reacci\u00f3n", "quitar reaccion", "quita la reacci\u00f3n", "quita la reaccion", "elimina la reacci\u00f3n", "elimina la reaccion"],
+      "slots": [
+        {"name": "message", "entity_kind": "slack.message", "required": true},
+        {"name": "reaction", "entity_kind": "slack.reaction", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "remove_reaction",
+          "capability_id": "slack.reaction.remove",
+          "capability_version": "1.0.0",
+          "input_bindings": {"channel_id": "message.channel_id", "message_ts": "message.message_ts", "reaction": "reaction"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "bot",
+      "family_flag": "slack_reactions",
+      "prerequisites": ["connected_installation", "message_visible_to_requester"],
+      "recovery": {"missing_slot": "clarify_message_or_reaction", "unavailable": "explain_message_access"},
+      "presentation": {"kind": "exact_effect_preview", "label": "Remove reaction"}
     }
   ],
   "method_coverage": {
@@ -332,7 +356,7 @@
     "conditional": [
       {"method": "conversations.open", "family": "direct_messages", "state": "runtime", "prerequisites": ["direct_messaging_enabled"]},
       {"method": "reactions.add", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
-      {"method": "reactions.remove", "family": "reactions", "state": "planned", "prerequisites": ["message_visible_to_requester", "exact_effect_descriptor"]},
+      {"method": "reactions.remove", "family": "reactions", "state": "runtime", "prerequisites": ["message_visible_to_requester"]},
       {"method": "pins.add", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "pins.remove", "family": "pins", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},
       {"method": "bookmarks.add", "family": "bookmarks", "state": "planned", "prerequisites": ["channel_membership", "exact_effect_descriptor"]},

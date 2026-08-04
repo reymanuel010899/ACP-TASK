@@ -128,7 +128,11 @@ def test_slack_conversation_primitives_have_narrow_scopes_and_inputs():
     }
     assert definitions["slack.users.list"].required_scopes == frozenset({"users:read"})
     assert definitions["slack.message.permalink"].required_scopes == frozenset({"channels:history"})
-    assert definitions["slack.direct_message.send"].required_scopes == frozenset({"im:write"})
+    # conversations.open then chat.postMessage: both scopes, or the check
+    # passes and Slack refuses.
+    assert definitions["slack.direct_message.send"].required_scopes == frozenset(
+        {"im:write", "chat:write"}
+    )
     assert definitions["slack.direct_message.send"].effect == "write"
     assert definitions["slack.direct_message.send"].preview_fields == ("user_id", "text")
     history = definitions["slack.conversation.read"].input_schema["properties"]
@@ -161,6 +165,10 @@ def test_slack_capabilities_declare_allowlisted_output_fields():
             "channel_id", "message_ts", "user_id",
         },
         "slack.reaction.add": {
+            "provider", "capability_id", "provider_id", "team_id",
+            "channel_id", "message_ts", "reaction",
+        },
+        "slack.reaction.remove": {
             "provider", "capability_id", "provider_id", "team_id",
             "channel_id", "message_ts", "reaction",
         },

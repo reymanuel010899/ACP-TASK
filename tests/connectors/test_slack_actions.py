@@ -269,3 +269,58 @@ def test_rate_limit_is_scoped_to_connection_and_method():
         policy.check("conn:a", "conversations.history")
     policy.check("conn:b", "conversations.history")
     policy.check("conn:a", "chat.postMessage")
+
+
+def test_removing_a_reaction_calls_slack_once_with_the_exact_target():
+    http = FakeHTTP([Response(payload={"ok": True})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.reaction.remove", {
+        "channel_id": "C1", "message_ts": "10.1", "reaction": "thumbsup",
+    }, context())
+
+    method, url, kwargs = http.calls[0]
+    assert url.endswith("/reactions.remove")
+    assert kwargs["json"] == {
+        "channel": "C1", "timestamp": "10.1", "name": "thumbsup",
+    }
+    assert receipt["capability_id"] == "slack.reaction.remove"
+    assert receipt["provider_id"] == "C1:10.1:thumbsup"
+    assert receipt["team_id"] == "T1"
+
+
+@pytest.mark.parametrize("code", ["no_reaction", "message_not_found"])
+def test_removing_an_absent_reaction_is_the_state_the_caller_asked_for(code):
+    http = FakeHTTP([Response(payload={"ok": False, "error": code})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.reaction.remove", {
+        "channel_id": "C1", "message_ts": "10.1", "reaction": "thumbsup",
+    }, context())
+
+    assert receipt["reaction"] == "thumbsup"
+    assert receipt["message_ts"] == "10.1"
+
+
+def test_a_denied_reaction_removal_still_fails():
+    http = FakeHTTP([Response(payload={"ok": False, "error": "missing_scope"})])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.execute("slack.reaction.remove", {
+            "channel_id": "C1", "message_ts": "10.1", "reaction": "thumbsup",
+        }, context())
+
+    assert failure.value.code == "missing_scope"
+    assert failure.value.category == "scope"
+
+
+def test_a_direct_message_declares_both_scopes_its_executor_uses():
+    from libs.integrations.catalog import slack_definitions
+
+    definition = next(item for item in slack_definitions()
+                      if item.capability_id == "slack.direct_message.send")
+
+    # conversations.open needs im:write and chat.postMessage needs chat:write;
+    # declaring one would let a workspace pass the check and fail at Slack.
+    assert definition.required_scopes == frozenset({"im:write", "chat:write"})

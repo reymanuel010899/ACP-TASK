@@ -215,8 +215,9 @@ def slack_definitions():
         "slack.private_thread.read": ("groups:history", "read", (), None),
         "slack.message.send": ("chat:write", "write", ("channel_id", "text"), "slack.message"),
         "slack.thread.reply": ("chat:write", "write", ("channel_id", "thread_ts", "text"), "slack.message"),
-        "slack.direct_message.send": ("im:write", "write", ("user_id", "text"), "slack.message"),
+        "slack.direct_message.send": (("im:write", "chat:write"), "write", ("user_id", "text"), "slack.message"),
         "slack.reaction.add": ("reactions:write", "write", ("channel_id", "message_ts", "reaction"), "slack.reaction"),
+        "slack.reaction.remove": ("reactions:write", "write", ("channel_id", "message_ts", "reaction"), "slack.reaction"),
         "slack.file.upload": ("files:write", "write", ("channel_id", "filename", "content_hash"), "slack.file"),
     }
     schemas = {
@@ -232,6 +233,7 @@ def slack_definitions():
         "slack.thread.reply": {"type": "object", "required": ["channel_id", "thread_ts", "text"], "properties": {"channel_id": {"type": "string"}, "thread_ts": {"type": "string"}, "text": {"type": "string", "maxLength": 40000}}, "additionalProperties": False},
         "slack.direct_message.send": {"type": "object", "required": ["user_id", "text"], "properties": {"user_id": {"type": "string"}, "text": {"type": "string", "maxLength": 40000}}, "additionalProperties": False},
         "slack.reaction.add": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
+        "slack.reaction.remove": {"type": "object", "required": ["channel_id", "message_ts", "reaction"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}, "reaction": {"type": "string"}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
     nullable_string = {"type": ["string", "null"]}
@@ -333,6 +335,12 @@ def slack_definitions():
                 "reaction": {"type": "string"},
             },
         ),
+        "slack.reaction.remove": receipt_output(
+            "slack.reaction.remove", {
+                "message_ts": {"type": "string"},
+                "reaction": {"type": "string"},
+            },
+        ),
         "slack.file.upload": receipt_output(
             "slack.file.upload", {
                 "provider_id": nullable_string,
@@ -346,7 +354,13 @@ def slack_definitions():
         provider="slack",
         input_schema=schemas[capability_id],
         output_schema=output_schemas[capability_id],
-        required_scopes=frozenset({scope}),
+        # A capability declares every scope its executor needs, not just the
+        # headline one. Slack's DM send opens a conversation and then posts to
+        # it; modelling that as one scope lets a workspace pass the check and
+        # fail at the provider.
+        required_scopes=frozenset(
+            (scope,) if isinstance(scope, str) else scope
+        ),
         effect=effect,
         risk="medium" if effect == "write" else "low",
         retry_policy="reconcile" if effect == "write" else "safe",

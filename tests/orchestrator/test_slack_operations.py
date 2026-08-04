@@ -68,7 +68,13 @@ def test_v1_manifest_is_exact_and_separates_conversation_from_authority():
         for item in payload["method_coverage"]["conditional"]
         if item["state"] != "runtime"
     }
-    assert future["reactions.remove"] == "planned"
+    # Promoted by U5: reactions.remove is a runtime descriptor now, so it
+    # must have left the future set entirely.
+    assert "reactions.remove" not in future
+    assert {
+        item["method"] for item in payload["method_coverage"]["conditional"]
+        if item["state"] == "runtime"
+    } >= {"reactions.remove"}
     assert future["pins.add"] == "planned"
     assert future["bookmarks.add"] == "planned"
     assert future["conversations.create"] == "planned"

@@ -27,6 +27,7 @@ SLACK_SCOPE_CATALOG = {
     "slack.thread.read": "channels:history",
     "slack.users.list": "users:read",
     "slack.message.permalink": "channels:history",
+    "slack.reaction.remove": "reactions:write",
     "slack.private_channels.list": "groups:read",
     "slack.private_conversation.read": "groups:history",
     "slack.private_thread.read": "groups:history",
@@ -198,6 +199,7 @@ class SlackActionExecutor:
             "slack.thread.reply": self._reply_thread,
             "slack.direct_message.send": self._send_direct_message,
             "slack.reaction.add": self._add_reaction,
+            "slack.reaction.remove": self._remove_reaction,
             "slack.file.upload": self._upload_file,
         }
         handler = routes.get(capability_id)
@@ -368,6 +370,33 @@ class SlackActionExecutor:
         return {
             "provider": "slack",
             "capability_id": "slack.reaction.add",
+            "provider_id": "%s:%s:%s" % (
+                channel_id, payload["message_ts"], name
+            ),
+            "team_id": context.get("team_id"),
+            "channel_id": channel_id,
+            "message_ts": payload["message_ts"],
+            "reaction": name,
+        }
+
+    def _remove_reaction(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        name = _required_str(payload, "reaction")
+        try:
+            self._api("reactions.remove", context, json={
+                "channel": channel_id,
+                "timestamp": _required_str(payload, "message_ts"),
+                "name": name,
+            })
+        except SlackAPIError as exc:
+            # The reaction is already gone, which is the state the caller
+            # asked for. Treating that as a failure would make a correct
+            # retry look broken.
+            if exc.code not in ("no_reaction", "message_not_found"):
+                raise
+        return {
+            "provider": "slack",
+            "capability_id": "slack.reaction.remove",
             "provider_id": "%s:%s:%s" % (
                 channel_id, payload["message_ts"], name
             ),
