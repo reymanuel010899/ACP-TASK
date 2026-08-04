@@ -67,16 +67,63 @@ class SlackCredentialConnector(CredentialConnector):
         self.http = http or requests
         self.timeout = timeout
 
-    def authorization_url(self, state, code_challenge, scopes):
+    def authorization_url(self, state, code_challenge, scopes,
+                          user_scopes=None):
         del code_challenge  # Slack confidential-server V1 intentionally has no PKCE.
-        if not state or not scopes:
-            raise ValueError("state and bot scopes are required")
-        return "%s?%s" % (AUTHORIZATION_URL, urlencode({
+        if not state or not (scopes or user_scopes):
+            raise ValueError("state and at least one scope set are required")
+        query = {
             "client_id": self.client_id,
             "redirect_uri": self.redirect_uri,
-            "scope": ",".join(sorted(set(scopes))),
+            "scope": ",".join(sorted(set(scopes or ()))),
             "state": state,
-        }))
+        }
+        if user_scopes:
+            # Slack keeps personal consent in a separate parameter, and returns
+            # its token in a separate block. Asking for both in one round is
+            # what lets one consent screen cover the bot and the person.
+            query["user_scope"] = ",".join(sorted(set(user_scopes)))
+        return "%s?%s" % (AUTHORIZATION_URL, urlencode(query))
+
+    def exchange_code_with_user(self, code):
+        """Exchange once and separate the two authorities Slack returns.
+
+        The personal token comes back apart from the bot's, and never inside
+        provider metadata: metadata is persisted with the connection row, so a
+        user token placed there would sit unencrypted beside it.
+        """
+        payload = self._request("POST", TOKEN_URL, "code exchange", data={
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": self.redirect_uri,
+            "code": code,
+        })
+        return (
+            self._bot_authority(payload, "code exchange"),
+            self._user_authority(payload),
+        )
+
+    @staticmethod
+    def _user_authority(payload):
+        block = payload.get("authed_user")
+        if not isinstance(block, dict):
+            return None
+        token = block.get("access_token")
+        subject = block.get("id")
+        if not isinstance(token, str) or not token.startswith(
+            ("xoxp-", "xoxe.xoxp-")
+        ) or not subject:
+            return None
+        return {
+            "slack_subject_id": subject,
+            "access_token": token,
+            "refresh_token": block.get("refresh_token"),
+            "expires_in": block.get("expires_in"),
+            "granted_scopes": frozenset(
+                scope for scope in (block.get("scope") or "").split(",") if scope
+            ),
+            "token_type": "user",
+        }
 
     def exchange_code(self, code, code_verifier):
         del code_verifier
@@ -108,6 +155,10 @@ class SlackCredentialConnector(CredentialConnector):
 
     def _token_request(self, data, operation):
         payload = self._request("POST", TOKEN_URL, operation, data=data)
+        return self._bot_authority(payload, operation)
+
+    @staticmethod
+    def _bot_authority(payload, operation):
         access_token = payload.get("access_token")
         refresh_token = payload.get("refresh_token")
         expires_in = payload.get("expires_in")

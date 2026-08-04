@@ -36,10 +36,14 @@ class SlackConnector:
             "slack.direct_message.send": frozenset({"im:write", "chat:write"}),
         }
 
-    def authorization_url(self, state, code_challenge, scopes):
-        return "https://slack.test/oauth?state=%s&scope=%s" % (
+    def authorization_url(self, state, code_challenge, scopes,
+                          user_scopes=None):
+        url = "https://slack.test/oauth?state=%s&scope=%s" % (
             state, ",".join(scopes)
         )
+        if user_scopes:
+            url += "&user_scope=%s" % ",".join(user_scopes)
+        return url
 
     def exchange_code(self, code, verifier):
         assert code == "valid-code"
@@ -341,3 +345,34 @@ def test_status_tells_the_ui_which_families_are_missing_and_why(tmp_path):
     ]
     # The DM already holds chat:write, so only the absent scope is offered.
     assert families["slack_direct_messages"]["missing_scopes"] == ["im:write"]
+
+
+def test_a_search_request_asks_the_person_not_the_workspace(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"families": ["slack_search"]},
+    )
+
+    assert status == 200
+    query = parse_qs(urlsplit(started["authorization_url"]).query)
+    # search:read is personal authority, so it must never be requested as a
+    # workspace scope: the install would then hold authority nobody granted
+    # as themselves.
+    assert query.get("user_scope") == ["search:read"]
+    assert "search:read" not in (query.get("scope") or [""])[0]
+
+
+def test_a_mixed_request_splits_workspace_and_personal_consent(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_search", "slack_channel_discovery"],
+        },
+    )
+
+    assert status == 200
+    query = parse_qs(urlsplit(started["authorization_url"]).query)
+    assert set(query["scope"][0].split(",")) == {"channels:read"}
+    assert query["user_scope"] == ["search:read"]

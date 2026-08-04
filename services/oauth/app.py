@@ -106,6 +106,61 @@ class OAuthService(object):
             for item in connections
         ]}
 
+    def _record_slack_user_authority(self, tenant_id, connection, principal_id,
+                                     user_authority):
+        """Store personal consent as its own profile, sealed like any other.
+
+        The user token never joins the connection row. It gets its own vault
+        credential and its own profile, so revoking one person's search access
+        cannot mean revoking the installation.
+        """
+        if not user_authority or not hasattr(
+            self.repository, "record_authority_profile"
+        ):
+            return None
+        context = {
+            "oauth_transaction_id": "user:%s" % connection["connection_id"],
+            "provider": "slack",
+            "tenant_id": tenant_id,
+            "user_principal_id": principal_id,
+            "slack_subject_id": user_authority["slack_subject_id"],
+            "credential_version": "1",
+        }
+        try:
+            envelope = self.managed_oauth_crypto.seal(
+                json.dumps({
+                    "access_token": user_authority["access_token"],
+                    "refresh_token": user_authority.get("refresh_token"),
+                    "expires_at": (
+                        int(self.clock()) + int(user_authority["expires_in"])
+                        if user_authority.get("expires_in") else None
+                    ),
+                    "token_type": "user",
+                    "granted_scopes": sorted(user_authority["granted_scopes"]),
+                }, sort_keys=True, separators=(",", ":")),
+                context,
+                caller_identity=self.ingestion_identity,
+            )
+            vault_status, vault_response = self.vault_service.store_managed_oauth({
+                "user_principal_id": principal_id,
+                "provider": "slack-user",
+                "granted_scopes": sorted(user_authority["granted_scopes"]),
+                "envelope": envelope,
+            }, signer=principal_id)
+        except ManagedOAuthError:
+            return None
+        if vault_status != 200:
+            return None
+        return self.repository.record_authority_profile(
+            tenant_id, connection["connection_id"], "user", principal_id,
+            vault_response["credential_id"],
+            sorted(user_authority["granted_scopes"]), int(self.clock()),
+            slack_subject_id=user_authority["slack_subject_id"],
+            # Consent alone does not enable it. Enabling stays a deliberate
+            # act, as the unit requires.
+            enabled=False,
+        )
+
     def _slack_missing_families(self, installation):
         registry = self._slack_registry()
         if registry is None:
@@ -144,6 +199,20 @@ class OAuthService(object):
             capabilities |= set(bundles[family]["capabilities"])
             scopes |= set(bundles[family]["scopes"])
         return sorted(capabilities), sorted(scopes - granted)
+
+    def _slack_user_scopes(self, capabilities):
+        """Scopes that must be asked of the person, not of the workspace."""
+        registry = self._slack_registry()
+        if registry is None:
+            return []
+        wanted = set(capabilities or ())
+        return sorted({
+            scope
+            for definition in registry.definitions
+            if definition.capability_id in wanted
+            and definition.authority_profile == "user"
+            for scope in definition.required_scopes
+        })
 
     def _slack_registry(self):
         if getattr(self, "_slack_operations", None) is None:
@@ -225,8 +294,12 @@ class OAuthService(object):
             intended_team_id=body.get("intended_team_id"),
             target_connection_id=target_connection_id,
         )
+        user_scopes = self._slack_user_scopes(capabilities)
+        # A personal scope must not be requested as the workspace's, or the
+        # install would hold authority nobody consented to as themselves.
+        bot_scopes = sorted(set(scopes) - set(user_scopes))
         return 200, {"authorization_url": self.slack_connector.authorization_url(
-            state, None, scopes
+            state, None, bot_scopes, user_scopes=user_scopes or None,
         )}
 
     def complete_slack(self, session_id, code, state, provider_error=None):
@@ -246,7 +319,14 @@ class OAuthService(object):
         if not code:
             return 400, {"error": "authorization code is required"}
         try:
-            authority = self.slack_connector.exchange_code(code, None)
+            if hasattr(self.slack_connector, "exchange_code_with_user"):
+                authority, user_authority = (
+                    self.slack_connector.exchange_code_with_user(code)
+                )
+            else:
+                authority, user_authority = (
+                    self.slack_connector.exchange_code(code, None), None
+                )
         except ProviderError:
             return 502, {"error": "Slack token exchange failed"}
         metadata = dict(authority.provider_metadata)
@@ -350,7 +430,10 @@ class OAuthService(object):
                 previous_installation["credential_id"],
                 previous_installation["principal_id"],
             )
-        del authority, document
+        self._record_slack_user_authority(
+            tenant_id, connection, current["principal_id"], user_authority,
+        )
+        del authority, document, user_authority
         return 200, {
             "result": "connected",
             "provider": "slack",
