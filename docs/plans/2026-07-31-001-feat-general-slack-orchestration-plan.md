@@ -738,6 +738,47 @@ corpus — see the note at the top of
 
 ### U6. Add incremental OAuth authority profiles and elevated channel/admin operations
 
+**Progress (2026-08-04).**
+
+Slice A — bot incremental scope bundles: **complete** (`8dae347`, `95b2213`).
+Install scopes derive from the trusted descriptors instead of a hand-kept copy
+that had already drifted; scopes group into per-family bundles; the connect
+endpoint accepts families and asks only for absent scopes; the card offers one
+upgrade per missing family instead of one button that re-requests everything.
+
+Slice B — user and Enterprise-admin authority:
+
+| Piece | State |
+|---|---|
+| Bot / user / enterprise profiles with subject and consent owner | **Done** (`156fccd`) |
+| Delegation bound to audience, family, purpose, expiry | **Done** (`156fccd`) |
+| Profile bound through dispatch and enforced by policy | **Done** (`799530f`) |
+| Enterprise boundary refused by name, no executors | **Done** (`799530f`) |
+| R22 step-up: reinforced approval needs fresh authentication | **Done** (`799530f`) |
+| `search.messages` registered as user authority | **Done** (`f85f506`) |
+| Personal consent obtained and sealed as its own credential | **Done** (`78e2405`) |
+| Channel create/rename/topic/archive/invite | **Written, uncommitted** — see below |
+| Profile bound through proposal, lease, receipt, audit | Not started |
+| Single-use OAuth state + admin revalidation | Not started |
+| Frontend for personal authority | Not started |
+
+**Channel administration is written but not committed.** The descriptors,
+schemas, `reinforced` flag, executors, and manifest operations exist in the
+working tree. They are not committed because a concurrent refactor of
+`libs/integrations/catalog.py` and `agents/orchestrator/slack_operations.py`
+was in flight in the same tree, and that refactor currently leaves
+`slack_operations.py` unable to import: line 373 still calls
+`SlackOperationRegistry` after the class was renamed to `OperationRegistry`.
+The manifest half cannot be validated until that lands, and committing the
+executors alone would leave dead code. Re-run
+`pytest tests/orchestrator/test_slack_operations.py` once the rename is
+finished, then commit the channel work as one piece.
+
+`reinforced` is declared on the channel descriptors, but nothing yet marks a
+*proposal* reinforced, so the step-up gate is dormant rather than wrong. Wiring
+it needs `action_repository.py`, which was also being changed concurrently.
+
+
 **Goal:** Support least-privilege scope upgrades, optional user search, and policy-gated channel or Enterprise administration without conflating installation ownership with tenant execution.
 
 **Requirements:** R3-R4, R10-R13, R17-R20, R22.
