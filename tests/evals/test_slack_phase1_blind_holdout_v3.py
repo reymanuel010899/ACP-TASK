@@ -89,7 +89,7 @@ def test_blind_holdout_v3_is_well_formed_and_manifest_grounded():
     # Grew to 25 when U5 and U6 promoted methods this corpus had covered as
     # refusals. The replacement cases target methods that remain dormant, so
     # refusal coverage is restored by adding, never by lowering the bar.
-    assert len(cases) == 25
+    assert len(cases) == 26
     assert len({case["id"] for case in cases}) == len(cases)
     assert {case["locale"] for case in cases} == {"es", "en", "mixed"}
     assert sum(case["support_state"] in {"planned", "dormant"} for case in cases) >= 5

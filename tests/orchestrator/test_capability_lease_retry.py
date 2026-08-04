@@ -158,3 +158,92 @@ def test_an_unexpected_pre_dispatch_failure_never_reaches_the_provider(tmp_path)
         WorkflowBrokerDispatcher(
             BrokenActions(), Broker(), Connections(), workflows, clock=lambda: 5
         )(step, claim)
+
+
+def _authority_binding(**overrides):
+    binding = {
+        "user_principal_id": "user:1", "agent_principal_id": "agent:1",
+        "task_id": "task:1", "credential_id": "cred:1",
+        "capability_id": "slack.search.messages",
+        "workflow_revision_id": "revision:1", "step_id": "search",
+        "plan_graph_hash": "graph:1", "connection_id": "conn:1", "attempt": 1,
+        "authority_profile": "user",
+        "authority_profile_id": "authority:1",
+        "slack_subject_id": "U1",
+    }
+    binding.update(overrides)
+    return binding
+
+
+def _authority_lease(repository):
+    return repository.issue_lease(
+        "user:1", "agent:1", "task:1", "cred:1", ["slack.search.messages"],
+        NOW + 60, workflow_revision_id="revision:1", step_id="search",
+        plan_graph_hash="graph:1", connection_id="conn:1", attempt=1,
+        now_ts=NOW, authority_profile="user",
+        authority_profile_id="authority:1", slack_subject_id="U1",
+    )
+
+
+def test_a_lease_validates_only_for_the_identity_it_was_issued_to(tmp_path):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    lease = _authority_lease(repository)
+
+    assert repository.validate_lease(lease, _authority_binding(), NOW) is True
+
+
+@pytest.mark.parametrize("swap", [
+    {"slack_subject_id": "U-someone-else"},
+    {"authority_profile_id": "authority:other"},
+    {"authority_profile": "bot"},
+])
+def test_swapping_the_acting_identity_invalidates_the_lease(tmp_path, swap):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    lease = _authority_lease(repository)
+
+    # An approval names who will act. Substituting another identity afterwards
+    # would make that approval a statement about nobody in particular.
+    assert repository.validate_lease(
+        lease, _authority_binding(**swap), NOW,
+    ) is False
+
+
+def test_a_bot_lease_still_validates_without_personal_fields(tmp_path):
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    lease = repository.issue_lease(
+        "user:1", "agent:1", "task:1", "cred:1", ["slack.message.send"],
+        NOW + 60, workflow_revision_id="revision:1", step_id="send",
+        plan_graph_hash="graph:1", connection_id="conn:1", attempt=1,
+        now_ts=NOW,
+    )
+
+    binding = _authority_binding(
+        capability_id="slack.message.send", step_id="send",
+        authority_profile="bot", authority_profile_id=None,
+        slack_subject_id=None,
+    )
+
+    assert repository.validate_lease(lease, binding, NOW) is True
+
+
+def test_a_channel_effect_is_proposed_as_reinforced(tmp_path):
+    from libs.integrations.catalog import capability_reinforced
+
+    repository = ActionRepository(str(tmp_path / "actions.sqlite"))
+    archive = repository.create_proposal(
+        "user:1", "agent:1", "cred:1", "slack.channel.archive",
+        {"channel_id": "C1"}, NOW + 60, workflow_revision_id="revision:1",
+        step_id="archive", plan_graph_hash="graph:1", connection_id="conn:1",
+        attempt=1, reinforced=capability_reinforced("slack.channel.archive"),
+    )
+    ordinary = repository.create_proposal(
+        "user:1", "agent:1", "cred:1", "slack.message.send",
+        {"channel_id": "C1", "text": "hola"}, NOW + 60,
+        workflow_revision_id="revision:2", step_id="send",
+        plan_graph_hash="graph:2", connection_id="conn:1", attempt=1,
+        reinforced=capability_reinforced("slack.message.send"),
+    )
+
+    assert archive["reinforced"] == 1
+    # Everyday messaging must not be dragged into step-up.
+    assert ordinary["reinforced"] == 0

@@ -111,4 +111,80 @@ describe("ConnectSlackCard", () => {
     expect(within(workspace).queryByRole("button", { name: /Upgrade/ })).not.toBeInTheDocument();
     expect(within(workspace).queryByRole("button", { name: /Disconnect/ })).not.toBeInTheDocument();
   });
+  it("lets a person pause their own Slack access", async () => {
+    const granted = {
+      connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+      status: "connected", enabled_capabilities: [], owner: true,
+      missing_families: [],
+      personal_authority: [
+        { profile_kind: "user", slack_subject_id: "U1", granted_scopes: ["search:read"], enabled: true },
+      ],
+    };
+    const paused = {
+      ...granted,
+      personal_authority: [{ ...granted.personal_authority[0], enabled: false }],
+    };
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => response({ provider: "slack", connections: [granted] }))
+      .mockImplementationOnce(() => response({ status: "disable" }))
+      .mockImplementationOnce(() => response({ provider: "slack", connections: [paused] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ConnectSlackCard redirect={vi.fn()} />);
+
+    // The person is told what they granted and whether it is currently active.
+    expect(await screen.findByText(/your own Slack access \(search:read\)/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pause my access" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    const [url, init] = fetchMock.mock.calls[1];
+    expect(url).toBe("/api/integrations/slack/conn-a/authority/user");
+    expect(JSON.parse(init.body as string)).toEqual({ action: "disable" });
+    expect(await screen.findByRole("button", { name: "Turn on my access" })).toBeInTheDocument();
+  });
+
+  it("offers withdrawal, not only pausing", async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => response({ provider: "slack", connections: [{
+        connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+        status: "connected", enabled_capabilities: [], owner: true,
+        missing_families: [],
+        personal_authority: [
+          { profile_kind: "user", slack_subject_id: "U1", granted_scopes: ["search:read"], enabled: true },
+        ],
+      }] }))
+      .mockImplementationOnce(() => response({ status: "revoke" }))
+      .mockImplementationOnce(() => response({ provider: "slack", connections: [{
+        connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+        status: "connected", enabled_capabilities: [], owner: true,
+        missing_families: [], personal_authority: [],
+      }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ConnectSlackCard redirect={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Withdraw my access" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    // Consent you cannot take back is not consent.
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).toEqual({ action: "revoke" });
+    await waitFor(() =>
+      expect(screen.queryByText(/your own Slack access/)).not.toBeInTheDocument());
+  });
+
+  it("shows no personal controls when nothing was granted", async () => {
+    const fetchMock = vi.fn().mockImplementationOnce(() => response({
+      provider: "slack", connections: [{
+        connection_id: "conn-a", team_id: "T-A", team_name: "Acme",
+        status: "connected", enabled_capabilities: [], owner: true,
+        missing_families: [], personal_authority: [],
+      }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ConnectSlackCard redirect={vi.fn()} />);
+
+    await screen.findByRole("group", { name: "Acme workspace" });
+    expect(screen.queryByText(/your own Slack access/)).not.toBeInTheDocument();
+  });
 });

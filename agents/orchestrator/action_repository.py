@@ -73,9 +73,19 @@ class ActionRepository(object):
             ("plan_graph_hash", "TEXT NOT NULL DEFAULT 'legacy'"),
             ("connection_id", "TEXT NOT NULL DEFAULT 'legacy'"),
             ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+            # Which identity the effect acts as. Part of the lease binding, so
+            # the acting subject cannot be swapped between approval and
+            # dispatch while the lease still validates.
+            ("authority_profile", "TEXT NOT NULL DEFAULT 'bot'"),
+            ("authority_profile_id", "TEXT NOT NULL DEFAULT 'none'"),
+            ("slack_subject_id", "TEXT NOT NULL DEFAULT 'none'"),
         ):
             self._ensure_proposal_column(name, declaration)
             self._ensure_lease_column(name, declaration)
+        # Effects whose approval must come from someone provably present.
+        self._ensure_proposal_column(
+            "reinforced", "INTEGER NOT NULL DEFAULT 0"
+        )
         self._connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS capability_one_active_workflow_lease "
             "ON capability_leases(workflow_revision_id, step_id) "
@@ -98,6 +108,10 @@ class ActionRepository(object):
         plan_graph_hash="legacy",
         connection_id="legacy",
         attempt=0,
+        authority_profile="bot",
+        authority_profile_id=None,
+        slack_subject_id=None,
+        reinforced=False,
     ):
         proposal_id = proposal_id or "proposal-%s" % uuid.uuid4().hex
         idempotency_key = idempotency_key or "action-%s" % uuid.uuid4().hex
@@ -141,8 +155,10 @@ class ActionRepository(object):
                         agent_principal_id, credential_id, capability_id,
                         payload_json, payload_hash, idempotency_key, status,
                         expires_at, workflow_revision_id, step_id,
-                        plan_graph_hash, connection_id, attempt
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?)
+                        plan_graph_hash, connection_id, attempt,
+                        authority_profile, authority_profile_id,
+                        slack_subject_id, reinforced
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         proposal_id,
@@ -160,6 +176,10 @@ class ActionRepository(object):
                         plan_graph_hash,
                         connection_id,
                         int(attempt),
+                        authority_profile or "bot",
+                        authority_profile_id or "none",
+                        slack_subject_id or "none",
+                        1 if reinforced else 0,
                     ),
                 )
                 self._connection.execute("COMMIT")
@@ -291,6 +311,9 @@ class ActionRepository(object):
         connection_id="legacy",
         attempt=0,
         now_ts=None,
+        authority_profile="bot",
+        authority_profile_id=None,
+        slack_subject_id=None,
     ):
         lease = secrets.token_urlsafe(32)
         revoked_at = int(time.time() if now_ts is None else now_ts)
@@ -315,8 +338,9 @@ class ActionRepository(object):
                     lease_hash, user_principal_id, agent_principal_id, task_id,
                     credential_id, capabilities_json, expires_at, revoked_at,
                     consumed_at, workflow_revision_id, step_id, plan_graph_hash,
-                    connection_id, attempt
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+                    connection_id, attempt, authority_profile,
+                    authority_profile_id, slack_subject_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     hashlib.sha256(lease.encode("utf-8")).hexdigest(),
@@ -331,6 +355,9 @@ class ActionRepository(object):
                     plan_graph_hash,
                     connection_id,
                     int(attempt),
+                    authority_profile or "bot",
+                    authority_profile_id or "none",
+                    slack_subject_id or "none",
                 ),
             )
         return lease
@@ -417,9 +444,22 @@ class ActionRepository(object):
             "workflow_revision_id", "step_id", "plan_graph_hash",
             "connection_id", "attempt",
         )
-        return all(
+        if not all(
             row[field] == binding.get(field, 0 if field == "attempt" else "legacy")
             for field in fields
+        ):
+            return False
+        # An approval names the identity that will act. Letting a dispatch
+        # substitute another one afterwards would make the approval a
+        # statement about nobody in particular.
+        authority = (
+            ("authority_profile", "bot"),
+            ("authority_profile_id", "none"),
+            ("slack_subject_id", "none"),
+        )
+        return all(
+            row[field] == (binding.get(field) or default)
+            for field, default in authority
         )
 
     def complete_execution(

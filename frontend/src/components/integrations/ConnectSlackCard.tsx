@@ -13,6 +13,7 @@ type SlackConnection = {
   status: "connected" | "degraded" | "disconnect_pending" | "rotation_uncertain";
   enabled_capabilities: string[];
   missing_families?: MissingFamily[];
+  personal_authority?: PersonalAuthority[];
   owner?: boolean;
 };
 
@@ -21,6 +22,13 @@ type SlackResponse = {
   authorization_url?: string;
   status?: string;
   connection_id?: string;
+};
+
+type PersonalAuthority = {
+  profile_kind: string;
+  slack_subject_id: string | null;
+  granted_scopes: string[];
+  enabled: boolean;
 };
 
 type MissingFamily = {
@@ -108,6 +116,45 @@ export default function ConnectSlackCard({
     queueMicrotask(() => void loadStatus());
   }, [loadStatus]);
 
+
+  async function decidePersonalAuthority(
+    connection: SlackConnection,
+    profile: PersonalAuthority,
+    action: "enable" | "disable" | "revoke",
+  ) {
+    const csrf = csrfToken();
+    if (!csrf) {
+      setFailed(true);
+      setMessage("Your secure session needs to be refreshed. Sign in again, then retry.");
+      return;
+    }
+    setBusy(connection.connection_id);
+    try {
+      const response = await fetch(
+        `/api/integrations/slack/${encodeURIComponent(connection.connection_id)}/authority/${encodeURIComponent(profile.profile_kind)}`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+          body: JSON.stringify({ action }),
+        },
+      );
+      if (!response.ok) throw new Error("authority change failed");
+      setMessage(
+        action === "revoke"
+          ? "Your personal Slack access was withdrawn."
+          : action === "enable"
+            ? "Your personal Slack access is on."
+            : "Your personal Slack access is paused.",
+      );
+      await loadStatus();
+    } catch {
+      setFailed(true);
+      setMessage("We could not change your personal Slack access.");
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function connect(target?: SlackConnection, family?: string) {
     const csrf = csrfToken();
@@ -210,6 +257,32 @@ export default function ConnectSlackCard({
                   ))}
                 </ul>
               )}
+              {(connection.personal_authority ?? []).map((profile) => (
+                <div key={profile.profile_kind} className="mt-2 rounded border border-[var(--ag-card-border)] p-[6px]">
+                  <p className="text-[9px] text-[var(--ag-text-secondary)]">
+                    You granted Tessera your own Slack access ({profile.granted_scopes.join(", ")}).
+                    {profile.enabled ? " It is on." : " It is paused."}
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void decidePersonalAuthority(connection, profile, profile.enabled ? "disable" : "enable")}
+                      className="rounded border border-[var(--ag-card-border)] px-2 py-1 text-[9px] text-[var(--ag-text)] disabled:opacity-50"
+                    >
+                      {profile.enabled ? "Pause my access" : "Turn on my access"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void decidePersonalAuthority(connection, profile, "revoke")}
+                      className="rounded border border-[#7F1D1D] px-2 py-1 text-[9px] text-[#FCA5A5] disabled:opacity-50"
+                    >
+                      Withdraw my access
+                    </button>
+                  </div>
+                </div>
+              ))}
               {connection.owner !== false && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   <button type="button" disabled={busy !== null} onClick={() => void disconnect(connection)} className="rounded border border-[#7F1D1D] px-2 py-1 text-[9px] text-[#FCA5A5] disabled:opacity-50">Disconnect {name}</button>

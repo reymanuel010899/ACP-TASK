@@ -129,3 +129,79 @@ def test_authority_is_scoped_to_its_tenant_and_connection(tmp_path):
         assert repository.authorize_personal_authority(
             tenant, connection, "user", "user:maria", "slack_search", NOW,
         )["reason"] == "authority_profile_absent"
+
+
+def test_a_person_sees_only_their_own_grants(tmp_path):
+    repository = _repository(tmp_path)
+    _user_profile(repository, owner="user:maria")
+    _user_profile(repository, owner="user:bob")
+
+    maria = repository.list_personal_authority(
+        "org:acme", "conn:slack", "user:maria",
+    )
+    bob = repository.list_personal_authority(
+        "org:acme", "conn:slack", "user:bob",
+    )
+
+    # Who searches what is not other members' business.
+    assert [item["consent_owner_principal_id"] for item in maria] == [
+        "user:maria",
+    ]
+    assert [item["consent_owner_principal_id"] for item in bob] == ["user:bob"]
+
+
+def test_withdrawing_consent_denies_immediately(tmp_path):
+    repository = _repository(tmp_path)
+    _user_profile(repository)
+
+    assert repository.authorize_personal_authority(
+        "org:acme", "conn:slack", "user", "user:maria", "slack_search", NOW,
+    )["allowed"] is True
+
+    assert repository.revoke_authority_profile(
+        "org:acme", "conn:slack", "user", "user:maria", NOW + 10,
+    ) is True
+
+    decision = repository.authorize_personal_authority(
+        "org:acme", "conn:slack", "user", "user:maria", "slack_search", NOW + 20,
+    )
+    assert decision["allowed"] is False
+    assert decision["reason"] == "authority_profile_revoked"
+    assert repository.list_personal_authority(
+        "org:acme", "conn:slack", "user:maria",
+    ) == []
+
+
+def test_only_the_consent_owner_can_withdraw_or_toggle(tmp_path):
+    repository = _repository(tmp_path)
+    _user_profile(repository, owner="user:maria")
+
+    assert repository.revoke_authority_profile(
+        "org:acme", "conn:slack", "user", "user:bob", NOW,
+    ) is False
+    assert repository.set_authority_profile_enabled(
+        "org:acme", "conn:slack", "user", "user:bob", False, NOW,
+    ) is False
+    # Maria's grant is untouched by someone else trying.
+    assert repository.authorize_personal_authority(
+        "org:acme", "conn:slack", "user", "user:maria", "slack_search", NOW,
+    )["allowed"] is True
+
+
+def test_a_grant_can_be_paused_without_re_consenting(tmp_path):
+    repository = _repository(tmp_path)
+    _user_profile(repository)
+
+    assert repository.set_authority_profile_enabled(
+        "org:acme", "conn:slack", "user", "user:maria", False, NOW,
+    ) is True
+    assert repository.authorize_personal_authority(
+        "org:acme", "conn:slack", "user", "user:maria", "slack_search", NOW,
+    )["reason"] == "authority_profile_disabled"
+
+    assert repository.set_authority_profile_enabled(
+        "org:acme", "conn:slack", "user", "user:maria", True, NOW,
+    ) is True
+    assert repository.authorize_personal_authority(
+        "org:acme", "conn:slack", "user", "user:maria", "slack_search", NOW,
+    )["allowed"] is True

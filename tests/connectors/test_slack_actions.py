@@ -479,3 +479,71 @@ def test_search_declares_user_authority_in_the_catalog():
     assert definition.authority_profile == "user"
     assert definition.required_scopes == frozenset({"search:read"})
     assert definition.effect == "read"
+
+
+def test_creating_a_channel_returns_its_provider_identity():
+    http = FakeHTTP([Response(payload={
+        "ok": True, "channel": {"id": "C9", "name": "incidentes"},
+    })])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.channel.create", {
+        "name": "incidentes",
+    }, context())
+
+    assert http.calls[0][1].endswith("/conversations.create")
+    assert receipt["provider_id"] == "C9"
+    assert receipt["name"] == "incidentes"
+
+
+def test_an_archive_already_done_is_the_requested_state():
+    http = FakeHTTP([Response(payload={"ok": False, "error": "already_archived"})])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.channel.archive", {
+        "channel_id": "C9",
+    }, context())
+
+    assert receipt["channel_id"] == "C9"
+
+
+def test_inviting_nobody_is_refused_before_any_provider_call():
+    http = FakeHTTP([])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.execute("slack.channel.invite", {
+            "channel_id": "C9", "user_ids": [],
+        }, context())
+
+    assert failure.value.code == "invalid_user_ids"
+    assert http.calls == []
+
+
+def test_inviting_people_already_present_succeeds():
+    http = FakeHTTP([Response(payload={
+        "ok": False, "error": "already_in_channel",
+    })])
+    executor = SlackActionExecutor(http=http)
+
+    receipt = executor.execute("slack.channel.invite", {
+        "channel_id": "C9", "user_ids": ["U1", "U2"],
+    }, context())
+
+    assert receipt["invited"] == 2
+
+
+def test_channel_administration_is_declared_reinforced():
+    from libs.integrations.catalog import slack_definitions
+
+    channel = [item for item in slack_definitions()
+               if item.capability_id.startswith("slack.channel.")]
+
+    assert len(channel) == 5
+    # Reshaping shared space needs approval from someone provably present.
+    assert all(item.reinforced for item in channel)
+    assert all(item.required_scopes == frozenset({"channels:manage"})
+               for item in channel)
+    # Ordinary messaging must not be dragged into step-up.
+    assert not next(item for item in slack_definitions()
+                    if item.capability_id == "slack.message.send").reinforced

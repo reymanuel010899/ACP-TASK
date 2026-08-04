@@ -436,6 +436,55 @@ class OAuthRepository(object):
             tenant_id, connection_id, profile_kind, consent_owner_principal_id
         )
 
+    def list_personal_authority(self, tenant_id, connection_id, principal_id):
+        """What this person has granted of their own, so they can withdraw it.
+
+        Only their own grants: another member's personal consent is not this
+        person's business, and showing it would leak who searches what.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM slack_authority_profiles
+                   WHERE tenant_id = ? AND connection_id = ?
+                     AND consent_owner_principal_id = ?
+                     AND profile_kind != 'bot' AND status = 'active'
+                   ORDER BY profile_kind""",
+                (tenant_id, connection_id, principal_id),
+            ).fetchall()
+        return [self._authority_profile(row) for row in rows]
+
+    def revoke_authority_profile(self, tenant_id, connection_id, profile_kind,
+                                 principal_id, now_ts):
+        """Withdraw one's own consent. Only the consent owner may."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE slack_authority_profiles
+                   SET status = 'revoked', enabled = 0, revoked_at = ?,
+                       updated_at = ?
+                   WHERE tenant_id = ? AND connection_id = ?
+                     AND profile_kind = ? AND consent_owner_principal_id = ?
+                     AND status = 'active'""",
+                (int(now_ts), int(now_ts), tenant_id, connection_id,
+                 profile_kind, principal_id),
+            )
+        return cursor.rowcount == 1
+
+    def set_authority_profile_enabled(self, tenant_id, connection_id,
+                                      profile_kind, principal_id, enabled,
+                                      now_ts):
+        """Turn one's own granted authority on or off without re-consenting."""
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE slack_authority_profiles
+                   SET enabled = ?, updated_at = ?
+                   WHERE tenant_id = ? AND connection_id = ?
+                     AND profile_kind = ? AND consent_owner_principal_id = ?
+                     AND status = 'active'""",
+                (1 if enabled else 0, int(now_ts), tenant_id, connection_id,
+                 profile_kind, principal_id),
+            )
+        return cursor.rowcount == 1
+
     def get_authority_profile(self, tenant_id, connection_id, profile_kind,
                               consent_owner_principal_id):
         with self._lock:
