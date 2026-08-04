@@ -1152,3 +1152,105 @@ def test_a_public_read_never_consults_the_private_authorizer(tmp_path):
     )
 
     assert revision["steps"][0]["capability_id"] == "slack.conversation.read"
+
+
+class _LinkConnections:
+    def list_tenant_installations(self, tenant, provider):
+        return [{"connection_id": "conn:s", "status": "connected",
+                 "credential_version": 1,
+                 "granted_scopes": ["channels:read", "channels:history"],
+                 "enabled_capabilities": [
+                     "slack.conversation.read", "slack.message.permalink"]}]
+
+
+def _link_service(tmp_path, name, connections=None):
+    repository = WorkflowRepository(str(tmp_path / name))
+    store = ConciergeConversationStore(repository, clock=lambda: 1_000_000)
+    service = DynamicWorkflowService(
+        _ExplodingBrain(), slack_definitions(),
+        connections or _LinkConnections(), repository,
+        conversation_store=store, clock=lambda: 1_000_000,
+    )
+    conversation = store.create("org:1", "user:1")
+    store.update("org:1" and conversation["conversation_id"], "org:1", "user:1",
+                 status="retrieving",
+                 active_connection={"id": "conn:s"})
+    return repository, store, service, conversation["conversation_id"]
+
+
+def test_a_finished_read_fetches_one_link_per_cited_message(tmp_path):
+    repository, store, service, conversation_id = _link_service(
+        tmp_path, "links.db",
+    )
+    progress = {
+        "channel_id": "C1", "awaiting_links": True,
+        "messages": [{"ts": "10.1", "user": "U1"}, {"ts": "10.2", "user": "U2"}],
+    }
+    conversation = dict(
+        store.get(conversation_id, "org:1", "user:1"), read_progress=progress,
+    )
+
+    assert service.continue_slack_read(conversation) is True
+
+    current = store.get(conversation_id, "org:1", "user:1")
+    revision = repository.get_revision_by_id(
+        current["workflow_revision_id"], "org:1",
+    )
+    assert [step["capability_id"] for step in revision["steps"]] == [
+        "slack.message.permalink", "slack.message.permalink",
+    ]
+    assert [step["input"]["message_ts"] for step in revision["steps"]] == [
+        "10.1", "10.2",
+    ]
+    assert current["read_progress"]["links_dispatched"] is True
+    for step in revision["steps"]:
+        _assert_matches_capability_schema(step)
+
+
+def test_the_link_round_is_capped_at_its_budget(tmp_path):
+    repository, store, service, conversation_id = _link_service(
+        tmp_path, "links-capped.db",
+    )
+    budget = repository.CITATION_LINK_BUDGET
+    progress = {
+        "channel_id": "C1", "awaiting_links": True,
+        "messages": [{"ts": "%d.0" % i, "user": "U1"}
+                     for i in range(budget + 7)],
+    }
+    conversation = dict(
+        store.get(conversation_id, "org:1", "user:1"), read_progress=progress,
+    )
+
+    service.continue_slack_read(conversation)
+
+    revision = repository.get_revision_by_id(
+        store.get(conversation_id, "org:1", "user:1")["workflow_revision_id"],
+        "org:1",
+    )
+    assert len(revision["steps"]) == budget
+    # The most recent evidence is what gets linked.
+    assert revision["steps"][-1]["input"]["message_ts"] == "%d.0" % (budget + 6)
+
+
+def test_a_read_without_link_authority_still_answers(tmp_path):
+    class NoLinks:
+        def list_tenant_installations(self, tenant, provider):
+            return [{"connection_id": "conn:s", "status": "connected",
+                     "credential_version": 1,
+                     "granted_scopes": ["channels:read", "channels:history"],
+                     "enabled_capabilities": ["slack.conversation.read"]}]
+
+    _, store, service, conversation_id = _link_service(
+        tmp_path, "links-denied.db", NoLinks(),
+    )
+    progress = {"channel_id": "C1", "awaiting_links": True,
+                "messages": [{"ts": "10.1", "user": "U1"}]}
+    conversation = dict(
+        store.get(conversation_id, "org:1", "user:1"), read_progress=progress,
+    )
+
+    assert service.continue_slack_read(conversation) is False
+
+    current = store.get(conversation_id, "org:1", "user:1")
+    assert current["read_progress"]["awaiting_links"] is False
+    assert current["read_progress"]["links_dispatched"] is True

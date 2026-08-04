@@ -1125,3 +1125,50 @@ def test_a_channel_read_marks_which_messages_started_threads(tmp_path):
     assert [m["relation"] for m in result["messages"]] == [
         "message", "thread_parent", "reply",
     ]
+
+
+def test_the_link_round_completes_the_answer_with_clickable_citations(tmp_path):
+    repository = _repository(tmp_path)
+    conversation = repository.create_conversation(
+        "org:acme", "user:alice", 10, ttl_seconds=600,
+    )
+    conversation_id = conversation["conversation_id"]
+    repository.update_conversation(
+        conversation_id, "org:acme", "user:alice", {
+            "status": "retrieving",
+            "read_progress": {
+                "channel_id": "C1", "awaiting_links": True,
+                "links_dispatched": True, "budget_exhausted": False,
+                "directory": [{"id": "U1", "display_name": "María"}],
+                "messages": [
+                    {"ts": "10.1", "user": "U1", "text": "uno"},
+                    {"ts": "10.2", "user": "U1", "text": "dos"},
+                ],
+            },
+        }, 11,
+    )
+    current = repository.get_conversation(
+        conversation_id, "org:acme", "user:alice", 12,
+    )
+
+    repository._present_linked_slack_read(
+        {"conversation_id": conversation_id, "principal_id": "user:alice"},
+        "org:acme", current,
+        {"10.1": "https://acme.slack.com/archives/C1/p101"},
+        {"status": "ready"}, 12,
+    )
+
+    final = repository.get_conversation(
+        conversation_id, "org:acme", "user:alice", 13,
+    )
+    presentation = final["presentation"]
+    links = {item["message_ts"]: item.get("permalink")
+             for item in presentation["citations"]}
+    assert links == {
+        "10.1": "https://acme.slack.com/archives/C1/p101", "10.2": None,
+    }
+    # One citation lacks a link, so the answer must not claim completeness.
+    assert presentation["citation_complete"] is False
+    assert "María (" in presentation["answer"]
+    assert final["status"] == "ready"
+    assert final.get("read_progress") is None

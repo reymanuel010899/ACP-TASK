@@ -26,6 +26,9 @@ class WorkflowRepository(object):
     })
     READ_PAGE_BUDGET = 5
     READ_MESSAGE_BUDGET = 500
+    # One provider call per link, so cite the most recent evidence and say
+    # plainly that the rest carry references without URLs.
+    CITATION_LINK_BUDGET = 10
     SLACK_ENTITY_FIELDS = {
         "workspace": frozenset({"id", "name", "domain"}),
         "channel": frozenset({
@@ -1948,6 +1951,35 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
+    def _present_linked_slack_read(self, row, tenant_id, current, links,
+                                   changes, now_ts):
+        """Answer once the permalink round returns, merging links into cites."""
+        progress = (current or {}).get("read_progress") or {}
+        messages = list(progress.get("messages") or [])
+        presented = self._present_slack_evidence(
+            {"messages": messages,
+             "partial": bool(progress.get("budget_exhausted"))},
+            {"channel_id": progress.get("channel_id")},
+            (current or {}).get("locale", "es"),
+            progress.get("directory"),
+        )
+        for citation in presented["citations"]:
+            permalink = links.get(citation["message_ts"])
+            if permalink:
+                citation["permalink"] = permalink
+        presented["citation_complete"] = all(
+            item.get("permalink") for item in presented["citations"]
+        ) if presented["citations"] else True
+        self.store_conversation_presentation(
+            row["conversation_id"], tenant_id, row["principal_id"], presented,
+            now_ts,
+        )
+        self.update_conversation(
+            row["conversation_id"], tenant_id, row["principal_id"],
+            dict(changes, read_progress=None), now_ts,
+        )
+        return True
+
     @staticmethod
     def _slack_read_author(conversation):
         """Filter to one author only when the turn actually named a person."""
@@ -1985,9 +2017,13 @@ class WorkflowRepository(object):
                 now_ts,
             )
             progress = (conversation or {}).get("read_progress") or {}
-            if progress.get("cursor") and progress.get("dispatched") != progress[
-                "cursor"
-            ]:
+            owes_page = bool(progress.get("cursor")) and progress.get(
+                "dispatched"
+            ) != progress["cursor"]
+            owes_links = bool(progress.get("awaiting_links")) and not progress.get(
+                "links_dispatched"
+            )
+            if owes_page or owes_links:
                 paging.append(conversation)
         return paging
 
@@ -2630,13 +2666,23 @@ class WorkflowRepository(object):
                     changes, now_ts,
                 )
                 return True
+            current = self.get_conversation(
+                row["conversation_id"], tenant_id, row["principal_id"], now_ts
+            )
+            links = {
+                step["input"]["message_ts"]: (step.get("output") or {})["permalink"]
+                for step in revision["steps"]
+                if (step.get("output") or {}).get("permalink")
+                and (step.get("input") or {}).get("message_ts")
+            }
+            if links:
+                return self._present_linked_slack_read(
+                    row, tenant_id, current, links, changes, now_ts,
+                )
             read_step = next((step for step in reversed(revision["steps"])
                               if (step.get("output") or {}).get("messages")
                               is not None), None)
             evidence = (read_step or {}).get("output") or {}
-            current = self.get_conversation(
-                row["conversation_id"], tenant_id, row["principal_id"], now_ts
-            )
             directory = next((
                 (step.get("output") or {}).get("users")
                 for step in revision["steps"]
@@ -2646,6 +2692,22 @@ class WorkflowRepository(object):
             progress = self._accumulate_slack_read_page(
                 current, evidence, step_input,
             )
+            if not progress["continues"] and progress["messages"] and not (
+                (current or {}).get("read_progress") or {}
+            ).get("links_dispatched"):
+                # Pages are done; now fetch the links before answering, so the
+                # user never sees an answer whose citations gain URLs later.
+                self.update_conversation(
+                    row["conversation_id"], tenant_id, row["principal_id"],
+                    {"status": "retrieving",
+                     "read_progress": dict(progress["state"], cursor=None,
+                                           awaiting_links=True,
+                                           directory=directory,
+                                           budget_exhausted=progress[
+                                               "budget_exhausted"])},
+                    now_ts,
+                )
+                return True
             if progress["continues"]:
                 # More pages remain inside budget: keep the turn retrieving so
                 # the worker fetches the next one, and do not present a partial

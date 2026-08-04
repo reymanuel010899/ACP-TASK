@@ -420,8 +420,12 @@ class DynamicWorkflowService:
     def continue_slack_read(self, conversation, now=None):
         """Dispatch the next read page for a turn still inside its budget."""
         progress = (conversation or {}).get("read_progress") or {}
+        if conversation.get("status") != "retrieving":
+            return False
+        if progress.get("awaiting_links") and not progress.get("links_dispatched"):
+            return self._dispatch_slack_permalinks(conversation, progress)
         cursor = progress.get("cursor")
-        if not cursor or conversation.get("status") != "retrieving":
+        if not cursor:
             return False
         if progress.get("dispatched") == cursor:
             return False
@@ -446,6 +450,74 @@ class DynamicWorkflowService:
             workflow_revision_id=revision["workflow_revision_id"],
         )
         return True
+
+    def _dispatch_slack_permalinks(self, conversation, progress):
+        """Fetch one clickable link per cited message, within a fixed budget."""
+        tenant_id = conversation["tenant_id"]
+        principal_id = conversation["principal_id"]
+        connection_id = (conversation.get("active_connection") or {}).get("id")
+        connection = next((
+            item for item in self._tenant_installations(tenant_id, principal_id)
+            if item.get("connection_id") == connection_id
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == "slack.message.permalink"),
+                          None)
+        cited = [item for item in (progress.get("messages") or [])
+                 if item.get("ts")][-self.workflows.CITATION_LINK_BUDGET:]
+        if not connection or not definition or not cited or (
+            "slack.message.permalink" not in set(
+                connection.get("enabled_capabilities") or ()
+            )
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            # Without link authority the answer still stands on its stable
+            # references, so finish rather than strand the turn.
+            return self._finish_unlinked_slack_read(conversation, progress)
+        now = int(self.clock())
+        channel_id = progress.get("channel_id")
+        steps = []
+        for message in cited:
+            payload = {"channel_id": channel_id, "message_ts": message["ts"]}
+            steps.append({
+                "step_id": "slack-permalink-%s" % message["ts"].replace(".", "-"),
+                "capability_id": "slack.message.permalink",
+                "capability_version": definition.version,
+                "connection_id": connection_id,
+                "descriptor_snapshot_hash": descriptor_hash(definition),
+                "credential_version": int(connection.get("credential_version") or 0),
+                "input": payload, "input_hash": _hash(payload),
+                "depends_on": [], "effect": "read",
+            })
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": steps})
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("permalinks"), now
+        )
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, steps, now
+        )
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        self.conversation_store.update(
+            conversation["conversation_id"], tenant_id, principal_id,
+            status="retrieving",
+            read_progress=dict(progress, links_dispatched=True),
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
+
+    def _finish_unlinked_slack_read(self, conversation, progress):
+        self.conversation_store.update(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"],
+            read_progress=dict(progress, awaiting_links=False,
+                               links_dispatched=True),
+        )
+        return False
 
     def _slack_directory_step(self, capability_id, connection_id, connection):
         """Fetch the member directory alongside a message read.
