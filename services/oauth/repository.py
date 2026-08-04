@@ -79,6 +79,41 @@ class OAuthRepository(object):
             CREATE INDEX IF NOT EXISTS integration_connections_owner_idx
                 ON integration_connections(tenant_id, principal_id, provider, status);
 
+            CREATE TABLE IF NOT EXISTS slack_authority_profiles (
+                authority_profile_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                profile_kind TEXT NOT NULL,
+                slack_subject_id TEXT,
+                consent_owner_principal_id TEXT NOT NULL,
+                credential_id TEXT NOT NULL,
+                credential_version INTEGER NOT NULL,
+                granted_scopes TEXT NOT NULL,
+                status TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                PRIMARY KEY(authority_profile_id, tenant_id),
+                UNIQUE(tenant_id, connection_id, profile_kind,
+                       consent_owner_principal_id)
+            );
+            CREATE TABLE IF NOT EXISTS slack_authority_delegations (
+                delegation_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                authority_profile_id TEXT NOT NULL,
+                audience_principal_id TEXT NOT NULL,
+                operation_family TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                granted_by_principal_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                PRIMARY KEY(delegation_id, tenant_id),
+                UNIQUE(tenant_id, authority_profile_id, audience_principal_id,
+                       operation_family)
+            );
+
             CREATE TABLE IF NOT EXISTS integration_connection_legacy_map (
                 legacy_key TEXT PRIMARY KEY,
                 connection_id TEXT UNIQUE,
@@ -354,6 +389,151 @@ class OAuthRepository(object):
                 self._connection.execute("ROLLBACK")
                 raise
         return self.get_installation(resolved_id, tenant_id)
+
+    PROFILE_KINDS = frozenset({"bot", "user", "enterprise_admin"})
+
+    def record_authority_profile(
+        self, tenant_id, connection_id, profile_kind, consent_owner_principal_id,
+        credential_id, granted_scopes, now_ts, slack_subject_id=None,
+        credential_version=1, enabled=False,
+    ):
+        """Persist one authority grant, bound to the identity it acts as."""
+        if profile_kind not in self.PROFILE_KINDS:
+            raise ValueError("unsupported authority profile kind")
+        if profile_kind != "bot" and not slack_subject_id:
+            raise ValueError("a personal authority profile needs its subject")
+        if not all((tenant_id, connection_id, consent_owner_principal_id,
+                    credential_id)):
+            raise ValueError("authority profile binding is required")
+        profile_id = "authority:%s" % uuid.uuid4().hex
+        now_ts = int(now_ts)
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO slack_authority_profiles(
+                       authority_profile_id, tenant_id, connection_id,
+                       profile_kind, slack_subject_id,
+                       consent_owner_principal_id, credential_id,
+                       credential_version, granted_scopes, status, enabled,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                   ON CONFLICT(tenant_id, connection_id, profile_kind,
+                               consent_owner_principal_id)
+                   DO UPDATE SET slack_subject_id = excluded.slack_subject_id,
+                       credential_id = excluded.credential_id,
+                       credential_version = excluded.credential_version,
+                       granted_scopes = excluded.granted_scopes,
+                       status = 'active', revoked_at = NULL,
+                       updated_at = excluded.updated_at""",
+                (
+                    profile_id, tenant_id, connection_id, profile_kind,
+                    slack_subject_id, consent_owner_principal_id, credential_id,
+                    int(credential_version),
+                    json.dumps(sorted(set(granted_scopes or ()))),
+                    1 if enabled else 0, now_ts, now_ts,
+                ),
+            )
+        return self.get_authority_profile(
+            tenant_id, connection_id, profile_kind, consent_owner_principal_id
+        )
+
+    def get_authority_profile(self, tenant_id, connection_id, profile_kind,
+                              consent_owner_principal_id):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM slack_authority_profiles
+                   WHERE tenant_id = ? AND connection_id = ?
+                     AND profile_kind = ? AND consent_owner_principal_id = ?""",
+                (tenant_id, connection_id, profile_kind,
+                 consent_owner_principal_id),
+            ).fetchone()
+        return self._authority_profile(row) if row else None
+
+    def authorize_personal_authority(
+        self, tenant_id, connection_id, profile_kind, requester_principal_id,
+        operation_family, now_ts, consent_owner_principal_id=None,
+    ):
+        """Decide whether this requester may act through a personal profile.
+
+        Personal authority belongs to its subject, not to the tenant. Sharing
+        a connection is not sharing a person's token, so a requester who is
+        not the consent owner needs a delegation naming them, the family, and
+        an expiry. Everything unproven denies.
+        """
+        owner = consent_owner_principal_id or requester_principal_id
+        profile = self.get_authority_profile(
+            tenant_id, connection_id, profile_kind, owner
+        )
+        if profile is None:
+            return {"allowed": False, "reason": "authority_profile_absent"}
+        if profile["status"] != "active":
+            return {"allowed": False, "reason": "authority_profile_%s"
+                    % profile["status"]}
+        if not profile["enabled"]:
+            return {"allowed": False, "reason": "authority_profile_disabled"}
+        if profile_kind == "bot":
+            return {"allowed": True, "reason": "tenant_bot_authority",
+                    "authority_profile_id": profile["authority_profile_id"]}
+        if profile["consent_owner_principal_id"] == requester_principal_id:
+            return {"allowed": True, "reason": "requester_is_subject",
+                    "authority_profile_id": profile["authority_profile_id"]}
+        delegation = self._live_delegation(
+            tenant_id, profile["authority_profile_id"], requester_principal_id,
+            operation_family, int(now_ts),
+        )
+        if delegation is None:
+            return {"allowed": False, "reason": "delegation_absent"}
+        return {
+            "allowed": True, "reason": "delegated",
+            "authority_profile_id": profile["authority_profile_id"],
+            "delegation_id": delegation["delegation_id"],
+        }
+
+    def grant_authority_delegation(
+        self, tenant_id, authority_profile_id, audience_principal_id,
+        operation_family, purpose, granted_by_principal_id, expires_at, now_ts,
+    ):
+        if not purpose or not operation_family:
+            raise ValueError("a delegation needs a purpose and a family")
+        if int(expires_at) <= int(now_ts):
+            raise ValueError("a delegation must expire in the future")
+        delegation_id = "delegation:%s" % uuid.uuid4().hex
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO slack_authority_delegations(
+                       delegation_id, tenant_id, authority_profile_id,
+                       audience_principal_id, operation_family, purpose,
+                       granted_by_principal_id, expires_at, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, authority_profile_id,
+                               audience_principal_id, operation_family)
+                   DO UPDATE SET purpose = excluded.purpose,
+                       granted_by_principal_id = excluded.granted_by_principal_id,
+                       expires_at = excluded.expires_at, revoked_at = NULL""",
+                (delegation_id, tenant_id, authority_profile_id,
+                 audience_principal_id, operation_family, purpose,
+                 granted_by_principal_id, int(expires_at), int(now_ts)),
+            )
+        return delegation_id
+
+    def _live_delegation(self, tenant_id, authority_profile_id,
+                         audience_principal_id, operation_family, now_ts):
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM slack_authority_delegations
+                   WHERE tenant_id = ? AND authority_profile_id = ?
+                     AND audience_principal_id = ? AND operation_family = ?
+                     AND revoked_at IS NULL AND expires_at > ?""",
+                (tenant_id, authority_profile_id, audience_principal_id,
+                 operation_family, now_ts),
+            ).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _authority_profile(row):
+        profile = dict(row)
+        profile["granted_scopes"] = json.loads(profile["granted_scopes"] or "[]")
+        profile["enabled"] = bool(profile["enabled"])
+        return profile
 
     def get_installation(self, connection_id, tenant_id):
         if not tenant_id:
