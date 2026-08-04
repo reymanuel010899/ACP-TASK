@@ -49,6 +49,11 @@ class PolicyEvaluator(object):
             "principal_id": binding.get("user_principal_id"),
             "connection_id": binding.get("connection_id"),
             "authority_profile": profile,
+            # The subject and the decision that authorised it are part of what
+            # the policy hash covers, so a dispatch cannot swap whose token it
+            # acts as after the decision was made.
+            "authority_profile_id": binding.get("authority_profile_id"),
+            "slack_subject_id": binding.get("slack_subject_id"),
             "capability_id": capability_id,
             "capability_version": capability_version,
             "descriptor_snapshot_hash": binding.get(
@@ -82,6 +87,31 @@ class PolicyEvaluator(object):
         decision["decision_hash"] = _hash(decision)
         return decision
 
+    @staticmethod
+    def _personal_authority_reason(binding):
+        """A user-token dispatch must carry proof of whose token it is.
+
+        The profile id, the Slack subject, and the authorization decision made
+        when the requester was checked against that subject all travel in the
+        binding. Missing any of them means nothing established that this
+        requester may act as this person, which is exactly the case that must
+        not reach Slack.
+        """
+        profile_id = binding.get("authority_profile_id")
+        subject = binding.get("slack_subject_id")
+        authorization = binding.get("authority_authorization")
+        if not profile_id or not subject:
+            return "personal_authority_unbound"
+        if not isinstance(authorization, Mapping):
+            return "personal_authority_unproven"
+        if authorization.get("authority_profile_id") != profile_id:
+            return "personal_authority_mismatch"
+        if authorization.get("allowed") is not True:
+            return "personal_authority_denied"
+        if authorization.get("reason") not in ("requester_is_subject", "delegated"):
+            return "personal_authority_denied"
+        return None
+
     def _denial_reason(
         self, binding, snapshot, live, definition, profile,
         snapshot_profile, live_profile, effective_scopes, now_ts,
@@ -107,8 +137,19 @@ class PolicyEvaluator(object):
             return "connection_mismatch"
         if binding["connection_id"] != live.get("connection_id"):
             return "connection_mismatch"
-        if profile != "bot" or snapshot_profile != "bot" or live_profile != "bot":
+        if profile != snapshot_profile or profile != live_profile:
+            return "authority_profile_mismatch"
+        # Enterprise admin has no qualified executor and no credential custody
+        # yet, so it is refused here rather than left to fail somewhere less
+        # visible. This is the boundary the unit requires be explicit.
+        if profile == "enterprise_admin":
+            return "enterprise_authority_unavailable"
+        if profile not in ("bot", "user"):
             return "unsupported_authority_profile"
+        if profile == "user":
+            personal = self._personal_authority_reason(binding)
+            if personal is not None:
+                return personal
         if snapshot.get("health") != "healthy" or live.get("status") != "connected":
             return "connection_unhealthy"
         if snapshot.get("rollout_version") != self.rollout_version:

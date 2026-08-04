@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import jsonschema
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -161,6 +162,40 @@ class ActionBroker(object):
         self.policy_evaluator = policy_evaluator
         self.connection_resolver = connection_resolver
 
+    REINFORCED_FRESHNESS_SECONDS = 300
+
+    def _reinforced_step_up_failure(self, session_id, proposal_id, approved):
+        """Refuse a reinforced approval from a session that went stale.
+
+        A session left open all day is still a valid session, which is fine
+        for reading and for ordinary writes. For an effect that cannot be
+        walked back, approval should mean the person is present now, so a
+        stale session fails closed rather than being silently accepted.
+        """
+        if not approved:
+            return None
+        proposal = self.actions.get(proposal_id)
+        if not isinstance(proposal, Mapping) or not proposal.get("reinforced"):
+            return None
+        if not hasattr(self.sessions, "authentication_attestation"):
+            return 403, {
+                "error": "step_up_required",
+                "recovery": "reauthenticate",
+            }
+        attestation = self.sessions.authentication_attestation(
+            session_id, self.clock(), self.REINFORCED_FRESHNESS_SECONDS,
+        )
+        if attestation.get("fresh") is True:
+            return None
+        return 403, {
+            "error": "step_up_required",
+            "reason": attestation.get("reason", "authentication_stale"),
+            "freshness_seconds": attestation.get(
+                "freshness_seconds", self.REINFORCED_FRESHNESS_SECONDS
+            ),
+            "recovery": "reauthenticate",
+        }
+
     def decide(self, session_id, csrf_token, proposal_id, body):
         current = self.sessions.resolve(session_id, self.clock(), touch=True)
         if current is None:
@@ -172,6 +207,11 @@ class ActionBroker(object):
         approved = body.get("approved")
         if not isinstance(approved, bool):
             return 422, {"error": "approved must be boolean"}
+        stale = self._reinforced_step_up_failure(
+            session_id, proposal_id, approved,
+        )
+        if stale is not None:
+            return stale
         changed = self.actions.decide(
             proposal_id,
             body["version"],

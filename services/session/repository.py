@@ -36,6 +36,62 @@ class SessionRepository(object):
             );
             """
         )
+        self._ensure_columns()
+
+    def _ensure_columns(self):
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(web_sessions)")
+        }
+        if "authenticated_at" not in columns:
+            self._connection.execute(
+                "ALTER TABLE web_sessions ADD COLUMN authenticated_at INTEGER"
+            )
+            self._connection.execute(
+                "UPDATE web_sessions SET authenticated_at = created_at "
+                "WHERE authenticated_at IS NULL"
+            )
+
+    def attest_authentication(self, session_id, now_ts):
+        """Record that this session just proved who it is, again.
+
+        Distinct from touching the session: using a session keeps it alive but
+        proves nothing new. A step-up needs the moment authentication actually
+        happened, or a session left open all day would look freshly verified.
+        """
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE web_sessions SET authenticated_at = ?, last_seen_at = ? "
+                "WHERE session_hash = ? AND revoked_at IS NULL",
+                (int(now_ts), int(now_ts), self._hash(session_id)),
+            )
+        return cursor.rowcount == 1
+
+    def authentication_attestation(self, session_id, now_ts,
+                                   freshness_seconds=300):
+        """Report how recently this session authenticated, and whether that
+        is inside the named window. An unknown session is never fresh."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT authenticated_at, created_at FROM web_sessions "
+                "WHERE session_hash = ? AND revoked_at IS NULL",
+                (self._hash(session_id),),
+            ).fetchone()
+        if row is None:
+            return {
+                "fresh": False, "reason": "session_absent",
+                "freshness_seconds": int(freshness_seconds),
+            }
+        authenticated_at = int(row["authenticated_at"] or row["created_at"])
+        age = int(now_ts) - authenticated_at
+        return {
+            "fresh": age <= int(freshness_seconds) and age >= 0,
+            "reason": "fresh" if age <= int(freshness_seconds) and age >= 0
+            else "authentication_stale",
+            "authenticated_at": authenticated_at,
+            "age_seconds": age,
+            "freshness_seconds": int(freshness_seconds),
+        }
 
     @staticmethod
     def _hash(value):
@@ -66,8 +122,9 @@ class SessionRepository(object):
                     """
                     INSERT INTO web_sessions(
                         session_hash, principal_id, csrf_hash, created_at,
-                        last_seen_at, absolute_expires_at, revoked_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                        last_seen_at, absolute_expires_at, revoked_at,
+                        authenticated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
                         session_hash,
@@ -76,6 +133,7 @@ class SessionRepository(object):
                         now,
                         now,
                         now + self.absolute_ttl_seconds,
+                        now,
                     ),
                 )
                 self._connection.execute("COMMIT")
@@ -91,6 +149,7 @@ class SessionRepository(object):
             "csrf_token": csrf_token,
             "created_at": now,
             "expires_at": now + self.absolute_ttl_seconds,
+            "idle_ttl_seconds": self.idle_ttl_seconds,
         }
 
     def resolve(self, session_id, now_ts, touch=True):
@@ -124,6 +183,7 @@ class SessionRepository(object):
                 "principal_id": row["principal_id"],
                 "created_at": row["created_at"],
                 "expires_at": row["absolute_expires_at"],
+                "idle_ttl_seconds": self.idle_ttl_seconds,
             }
 
     def csrf_matches(self, session_id, csrf_token):

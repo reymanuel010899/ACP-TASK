@@ -114,7 +114,9 @@ def test_bot_policy_decision_is_versioned_deterministic_and_allows_read_write(
         (lambda live, binding: live.update(connection_id="conn:other"), "connection_mismatch"),
         (lambda live, binding: live.update(credential_version=8), "credential_mismatch"),
         (lambda live, binding: live.update(granted_scopes=[]), "missing_required_scopes"),
-        (lambda live, binding: live.update(authority_profile="user"), "unsupported_authority_profile"),
+        # Live authority drifting away from the binding is a mismatch, not
+        # an unsupported profile: the binding still says bot.
+        (lambda live, binding: live.update(authority_profile="user"), "authority_profile_mismatch"),
         (lambda live, binding: binding.update(slack_connect=True), "slack_connect_denied"),
         (lambda live, binding: binding.update(data_egress=True), "data_egress_denied"),
     ],
@@ -264,3 +266,104 @@ def test_broker_recomputes_dynamic_policy_and_blocks_toctou_before_provider(
     assert response["error"] == "dynamic policy decision is stale or denied"
     assert vault.calls == 0
     assert executor.calls == 0
+
+
+def _personal(definition, **overrides):
+    binding, _payload = _binding(definition)
+    live = _connection(definition)
+    for target in (binding, live, binding["connection_snapshot"]):
+        target["authority_profile"] = "user"
+    binding.update({
+        "authority_profile_id": "authority:1",
+        "slack_subject_id": "U1",
+        "authority_authorization": {
+            "allowed": True, "reason": "requester_is_subject",
+            "authority_profile_id": "authority:1",
+        },
+    })
+    binding.update(overrides)
+    return binding, live
+
+
+def test_a_user_token_dispatch_carries_proof_of_whose_token_it_is():
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition)
+
+    decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )
+
+    assert decision["allowed"] is True
+    assert decision["reason"] == "allowed"
+
+
+def test_a_delegated_user_token_is_also_accepted():
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition, authority_authorization={
+        "allowed": True, "reason": "delegated",
+        "authority_profile_id": "authority:1",
+    })
+
+    assert PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )["allowed"] is True
+
+
+@pytest.mark.parametrize("overrides,reason", [
+    ({"authority_profile_id": None}, "personal_authority_unbound"),
+    ({"slack_subject_id": None}, "personal_authority_unbound"),
+    ({"authority_authorization": None}, "personal_authority_unproven"),
+    ({"authority_authorization": {
+        "allowed": True, "reason": "requester_is_subject",
+        "authority_profile_id": "authority:other",
+    }}, "personal_authority_mismatch"),
+    ({"authority_authorization": {
+        "allowed": False, "reason": "delegation_absent",
+        "authority_profile_id": "authority:1",
+    }}, "personal_authority_denied"),
+    ({"authority_authorization": {
+        "allowed": True, "reason": "authority_profile_disabled",
+        "authority_profile_id": "authority:1",
+    }}, "personal_authority_denied"),
+])
+def test_an_unproven_personal_authority_never_reaches_slack(overrides, reason):
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition, **overrides)
+
+    decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )
+
+    assert decision["allowed"] is False
+    assert decision["reason"] == reason
+
+
+def test_enterprise_authority_is_refused_at_the_boundary():
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition)
+    for target in (binding, live, binding["connection_snapshot"]):
+        target["authority_profile"] = "enterprise_admin"
+
+    decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )
+
+    # No qualified executor and no credential custody exist for admin.*, so
+    # the refusal is named here rather than failing somewhere less visible.
+    assert decision["allowed"] is False
+    assert decision["reason"] == "enterprise_authority_unavailable"
+
+
+def test_the_subject_is_covered_by_the_policy_hash():
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition)
+    evaluator = PolicyEvaluator(slack_definitions(), ROLLOUT)
+
+    original = evaluator.evaluate(binding, live, NOW)
+    swapped = evaluator.evaluate(
+        dict(binding, slack_subject_id="U-someone-else"), live, NOW,
+    )
+
+    # Swapping whose token it acts as must change the decision, or an approval
+    # for one person would authorise a dispatch as another.
+    assert original["input_hash"] != swapped["input_hash"]
