@@ -269,6 +269,7 @@ def test_broker_recomputes_dynamic_policy_and_blocks_toctou_before_provider(
 
 
 def _personal(definition, **overrides):
+    """Build a dispatch acting as a person, for a capability that needs one."""
     binding, _payload = _binding(definition)
     live = _connection(definition)
     for target in (binding, live, binding["connection_snapshot"]):
@@ -286,7 +287,7 @@ def _personal(definition, **overrides):
 
 
 def test_a_user_token_dispatch_carries_proof_of_whose_token_it_is():
-    definition = _definition("slack.channels.list")
+    definition = _definition("slack.search.messages")
     binding, live = _personal(definition)
 
     decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
@@ -298,7 +299,7 @@ def test_a_user_token_dispatch_carries_proof_of_whose_token_it_is():
 
 
 def test_a_delegated_user_token_is_also_accepted():
-    definition = _definition("slack.channels.list")
+    definition = _definition("slack.search.messages")
     binding, live = _personal(definition, authority_authorization={
         "allowed": True, "reason": "delegated",
         "authority_profile_id": "authority:1",
@@ -327,7 +328,7 @@ def test_a_delegated_user_token_is_also_accepted():
     }}, "personal_authority_denied"),
 ])
 def test_an_unproven_personal_authority_never_reaches_slack(overrides, reason):
-    definition = _definition("slack.channels.list")
+    definition = _definition("slack.search.messages")
     binding, live = _personal(definition, **overrides)
 
     decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
@@ -339,7 +340,7 @@ def test_an_unproven_personal_authority_never_reaches_slack(overrides, reason):
 
 
 def test_enterprise_authority_is_refused_at_the_boundary():
-    definition = _definition("slack.channels.list")
+    definition = _definition("slack.search.messages")
     binding, live = _personal(definition)
     for target in (binding, live, binding["connection_snapshot"]):
         target["authority_profile"] = "enterprise_admin"
@@ -355,7 +356,7 @@ def test_enterprise_authority_is_refused_at_the_boundary():
 
 
 def test_the_subject_is_covered_by_the_policy_hash():
-    definition = _definition("slack.channels.list")
+    definition = _definition("slack.search.messages")
     binding, live = _personal(definition)
     evaluator = PolicyEvaluator(slack_definitions(), ROLLOUT)
 
@@ -367,3 +368,30 @@ def test_the_subject_is_covered_by_the_policy_hash():
     # Swapping whose token it acts as must change the decision, or an approval
     # for one person would authorise a dispatch as another.
     assert original["input_hash"] != swapped["input_hash"]
+
+
+def test_a_bot_capability_cannot_be_run_as_a_person():
+    definition = _definition("slack.channels.list")
+    binding, live = _personal(definition)
+
+    decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )
+
+    # Listing channels is the installation's job. Running it as a person
+    # would answer a differently-scoped question than the descriptor promises.
+    assert decision["allowed"] is False
+    assert decision["reason"] == "authority_profile_not_permitted"
+
+
+def test_a_personal_capability_cannot_be_run_as_the_bot():
+    definition = _definition("slack.search.messages")
+    binding, _payload = _binding(definition)
+    live = _connection(definition)
+
+    decision = PolicyEvaluator(slack_definitions(), ROLLOUT).evaluate(
+        binding, live, NOW,
+    )
+
+    assert decision["allowed"] is False
+    assert decision["reason"] == "authority_profile_not_permitted"

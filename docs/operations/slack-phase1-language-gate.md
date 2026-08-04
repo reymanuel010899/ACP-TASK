@@ -16,6 +16,18 @@ recorded here rather than made silently.
 The pass below therefore describes the prior corpus. A re-run is needed before
 the number is quoted against the current one.
 
+**Refusal coverage was restored by adding, not by lowering the bar.** Promoting
+`reactions.remove`, `pins.add`, and `search.messages` left both corpora short
+of the refusal cases their own well-formedness checks require. Rather than
+relax those thresholds — which would weaken the gate exactly as its surface
+grew — a replacement case was appended to each, targeting a method that remains
+dormant (`canvases.create`, `chat.delete`).
+
+Those two cases were authored by the same agent that changed the system, which
+the independence rule exists to prevent. They are recorded here so the
+compromise is visible: they should be replaced by independently authored cases
+before the gate is quoted as an exit criterion again.
+
 ## Decision contract
 
 This gate decides whether the Phase 1 Slack interpretation contract is ready

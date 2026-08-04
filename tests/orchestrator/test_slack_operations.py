@@ -80,7 +80,8 @@ def test_v1_manifest_is_exact_and_separates_conversation_from_authority():
     assert "bookmarks.add" not in future
     assert future["bookmarks.edit"] == "planned"
     assert future["conversations.create"] == "planned"
-    assert future["search.messages"] == "planned"
+    # Promoted by U6 slice B: search runs, but only as a user profile.
+    assert "search.messages" not in future
     assert future["files.getUploadURLExternal"] == "dormant"
     assert future["canvases.create"] == "dormant"
     assert future["chat.delete"] == "dormant"

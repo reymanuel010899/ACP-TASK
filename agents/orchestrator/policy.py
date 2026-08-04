@@ -146,6 +146,10 @@ class PolicyEvaluator(object):
             return "enterprise_authority_unavailable"
         if profile not in ("bot", "user"):
             return "unsupported_authority_profile"
+        # The descriptor decides which authority its executor needs. A search
+        # answered with a bot token is a different answer, not a lesser one.
+        if definition.authority_profile != profile:
+            return "authority_profile_not_permitted"
         if profile == "user":
             personal = self._personal_authority_reason(binding)
             if personal is not None:

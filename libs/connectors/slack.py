@@ -186,6 +186,7 @@ class SlackActionExecutor:
             "slack.private_channels.list": self._list_private_channels,
             "slack.private_conversation.read": self._read_conversation,
             "slack.private_thread.read": self._read_thread,
+            "slack.search.messages": self._search_messages,
         }
         handler = routes.get(capability_id)
         if handler is None:
@@ -270,6 +271,42 @@ class SlackActionExecutor:
         _copy_page_params(payload, params, ("oldest", "latest", "cursor"))
         data = self._api("conversations.replies", context, params=params)
         return _page(_filtered_messages(data.get("messages", [])), "messages", data)
+
+    def _search_messages(self, payload, context):
+        """Search as the consenting user, never as the installation.
+
+        search.messages returns what one person can see. Running it with a bot
+        token would answer a different question than the one asked, so the
+        connector refuses unless the broker handed it user authority.
+        """
+        if context.get("authority_profile") != "user":
+            raise SlackAPIError(
+                "search.messages", "user_authority_required", "permission"
+            )
+        params = {
+            "query": _required_str(payload, "query"),
+            "count": min(int(payload.get("limit", 20)), 100),
+        }
+        _copy_page_params(payload, params, ("cursor",))
+        data = self._api("search.messages", context, params=params)
+        block = data.get("messages") if isinstance(
+            data.get("messages"), dict
+        ) else {}
+        matches = []
+        for match in block.get("matches", []) or []:
+            if not isinstance(match, dict) or not match.get("ts"):
+                continue
+            channel = match.get("channel") if isinstance(
+                match.get("channel"), dict
+            ) else {}
+            matches.append({
+                "ts": match.get("ts"),
+                "text": match.get("text", ""),
+                "user": match.get("user"),
+                "thread_ts": match.get("thread_ts"),
+                "channel_id": channel.get("id"),
+            })
+        return _page(matches, "messages", data)
 
     def _list_users(self, payload, context):
         params = {"limit": min(int(payload.get("limit", 100)), 200)}

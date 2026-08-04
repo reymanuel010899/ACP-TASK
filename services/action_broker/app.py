@@ -378,6 +378,12 @@ class ActionBroker(object):
                     "connection_id": binding.get("connection_id"),
                     "team_id": binding.get("team_id"),
                     "bot_user_id": binding.get("bot_user_id"),
+                    # Executors that act as a person need to know they were
+                    # handed personal authority, not the installation's.
+                    "authority_profile": binding.get(
+                        "authority_profile", "bot"
+                    ),
+                    "slack_subject_id": binding.get("slack_subject_id"),
                 }
                 if side_effecting:
                     if proposal is None or not self.actions.mark_dispatched(

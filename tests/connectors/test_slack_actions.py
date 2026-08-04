@@ -430,3 +430,52 @@ def test_a_bookmark_without_a_provider_id_is_not_a_receipt():
         }, context())
 
     assert failure.value.code == "missing_bookmark_id"
+
+
+def _user_context():
+    return dict(context(), authority_profile="user", slack_subject_id="U1")
+
+
+def test_search_runs_as_the_person_and_returns_their_matches():
+    http = FakeHTTP([Response(payload={"ok": True, "messages": {"matches": [
+        {"ts": "10.1", "text": "presupuesto aprobado", "user": "U1",
+         "channel": {"id": "C1", "name": "finanzas"}},
+        {"ts": "10.2", "text": "sin ts valido", "user": "U2"},
+    ]}})])
+    executor = SlackActionExecutor(http=http)
+
+    result = executor.read("slack.search.messages", {
+        "query": "presupuesto", "limit": 20,
+    }, _user_context())
+
+    _method, url, kwargs = http.calls[0]
+    assert url.endswith("/search.messages")
+    assert kwargs["params"]["query"] == "presupuesto"
+    assert [m["ts"] for m in result["messages"]] == ["10.1", "10.2"]
+    assert result["messages"][0]["channel_id"] == "C1"
+
+
+def test_search_refuses_to_run_as_the_installation():
+    http = FakeHTTP([])
+    executor = SlackActionExecutor(http=http)
+
+    with pytest.raises(SlackAPIError) as failure:
+        executor.read("slack.search.messages", {"query": "presupuesto"},
+                      context())
+
+    # A bot token would answer a differently-scoped question, so the refusal
+    # happens before any provider call.
+    assert failure.value.code == "user_authority_required"
+    assert failure.value.category == "permission"
+    assert http.calls == []
+
+
+def test_search_declares_user_authority_in_the_catalog():
+    from libs.integrations.catalog import slack_definitions
+
+    definition = next(item for item in slack_definitions()
+                      if item.capability_id == "slack.search.messages")
+
+    assert definition.authority_profile == "user"
+    assert definition.required_scopes == frozenset({"search:read"})
+    assert definition.effect == "read"

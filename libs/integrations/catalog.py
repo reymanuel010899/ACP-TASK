@@ -26,6 +26,10 @@ class TrustedCapabilityDefinition:
     retry_policy: str
     preview_fields: Tuple[str, ...]
     verifier: Optional[str]
+    #: Which authority a dispatch must act as. Declared here so the catalog
+    #: stays the single source of truth, rather than a second copy that can
+    #: drift the way the install scope list already did.
+    authority_profile: str = "bot"
 
     def __post_init__(self):
         if not self.capability_id or "." not in self.capability_id:
@@ -34,6 +38,8 @@ class TrustedCapabilityDefinition:
             raise ValueError("effect must be read or write")
         if self.effect == "write" and not self.preview_fields:
             raise ValueError("write capabilities require preview fields")
+        if self.authority_profile not in ("bot", "user", "enterprise_admin"):
+            raise ValueError("unsupported authority profile")
 
 
 @dataclass(frozen=True)
@@ -207,6 +213,11 @@ def google_definitions():
 #: converges on the same result, so an ambiguous dispatch can simply retry
 #: instead of demanding reconciliation. Sending a message is not here: a
 #: repeat posts twice.
+#: Capabilities that act as a person rather than as the installation. Slack's
+#: message search reads what one user can see, so a bot token cannot stand in
+#: for it without silently widening or narrowing the result.
+USER_AUTHORITY_CAPABILITIES = frozenset({"slack.search.messages"})
+
 IDEMPOTENT_WRITES = frozenset({
     "slack.reaction.add", "slack.reaction.remove",
     "slack.message.pin", "slack.message.unpin",
@@ -237,6 +248,7 @@ def slack_definitions():
         "slack.message.pin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
         "slack.message.unpin": ("pins:write", "write", ("channel_id", "message_ts"), "slack.pin"),
         "slack.bookmark.add": ("bookmarks:write", "write", ("channel_id", "title", "link"), "slack.bookmark"),
+        "slack.search.messages": ("search:read", "read", (), None),
         "slack.file.upload": ("files:write", "write", ("channel_id", "filename", "content_hash"), "slack.file"),
     }
     schemas = {
@@ -256,6 +268,7 @@ def slack_definitions():
         "slack.message.pin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.message.unpin": {"type": "object", "required": ["channel_id", "message_ts"], "properties": {"channel_id": {"type": "string"}, "message_ts": {"type": "string"}}, "additionalProperties": False},
         "slack.bookmark.add": {"type": "object", "required": ["channel_id", "title", "link"], "properties": {"channel_id": {"type": "string"}, "title": {"type": "string", "minLength": 1, "maxLength": 250}, "link": {"type": "string", "pattern": "^https://"}}, "additionalProperties": False},
+        "slack.search.messages": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 500}, "cursor": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "additionalProperties": False},
         "slack.file.upload": {"type": "object", "required": ["channel_id", "filename", "content_hash"], "properties": {"channel_id": {"type": "string"}, "filename": {"type": "string"}, "content_hash": {"type": "string"}, "content": {"type": "string"}}, "additionalProperties": False},
     }
     nullable_string = {"type": ["string", "null"]}
@@ -329,6 +342,7 @@ def slack_definitions():
         "slack.thread.read": page_output("messages", message),
         "slack.private_thread.read": page_output("messages", message),
         "slack.users.list": page_output("users", user),
+        "slack.search.messages": page_output("messages", message),
         "slack.message.permalink": {
             "type": "object",
             "required": ["channel_id", "message_ts", "permalink"],
@@ -400,4 +414,7 @@ def slack_definitions():
         retry_policy=capability_retry_policy(capability_id, effect),
         preview_fields=preview,
         verifier=verifier,
+        authority_profile=(
+            "user" if capability_id in USER_AUTHORITY_CAPABILITIES else "bot"
+        ),
     ) for capability_id, (scope, effect, preview, verifier) in matrix.items())

@@ -413,6 +413,29 @@
       "prerequisites": ["connected_installation", "channel_membership"],
       "recovery": {"missing_slot": "clarify_channel_or_link", "unavailable": "explain_channel_access"},
       "presentation": {"kind": "exact_effect_preview", "label": "Add bookmark"}
+    },
+    {
+      "operation_id": "slack.search.messages",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": ["search messages", "search slack", "busca en slack", "buscar mensajes", "busca mensajes", "encuentra mensajes"],
+      "slots": [
+        {"name": "query", "entity_kind": "slack.text", "required": true}
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "search_messages",
+          "capability_id": "slack.search.messages",
+          "capability_version": "1.0.0",
+          "input_bindings": {"query": "query"},
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "user",
+      "family_flag": "slack_search",
+      "prerequisites": ["connected_installation", "separate_user_authority_profile"],
+      "recovery": {"missing_slot": "clarify_query", "unavailable": "explain_user_authority_required"},
+      "presentation": {"kind": "grounded_answer", "label": "Search messages"}
     }
   ],
   "method_coverage": {
@@ -436,7 +459,7 @@
       {"method": "conversations.create", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
       {"method": "conversations.rename", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
       {"method": "conversations.archive", "family": "channel_management", "state": "planned", "prerequisites": ["incremental_bot_authority", "reinforced_approval"]},
-      {"method": "search.messages", "family": "search", "state": "planned", "prerequisites": ["separate_user_authority_profile", "search_product_eligibility"]},
+      {"method": "search.messages", "family": "search", "state": "runtime", "prerequisites": ["separate_user_authority_profile", "search_product_eligibility"]},
       {"method": "files.getUploadURLExternal", "family": "files", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "exact_effect_descriptor"]},
       {"method": "files.completeUploadExternal", "family": "files", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "exact_effect_descriptor"]},
       {"method": "canvases.create", "family": "canvases", "state": "dormant", "prerequisites": ["quarantined_artifact_backend", "product_availability", "exact_effect_descriptor"]},
