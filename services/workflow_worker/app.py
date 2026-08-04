@@ -70,7 +70,24 @@ class WorkflowWorker:
                 })
         self._drain_outbox(now)
         self._resume_slack_resolver_runs(now)
+        self._resume_slack_reads(now)
         return outcomes
+
+    def _resume_slack_reads(self, now):
+        """Fetch the next page of a read still inside its budget."""
+        resolver = self.conversation_resolver
+        if resolver is None or not hasattr(
+            self.workflows, "list_paging_slack_reads"
+        ):
+            return 0
+        resumed = 0
+        for conversation in self.workflows.list_paging_slack_reads(now):
+            try:
+                if resolver.continue_slack_read(conversation, now):
+                    resumed += 1
+            except Exception:
+                continue
+        return resumed
 
     def _resume_slack_resolver_runs(self, now):
         """Page durable resolver runs forward after completion or restart."""

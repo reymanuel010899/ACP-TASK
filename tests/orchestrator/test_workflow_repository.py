@@ -967,3 +967,85 @@ def test_read_evidence_names_authors_when_the_directory_is_present(tmp_path):
     assert "U9 (" in named["answer"]
     assert "U1 (" in anonymous["answer"]
     assert named["citations"][0]["author_id"] == "U1"
+
+
+def _page(messages, cursor=None):
+    return {"messages": messages, "next_cursor": cursor}
+
+
+def test_a_read_accumulates_pages_until_the_cursor_runs_out(tmp_path):
+    repository = _repository(tmp_path)
+    step_input = {"channel_id": "C1"}
+
+    first = repository._accumulate_slack_read_page(
+        {}, _page([{"ts": "1", "user": "U1", "text": "uno"}], "p2"), step_input,
+    )
+    second = repository._accumulate_slack_read_page(
+        {"read_progress": first["state"]},
+        _page([{"ts": "2", "user": "U1", "text": "dos"}], None), step_input,
+    )
+
+    assert first["continues"] is True
+    assert first["state"]["cursor"] == "p2"
+    assert first["state"]["pages"] == 1
+    assert second["continues"] is False
+    assert second["budget_exhausted"] is False
+    assert [m["ts"] for m in second["messages"]] == ["1", "2"]
+    assert second["state"]["pages"] == 2
+
+
+def test_a_read_stops_at_its_page_budget_and_says_it_is_partial(tmp_path):
+    repository = _repository(tmp_path)
+    step_input = {"channel_id": "C1"}
+    state, result = {}, None
+
+    for index in range(repository.READ_PAGE_BUDGET):
+        result = repository._accumulate_slack_read_page(
+            state, _page([{"ts": str(index), "user": "U1", "text": "x"}], "next"),
+            step_input,
+        )
+        state = {"read_progress": result["state"]}
+
+    assert result["state"]["pages"] == repository.READ_PAGE_BUDGET
+    assert result["continues"] is False
+    assert result["budget_exhausted"] is True
+    assert result["state"]["cursor"] == "next"
+
+
+def test_a_read_never_accumulates_beyond_its_message_budget(tmp_path):
+    repository = _repository(tmp_path)
+    flood = [{"ts": str(i), "user": "U1", "text": "x"}
+             for i in range(repository.READ_MESSAGE_BUDGET + 50)]
+
+    result = repository._accumulate_slack_read_page(
+        {}, _page(flood, "next"), {"channel_id": "C1"},
+    )
+
+    assert len(result["messages"]) == repository.READ_MESSAGE_BUDGET
+    assert result["budget_exhausted"] is True
+    assert result["continues"] is False
+
+
+def test_paging_reads_are_listed_only_while_a_page_is_owed(tmp_path):
+    repository = _repository(tmp_path)
+    conversation = repository.create_conversation(
+        "org:acme", "user:alice", 10, ttl_seconds=600,
+    )
+    conversation_id = conversation["conversation_id"]
+
+    def progress(**changes):
+        repository.update_conversation(
+            conversation_id, "org:acme", "user:alice",
+            {"status": "retrieving", "read_progress": changes}, 11,
+        )
+
+    progress(cursor="p2", pages=1)
+    owed = repository.list_paging_slack_reads(12)
+    progress(cursor="p2", pages=1, dispatched="p2")
+    dispatched = repository.list_paging_slack_reads(12)
+    progress(cursor=None, pages=2)
+    finished = repository.list_paging_slack_reads(12)
+
+    assert [item["conversation_id"] for item in owed] == [conversation_id]
+    assert dispatched == []
+    assert finished == []

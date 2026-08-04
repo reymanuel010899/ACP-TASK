@@ -315,7 +315,8 @@ class DynamicWorkflowService:
         "slack.users.list": 200,
     }
 
-    def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved):
+    def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved,
+                             cursor=None):
         """Compile the read workflow deterministically.
 
         The operation and its slots are already grounded by this point, so
@@ -351,6 +352,8 @@ class DynamicWorkflowService:
             )
         now = int(self.clock())
         payload = self._slack_read_input(capability_id, resolved, thread, now)
+        if cursor and "cursor" in (definition.input_schema.get("properties") or {}):
+            payload = dict(payload, cursor=cursor)
         steps = [{
             "step_id": "slack-read-%s" % operation,
             "capability_id": capability_id,
@@ -413,6 +416,36 @@ class DynamicWorkflowService:
                 )
             )
         return decision
+
+    def continue_slack_read(self, conversation, now=None):
+        """Dispatch the next read page for a turn still inside its budget."""
+        progress = (conversation or {}).get("read_progress") or {}
+        cursor = progress.get("cursor")
+        if not cursor or conversation.get("status") != "retrieving":
+            return False
+        if progress.get("dispatched") == cursor:
+            return False
+        operation = conversation.get("operation")
+        if operation not in self.READ_CAPABILITIES:
+            return False
+        resolved = {
+            key: conversation.get(key) for key in (
+                "active_connection", "active_channel", "active_thread",
+                "read_period",
+            ) if conversation.get(key) is not None
+        }
+        run, revision = self._dispatch_slack_read(
+            conversation["tenant_id"], conversation["principal_id"], operation,
+            resolved, cursor=cursor,
+        )
+        self.conversation_store.update(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"], status="retrieving",
+            read_progress=dict(progress, dispatched=cursor),
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
 
     def _slack_directory_step(self, capability_id, connection_id, connection):
         """Fetch the member directory alongside a message read.

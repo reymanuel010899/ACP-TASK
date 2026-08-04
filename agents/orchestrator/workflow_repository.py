@@ -22,8 +22,10 @@ class WorkflowRepository(object):
         "active_file", "active_reaction", "read_period", "pending_draft",
         "effect_candidates", "known_inputs", "slot_state", "corrections",
         "dependencies", "blockers", "entity_refs", "blocking_need",
-        "resolution_request",
+        "resolution_request", "read_progress",
     })
+    READ_PAGE_BUDGET = 5
+    READ_MESSAGE_BUDGET = 500
     SLACK_ENTITY_FIELDS = {
         "workspace": frozenset({"id", "name", "domain"}),
         "channel": frozenset({
@@ -1946,6 +1948,64 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
+    def list_paging_slack_reads(self, now_ts, limit=50):
+        """Return live turns whose read has a page left to fetch."""
+        now_ts = int(now_ts)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT conversation_id, tenant_id, principal_id
+                   FROM concierge_conversations
+                   WHERE status = 'retrieving'
+                     AND status NOT IN ('closed', 'expired')
+                     AND expires_at >= ?
+                   ORDER BY updated_at ASC LIMIT ?""",
+                (now_ts, int(limit)),
+            ).fetchall()
+        paging = []
+        for row in rows:
+            conversation = self.get_conversation(
+                row["conversation_id"], row["tenant_id"], row["principal_id"],
+                now_ts,
+            )
+            progress = (conversation or {}).get("read_progress") or {}
+            if progress.get("cursor") and progress.get("dispatched") != progress[
+                "cursor"
+            ]:
+                paging.append(conversation)
+        return paging
+
+    def _accumulate_slack_read_page(self, conversation, output, step_input):
+        """Fold one page into the run and decide whether another is due.
+
+        A single page is not an answer to "what was said this week"; it is the
+        first hundred messages Slack happened to return. Pages accumulate until
+        the cursor runs out or a budget stops them, and the budget stop is
+        reported as partial rather than presented as complete.
+        """
+        prior = (conversation or {}).get("read_progress") or {}
+        messages = list(prior.get("messages") or [])
+        for message in (output.get("messages") or []):
+            if isinstance(message, dict) and message.get("ts"):
+                messages.append(message)
+        pages = int(prior.get("pages") or 0) + 1
+        cursor = output.get("next_cursor") or (
+            output.get("response_metadata") or {}
+        ).get("next_cursor") or None
+        budget_exhausted = (
+            pages >= self.READ_PAGE_BUDGET
+            or len(messages) >= self.READ_MESSAGE_BUDGET
+        )
+        messages = messages[:self.READ_MESSAGE_BUDGET]
+        state = {
+            "pages": pages, "cursor": cursor, "messages": messages,
+            "channel_id": step_input.get("channel_id"),
+        }
+        return {
+            "state": state, "messages": messages,
+            "budget_exhausted": bool(budget_exhausted and cursor),
+            "continues": bool(cursor) and not budget_exhausted,
+        }
+
     @staticmethod
     def _slack_author_labels(directory):
         """Map ids to a display name only; no email, title, or phone."""
@@ -2549,11 +2609,28 @@ class WorkflowRepository(object):
                 for step in revision["steps"]
                 if (step.get("output") or {}).get("users") is not None
             ), None)
+            step_input = (read_step or {}).get("input") or {}
+            progress = self._accumulate_slack_read_page(
+                current, evidence, step_input,
+            )
+            if progress["continues"]:
+                # More pages remain inside budget: keep the turn retrieving so
+                # the worker fetches the next one, and do not present a partial
+                # answer as if it were the whole one.
+                self.update_conversation(
+                    row["conversation_id"], tenant_id, row["principal_id"],
+                    {"status": "retrieving", "read_progress": progress["state"]},
+                    now_ts,
+                )
+                return True
+            changes["read_progress"] = None
             self.store_conversation_presentation(
                 row["conversation_id"], tenant_id, row["principal_id"],
                 self._present_slack_evidence(
-                    evidence, (read_step or {}).get("input") or {},
-                    (current or {}).get("locale", "es"), directory,
+                    {"messages": progress["messages"],
+                     "next_cursor": progress["state"]["cursor"],
+                     "partial": progress["budget_exhausted"]},
+                    step_input, (current or {}).get("locale", "es"), directory,
                 ), now_ts,
             )
         if status == "complete" and effects == {"write"}:
