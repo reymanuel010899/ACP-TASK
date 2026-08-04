@@ -22,7 +22,7 @@ class WorkflowRepository(object):
         "active_file", "active_reaction", "read_period", "pending_draft",
         "effect_candidates", "known_inputs", "slot_state", "corrections",
         "dependencies", "blockers", "entity_refs", "blocking_need",
-        "resolution_request", "read_progress",
+        "resolution_request", "read_progress", "effect_group",
     })
     READ_PAGE_BUDGET = 5
     READ_MESSAGE_BUDGET = 500

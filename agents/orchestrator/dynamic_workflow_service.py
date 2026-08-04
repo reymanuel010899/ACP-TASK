@@ -4,6 +4,11 @@ import hashlib
 import json
 import time
 
+from agents.orchestrator.compound import (
+    apply_effect_decision,
+    build_effect_group,
+    group_outcome,
+)
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
 from agents.orchestrator.slack_conversation import SlackConversationCoordinator
 from agents.orchestrator.slack_operations import (
@@ -257,13 +262,9 @@ class DynamicWorkflowService:
         if turn_payload.get("state") != "resolving":
             return turn_payload
         if len(turn_payload.get("compound_operations") or ()) > 1:
-            return {
-                "state": "retryable_failure", "conversation_id": conversation_id,
-                "error": {"code": "compound_execution_unavailable"},
-                "recovery": {"action": "wait_for_compound_rollout"},
-                "compound_operations": turn_payload["compound_operations"],
-                "dependencies": turn_payload.get("dependencies") or [],
-            }
+            return self._offer_compound_effects(
+                conversation_id, tenant_id, principal_id, turn_payload,
+            )
         resolved = turn_payload.get("resolved") or {}
         operation = turn.get("operation")
         if operation in {"post", "reply", "dm"}:
@@ -573,6 +574,47 @@ class DynamicWorkflowService:
         if capability_id == "slack.thread.read":
             payload["thread_ts"] = thread["thread_ts"]
         return payload
+
+    def _offer_compound_effects(self, conversation_id, tenant_id, principal_id,
+                                turn_payload):
+        """Offer a compound request as effects that can be answered one by one.
+
+        Refusing compound requests outright was the old behaviour, and it sent
+        people back to chaining turns — which the Phase 1 comparison measured
+        completing a quarter of the time. Each effect is now previewed and
+        approved on its own, and no approval carries another.
+        """
+        group = build_effect_group(
+            conversation_id, turn_payload["compound_operations"],
+            turn_payload.get("resolved") or {},
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="awaiting_approval", effect_group=group,
+            dependencies=turn_payload.get("dependencies") or [],
+        )
+        return {
+            "state": "awaiting_approval", "conversation_id": conversation_id,
+            "effect_group": group,
+        }
+
+    def decide_compound_effect(self, conversation_id, tenant_id, principal_id,
+                               effect_id, decision):
+        """Answer exactly one effect of a group."""
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        group = (conversation or {}).get("effect_group")
+        if not group:
+            raise KeyError("conversation has no effect group")
+        updated = apply_effect_decision(group, effect_id, decision)
+        outcome = group_outcome(updated)
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            effect_group=updated,
+            status="ready" if outcome["terminal"] else "awaiting_approval",
+        )
+        return {"effect_group": updated, "outcome": outcome}
 
     def _start_slack_entity_resolution(self, conversation_id, tenant_id,
                                        principal_id, text, turn, field, query):

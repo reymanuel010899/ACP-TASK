@@ -286,7 +286,7 @@ def test_policy_hidden_operation_is_not_projected_and_has_named_recovery(tmp_pat
     assert result["recovery"]["action"] == "contact_admin"
 
 
-def test_compound_proposal_keeps_dependencies_without_partial_execution(tmp_path):
+def test_a_compound_request_is_offered_as_effects_not_refused(tmp_path):
     proposal = SlackInterpretation(
         operations=[
             SlackOperationCandidate(operation_id="slack.conversation.read", confidence=0.9),
@@ -323,7 +323,18 @@ def test_compound_proposal_keeps_dependencies_without_partial_execution(tmp_path
         "slack.conversation.read", "slack.message.send",
     ]
     assert turn["dependencies"] == [{"operation_index": 1, "depends_on_index": 0}]
-    assert result["error"]["code"] == "compound_execution_unavailable"
+
+    # A compound request is now offered as effects that can be answered one by
+    # one, rather than refused outright.
+    group = result["effect_group"]
+    assert [item["capability_id"] for item in group["effects"]] == [
+        "slack.conversation.read", "slack.message.send",
+    ]
+    # The write is derived from the read, so it cannot be approved against
+    # content nobody has seen yet.
+    assert group["effects"][1]["status"] == "blocked"
+    assert group["effects"][1]["depends_on"] == [group["effects"][0]["effect_id"]]
+    # Offering is not executing: nothing runs before anyone approves.
     assert repository.list_runnable_revisions() == []
 
 

@@ -836,6 +836,44 @@ it needs `action_repository.py`, which was also being changed concurrently.
 
 ### U7. Preserve compound plans and unify the conversational UI
 
+**Progress (2026-08-04). Both slices built.**
+
+Slice A — server-authoritative projection. Written contract-first: six failing
+end-to-end tests, then the projection. A snapshot carries `stateVersion`,
+`terminal`, `allowedActions`, and `projectionLag`, so the client renders what
+the server will accept rather than inferring it, refuses to regress to a stale
+poll, and can say it is catching up instead of presenting stale state as
+settled.
+
+Slice B — compound effect groups, funded by the Phase 1 comparison (composed
+4/4 versus chained 1/4; evidence in `docs/operations/slack-phase1-baseline.md`).
+Compound requests were previously refused outright with
+`compound_execution_unavailable`, which sent people back to chaining turns —
+the path that completes a quarter of the time. Now:
+
+- Reads order before writes, and a write derived from a read is created
+  `blocked`, so nothing is approved against content nobody has seen.
+- Each effect is decided on its own; approving one never authorises another,
+  and rejecting one leaves the rest answerable.
+- Correcting an effect returns only that effect to unapproved, because the
+  approval it held was given for content that no longer stands.
+- A mixed outcome reports "1 of 2 completed" with no aggregate verdict. The
+  group never promised atomicity and the report does not invent one.
+- `EffectGroupCard` renders one row per effect, opens details by default only
+  where approval is reinforced, announces the summary only when it changes,
+  and restores focus to the last-interacted control after a server re-render.
+
+**Caveat on the gate.** Composition won partly by walkover: three of four
+chained jobs died in `needs_input` because slots do not carry reliably across
+turns. Funding this slice does not remove the need to fix multi-turn slot
+carrying, which is the path anyone takes who cannot state a complete request
+in one sentence.
+
+**Not yet done:** dispatching an approved group through the broker, and the
+accessibility sweep the unit lists (axe checks, reduced motion, keyboard
+integration tests for asynchronous updates).
+
+
 **Goal:** Execute broad and composed Slack requests as one coherent server-authoritative conversation with exact effect groups, corrections, progress, and partial outcomes.
 
 **Requirements:** R1-R8, R12, R15-R20, R22, R24-R25.
