@@ -1049,3 +1049,79 @@ def test_paging_reads_are_listed_only_while_a_page_is_owed(tmp_path):
     assert [item["conversation_id"] for item in owed] == [conversation_id]
     assert dispatched == []
     assert finished == []
+
+
+def test_a_named_person_filters_the_evidence_to_their_own_messages(tmp_path):
+    repository = _repository(tmp_path)
+    conversation = {"operation": "read", "active_person": {"id": "U1"}}
+    page = _page([
+        {"ts": "1", "user": "U1", "text": "mío"},
+        {"ts": "2", "user": "U2", "text": "de otra persona"},
+        {"ts": "3", "user": "U1", "text": "mío tambien"},
+    ])
+
+    result = repository._accumulate_slack_read_page(
+        conversation, page, {"channel_id": "C1"},
+    )
+
+    assert [m["ts"] for m in result["messages"]] == ["1", "3"]
+    # Budget counts what was examined, so a narrow filter cannot page forever.
+    assert result["state"]["examined"] == 3
+
+
+def test_a_filter_only_applies_when_the_turn_named_a_person(tmp_path):
+    repository = _repository(tmp_path)
+    page = _page([
+        {"ts": "1", "user": "U1", "text": "a"},
+        {"ts": "2", "user": "U2", "text": "b"},
+    ])
+
+    posting = repository._accumulate_slack_read_page(
+        {"operation": "post", "active_person": {"id": "U1"}}, page,
+        {"channel_id": "C1"},
+    )
+    unnamed = repository._accumulate_slack_read_page(
+        {"operation": "read"}, page, {"channel_id": "C1"},
+    )
+
+    assert [m["ts"] for m in posting["messages"]] == ["1", "2"]
+    assert [m["ts"] for m in unnamed["messages"]] == ["1", "2"]
+
+
+def test_thread_replies_stay_distinguishable_from_their_parent(tmp_path):
+    repository = _repository(tmp_path)
+    conversation = {
+        "operation": "read",
+        "active_thread": {"channel_id": "C1", "thread_ts": "100.1"},
+    }
+    page = _page([
+        {"ts": "100.1", "user": "U1", "text": "pregunta", "thread_ts": "100.1"},
+        {"ts": "100.2", "user": "U2", "text": "respuesta", "thread_ts": "100.1"},
+    ])
+
+    result = repository._accumulate_slack_read_page(
+        conversation, page, {"channel_id": "C1", "thread_ts": "100.1"},
+    )
+    presented = repository._present_slack_evidence(
+        {"messages": result["messages"]}, {"channel_id": "C1"}, "es",
+    )
+
+    assert [m["relation"] for m in result["messages"]] == ["parent", "reply"]
+    assert [c["relation"] for c in presented["citations"]] == ["parent", "reply"]
+
+
+def test_a_channel_read_marks_which_messages_started_threads(tmp_path):
+    repository = _repository(tmp_path)
+    page = _page([
+        {"ts": "1", "user": "U1", "text": "suelto"},
+        {"ts": "2", "user": "U1", "text": "abre hilo", "thread_ts": "2"},
+        {"ts": "3", "user": "U2", "text": "en el hilo", "thread_ts": "2"},
+    ])
+
+    result = repository._accumulate_slack_read_page(
+        {"operation": "read"}, page, {"channel_id": "C1"},
+    )
+
+    assert [m["relation"] for m in result["messages"]] == [
+        "message", "thread_parent", "reply",
+    ]

@@ -1948,6 +1948,23 @@ class WorkflowRepository(object):
                 raise
         return dict(self._slack_resolver_run(updated), completed=True)
 
+    @staticmethod
+    def _slack_read_author(conversation):
+        """Filter to one author only when the turn actually named a person."""
+        if (conversation or {}).get("operation") not in {"read", "summarize"}:
+            return None
+        return ((conversation or {}).get("active_person") or {}).get("id")
+
+    @staticmethod
+    def _slack_message_relation(message, thread_ts):
+        """Keep parent and reply distinguishable in the evidence."""
+        own_thread = message.get("thread_ts")
+        if thread_ts:
+            return "parent" if message.get("ts") == thread_ts else "reply"
+        if own_thread and own_thread != message.get("ts"):
+            return "reply"
+        return "thread_parent" if own_thread else "message"
+
     def list_paging_slack_reads(self, now_ts, limit=50):
         """Return live turns whose read has a page left to fetch."""
         now_ts = int(now_ts)
@@ -1984,21 +2001,34 @@ class WorkflowRepository(object):
         """
         prior = (conversation or {}).get("read_progress") or {}
         messages = list(prior.get("messages") or [])
+        author_id = self._slack_read_author(conversation)
+        thread_ts = ((conversation or {}).get("active_thread") or {}).get(
+            "thread_ts"
+        ) or step_input.get("thread_ts")
+        examined = int(prior.get("examined") or 0)
         for message in (output.get("messages") or []):
-            if isinstance(message, dict) and message.get("ts"):
-                messages.append(message)
+            if not isinstance(message, dict) or not message.get("ts"):
+                continue
+            examined += 1
+            if author_id and message.get("user") != author_id:
+                continue
+            messages.append(dict(message, relation=self._slack_message_relation(
+                message, thread_ts,
+            )))
         pages = int(prior.get("pages") or 0) + 1
         cursor = output.get("next_cursor") or (
             output.get("response_metadata") or {}
         ).get("next_cursor") or None
+        # Examined, not kept: a narrow author filter must not be able to page
+        # a whole workspace looking for one more match.
         budget_exhausted = (
             pages >= self.READ_PAGE_BUDGET
-            or len(messages) >= self.READ_MESSAGE_BUDGET
+            or examined >= self.READ_MESSAGE_BUDGET
         )
         messages = messages[:self.READ_MESSAGE_BUDGET]
         state = {
             "pages": pages, "cursor": cursor, "messages": messages,
-            "channel_id": step_input.get("channel_id"),
+            "channel_id": step_input.get("channel_id"), "examined": examined,
         }
         return {
             "state": state, "messages": messages,
@@ -2036,18 +2066,21 @@ class WorkflowRepository(object):
         for message in (output.get("messages") or []):
             if not isinstance(message, dict) or not message.get("ts"):
                 continue
+            relation = message.get("relation") or "message"
             messages.append({
                 "channel_id": channel_id,
                 "message_ts": message.get("ts"),
                 "author_id": message.get("user"),
                 "text": message.get("text", ""),
                 "thread_ts": message.get("thread_ts"),
+                "relation": relation,
             })
             citations.append({
                 "citation_id": "slack:%s:%s" % (channel_id, message["ts"]),
                 "channel_id": channel_id,
                 "message_ts": message["ts"],
                 "author_id": message.get("user"),
+                "relation": relation,
             })
         period = ({"oldest": step_input["oldest"], "latest": step_input["latest"]}
                   if step_input.get("oldest") and step_input.get("latest")
