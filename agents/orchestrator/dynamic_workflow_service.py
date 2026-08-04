@@ -21,7 +21,8 @@ class DynamicWorkflowService:
                  rollout_version="production-v1", shadow_mode=True, clock=None,
                  conversation_store=None, conversational_reads_enabled=True,
                  slack_writes_enabled=True, slack_dms_enabled=True,
-                 slack_policy_visible=None, slack_family_flags=None):
+                 slack_policy_visible=None, slack_family_flags=None,
+                 private_read_authorizer=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -35,6 +36,8 @@ class DynamicWorkflowService:
         self.slack_dms_enabled = bool(slack_dms_enabled)
         self.slack_policy_visible = slack_policy_visible
         self.slack_family_flags = dict(slack_family_flags or {})
+        # Absent an audited tenant grant, private reads stay denied (R21).
+        self.private_read_authorizer = private_read_authorizer
         self.slack_coordinator = SlackConversationCoordinator()
         slack_definitions = tuple(
             item for item in self.definitions if item.provider == "slack"
@@ -308,6 +311,7 @@ class DynamicWorkflowService:
         "slack.conversation.read": 100,
         "slack.thread.read": 100,
         "slack.private_conversation.read": 100,
+        "slack.private_thread.read": 100,
         "slack.users.list": 200,
     }
 
@@ -320,9 +324,11 @@ class DynamicWorkflowService:
         bounded pipeline the only conversational read path.
         """
         thread = resolved.get("active_thread") or {}
-        capability_id = ("slack.thread.read" if thread.get("thread_ts")
-                         and operation in {"read", "summarize"}
-                         else self.READ_CAPABILITIES[operation])
+        private = bool((resolved.get("active_channel") or {}).get("is_private"))
+        if operation in {"read", "summarize"}:
+            capability_id = self._private_read_capability(thread, private)
+        else:
+            capability_id = self.READ_CAPABILITIES[operation]
         connection_id = (resolved.get("active_connection") or {}).get("id")
         connection = next((
             item for item in self._tenant_installations(tenant_id, principal_id)
@@ -337,6 +343,12 @@ class DynamicWorkflowService:
         ):
             required = sorted(definition.required_scopes)[0] if definition else "unknown"
             raise PermissionError("missing_scope:%s" % required)
+        # Scope answers whether this workspace grants the read at all; the
+        # visibility check answers whether this requester may borrow it.
+        if capability_id in self.PRIVATE_READ_CAPABILITIES:
+            self._require_requester_visibility(
+                tenant_id, principal_id, resolved, capability_id,
+            )
         now = int(self.clock())
         payload = self._slack_read_input(capability_id, resolved, thread, now)
         steps = [{
@@ -364,6 +376,43 @@ class DynamicWorkflowService:
             graph_hash, principal_id, now,
         )
         return run, revision
+
+    PRIVATE_READ_CAPABILITIES = frozenset({
+        "slack.private_conversation.read", "slack.private_thread.read",
+        "slack.private_channels.list",
+    })
+
+    @staticmethod
+    def _private_read_capability(thread, private):
+        if thread.get("thread_ts"):
+            return "slack.private_thread.read" if private else "slack.thread.read"
+        return ("slack.private_conversation.read" if private
+                else "slack.conversation.read")
+
+    def _require_requester_visibility(self, tenant_id, principal_id, resolved,
+                                      capability_id):
+        """Deny bot-authorized private reads the requester could not do alone.
+
+        The bot's membership is not the requester's. Without proof that the
+        asking principal is themselves in the private conversation, reading it
+        through bot authority would let any tenant member borrow the bot's
+        access. R21 requires this fail closed, naming both the limitation and
+        the audited override, rather than quietly widening visibility.
+        """
+        authorizer = self.private_read_authorizer
+        if authorizer is None:
+            raise PermissionError(
+                "requester_visibility_unverified:%s" % capability_id
+            )
+        channel = (resolved.get("active_channel") or {}).get("id")
+        decision = authorizer(tenant_id, principal_id, channel, capability_id)
+        if not (decision or {}).get("allowed"):
+            raise PermissionError(
+                "requester_visibility_denied:%s" % (
+                    (decision or {}).get("reason") or "not_a_member"
+                )
+            )
+        return decision
 
     def _slack_directory_step(self, capability_id, connection_id, connection):
         """Fetch the member directory alongside a message read.
@@ -406,6 +455,10 @@ class DynamicWorkflowService:
             raise ValueError("Slack read target is unresolved")
         if capability_id == "slack.private_conversation.read":
             return {"channel_id": channel_id, "limit": limit}
+        if capability_id == "slack.private_thread.read":
+            # The private thread descriptor takes no period; bound it by size.
+            return {"channel_id": channel_id, "limit": limit,
+                    "thread_ts": thread["thread_ts"]}
         period = resolved.get("read_period") or {}
         days = int(period.get("days") or self.DEFAULT_READ_DAYS)
         payload = {

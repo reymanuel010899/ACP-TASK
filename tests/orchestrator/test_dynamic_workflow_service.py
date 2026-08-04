@@ -1046,3 +1046,109 @@ def test_a_read_without_directory_scope_still_compiles(tmp_path):
     assert [step["capability_id"] for step in revision["steps"]] == [
         "slack.conversation.read",
     ]
+
+
+class _PrivateConnections:
+    def list_tenant_installations(self, tenant, provider):
+        return [{"connection_id": "conn:s", "status": "connected",
+                 "credential_version": 1,
+                 "granted_scopes": ["channels:read", "channels:history",
+                                    "groups:read", "groups:history"],
+                 "enabled_capabilities": [
+                     "slack.channels.list", "slack.conversation.read",
+                     "slack.private_channels.list",
+                     "slack.private_conversation.read",
+                     "slack.private_thread.read"]}]
+
+
+def _private_service(tmp_path, name, authorizer=None):
+    repository = WorkflowRepository(str(tmp_path / name))
+    store = ConciergeConversationStore(repository, clock=lambda: 1_000_000)
+    return DynamicWorkflowService(
+        _ExplodingBrain(), slack_definitions(), _PrivateConnections(),
+        repository, conversation_store=store, clock=lambda: 1_000_000,
+        private_read_authorizer=authorizer,
+    )
+
+
+def test_a_private_read_is_denied_without_proof_the_requester_can_see_it(tmp_path):
+    service = _private_service(tmp_path, "private-denied.db")
+
+    with pytest.raises(PermissionError,
+                       match="requester_visibility_unverified"):
+        service._dispatch_slack_read(
+            "org:1", "user:1", "read",
+            {"active_connection": {"id": "conn:s"},
+             "active_channel": {"id": "C9", "is_private": True}},
+        )
+
+
+def test_a_private_read_is_denied_when_the_requester_is_not_a_member(tmp_path):
+    service = _private_service(
+        tmp_path, "private-nonmember.db",
+        authorizer=lambda tenant, principal, channel, capability: {
+            "allowed": False, "reason": "not_a_member",
+        },
+    )
+
+    with pytest.raises(PermissionError,
+                       match="requester_visibility_denied:not_a_member"):
+        service._dispatch_slack_read(
+            "org:1", "user:1", "read",
+            {"active_connection": {"id": "conn:s"},
+             "active_channel": {"id": "C9", "is_private": True}},
+        )
+
+
+def test_an_audited_grant_lets_a_private_read_compile_privately(tmp_path):
+    seen = []
+
+    def authorizer(tenant, principal, channel, capability):
+        seen.append((tenant, principal, channel, capability))
+        return {"allowed": True, "grant_id": "grant:1"}
+
+    service = _private_service(tmp_path, "private-granted.db", authorizer)
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C9", "is_private": True}},
+    )
+
+    assert seen == [("org:1", "user:1", "C9",
+                     "slack.private_conversation.read")]
+    assert revision["steps"][0]["capability_id"] == (
+        "slack.private_conversation.read"
+    )
+    _assert_matches_capability_schema(revision["steps"][0])
+
+
+def test_a_private_thread_routes_to_the_private_thread_capability(tmp_path):
+    service = _private_service(
+        tmp_path, "private-thread.db",
+        authorizer=lambda *args: {"allowed": True},
+    )
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C9", "is_private": True},
+         "active_thread": {"channel_id": "C9", "thread_ts": "1710.1"}},
+    )
+
+    assert revision["steps"][0]["capability_id"] == "slack.private_thread.read"
+
+
+def test_a_public_read_never_consults_the_private_authorizer(tmp_path):
+    def authorizer(*args):
+        raise AssertionError("public reads must not be gated on membership")
+
+    service = _private_service(tmp_path, "public-ungated.db", authorizer)
+
+    _, revision = service._dispatch_slack_read(
+        "org:1", "user:1", "read",
+        {"active_connection": {"id": "conn:s"},
+         "active_channel": {"id": "C1", "is_private": False}},
+    )
+
+    assert revision["steps"][0]["capability_id"] == "slack.conversation.read"
