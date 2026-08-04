@@ -4,6 +4,7 @@ import argparse
 import hmac
 import importlib
 import json
+import logging
 import os
 import time
 import jsonschema
@@ -21,6 +22,8 @@ from libs.integrations.catalog import (
 from runner.trust_challenge import prove_identity
 from services.session.app import session_cookie_value
 from vault.managed_oauth_crypto import ManagedOAuthError
+
+logger = logging.getLogger(__name__)
 
 
 BROKER_IDENTITY = "service:credential-broker"
@@ -100,6 +103,20 @@ def _safe_provider_error(exc):
         return 403, body
     if isinstance(exc, ProviderNetworkError):
         return 503, body
+    if isinstance(exc, KeyError):
+        # The connection still calls itself healthy, but its credential is
+        # gone from the vault. Retrying cannot fix that; only reconnecting
+        # can, so say which one this is instead of reporting a provider fault.
+        body["error"] = "credential_unavailable"
+        body["category"] = "auth"
+        body["recovery"] = "reconnect_integration"
+        return 403, body
+    # Anything reaching here is unclassified, so the response alone says
+    # nothing about what went wrong. Name the exception type in the body and
+    # log it with a traceback: a silent 502 turns a one-line configuration
+    # fault into an afternoon of bisecting the dispatch path.
+    body["error_class"] = type(exc).__name__
+    logger.exception("unclassified provider failure: %s", type(exc).__name__)
     return 502, body
 
 
