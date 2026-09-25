@@ -96,3 +96,24 @@ def test_disconnect_tombstones_instead_of_deleting(tmp_path):
     stored = repository.get_installation(connection["connection_id"], "org:acme")
     assert stored["status"] == "disconnected"
     assert stored["credential_id"] is None
+
+
+def test_tenant_member_can_list_usable_installations_without_owner_mutation_scope(tmp_path):
+    repository = _repo(tmp_path)
+    owned = repository.upsert_installation(
+        tenant_id="org:acme", principal_id="user:alice", provider="slack",
+        app_id="app:tessera", team_id="T-A", credential_id="cred-a",
+        granted_scopes=["users:read"], enabled_capabilities=["slack.users.list"],
+        now_ts=10,
+    )
+    repository.upsert_installation(
+        tenant_id="org:other", principal_id="user:mallory", provider="slack",
+        app_id="app:tessera", team_id="T-X", credential_id="cred-x",
+        granted_scopes=["users:read"], enabled_capabilities=["slack.users.list"],
+        now_ts=10,
+    )
+
+    visible = repository.list_tenant_installations("org:acme", "slack")
+    assert [item["connection_id"] for item in visible] == [owned["connection_id"]]
+    assert repository.list_installations("org:acme", "user:bob", "slack") == []
+    assert repository.list_tenant_installations("org:other", "slack")[0]["team_id"] == "T-X"

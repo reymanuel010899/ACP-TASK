@@ -1,11 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { generateKeypair, publicKeyFromPrivate, b64encode } from "./agentCrypto";
-import { buildSessionAssertion, DEFAULT_SESSION_TTL, SessionAssertionError } from "./agentSession";
+import {
+  buildSessionAssertion,
+  DEFAULT_IDLE_TTL_SECONDS,
+  DEFAULT_SESSION_TTL,
+  SessionAssertionError,
+  establishWebSession,
+  probeWebSession,
+} from "./agentSession";
 
 // ---------------------------------------------------------------------------
 // Shape / determinism tests (pure TS, no Python needed)
@@ -239,5 +246,84 @@ describe("sanity: agentCrypto's keypair helpers agree with each other", () => {
   it("publicKeyFromPrivate derives the same public key generateKeypair returned", () => {
     const { privateKey, publicKey } = generateKeypair();
     expect(b64encode(publicKeyFromPrivate(privateKey))).toBe(b64encode(publicKey));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idle-window normalization at the network boundary
+// ---------------------------------------------------------------------------
+
+describe("web session idle-window normalization", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const assertion = {
+    principal_id: "p",
+    session_public_key: "k",
+    issued_at: 1,
+    expires_at: 2,
+    signature: "s",
+  };
+
+  it("regression: a session service that omits idle_ttl_seconds yields the default, never undefined", async () => {
+    // Left as `undefined`, this field is dropped by JSON.stringify when the
+    // session is stored, so the record fails validation on the next page load
+    // and the user is bounced to /login on every full navigation.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ principal_id: "p", csrf_token: "c", expires_at: 1_900_000_000 }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const session = await establishWebSession(assertion);
+
+    expect(session.idle_ttl_seconds).toBe(DEFAULT_IDLE_TTL_SECONDS);
+  });
+
+  it("the server's own idle_ttl_seconds always wins over the default", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            principal_id: "p",
+            csrf_token: "c",
+            expires_at: 1_900_000_000,
+            idle_ttl_seconds: 900,
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const session = await establishWebSession(assertion);
+
+    expect(session.idle_ttl_seconds).toBe(900);
+  });
+
+  it("probeWebSession normalizes the same way and reports a 401 as expired", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ principal_id: "p", expires_at: 1_900_000_000 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    const probe = await probeWebSession();
+    expect(probe).not.toBe("expired");
+    expect(probe).not.toBe("unavailable");
+    if (probe !== "expired" && probe !== "unavailable") {
+      expect(probe.idle_ttl_seconds).toBe(DEFAULT_IDLE_TTL_SECONDS);
+    }
+
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 401 })));
+    expect(await probeWebSession()).toBe("expired");
   });
 });

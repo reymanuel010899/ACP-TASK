@@ -1,3 +1,4 @@
+
 """AgentTrust demo Requester Agent (unit U5).
 
 An independently-buildable A2A *client*. Given a capability id it:

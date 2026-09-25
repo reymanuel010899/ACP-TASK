@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { WEB_SESSION_CSRF_STORAGE_KEY } from "@/lib/agentSession";
+import { readStoredCsrfToken as csrfToken } from "@/lib/agentSession";
 import SlackBrandIcon from "./SlackBrandIcon";
 
 type SlackConnection = {
@@ -12,6 +12,8 @@ type SlackConnection = {
   bot_user_id?: string | null;
   status: "connected" | "degraded" | "disconnect_pending" | "rotation_uncertain";
   enabled_capabilities: string[];
+  missing_families?: MissingFamily[];
+  personal_authority?: PersonalAuthority[];
   owner?: boolean;
 };
 
@@ -22,15 +24,49 @@ type SlackResponse = {
   connection_id?: string;
 };
 
+type PersonalAuthority = {
+  profile_kind: string;
+  slack_subject_id: string | null;
+  granted_scopes: string[];
+  enabled: boolean;
+};
+
+type MissingFamily = {
+  family: string;
+  missing_scopes: string[];
+  operations: string[];
+};
+
+// What each family lets Tessera do, in the user's words. The scopes and the
+// operations come from the server; only the phrasing lives here.
+const FAMILY_LABELS: Record<string, string> = {
+  slack_channel_discovery: "find channels",
+  slack_conversation_reads: "read conversations",
+  slack_private_reads: "read private channels",
+  slack_user_discovery: "find people",
+  slack_messaging: "post messages and replies",
+  slack_direct_messages: "send direct messages",
+  slack_reactions: "add and remove reactions",
+  slack_pins: "pin and unpin messages",
+  slack_bookmarks: "bookmark links",
+};
+
+function familyLabel(family: string) {
+  return FAMILY_LABELS[family] ?? family.replace(/^slack_/, "").replace(/_/g, " ");
+}
+
 const CAPABILITIES = [
   "slack.channels.list",
   "slack.conversation.read",
   "slack.thread.read",
+  "slack.users.list",
+  "slack.message.permalink",
   "slack.private_channels.list",
   "slack.private_conversation.read",
   "slack.private_thread.read",
   "slack.message.send",
   "slack.thread.reply",
+  "slack.direct_message.send",
   "slack.reaction.add",
   "slack.file.upload",
 ];
@@ -80,15 +116,47 @@ export default function ConnectSlackCard({
     queueMicrotask(() => void loadStatus());
   }, [loadStatus]);
 
-  function csrfToken() {
+
+  async function decidePersonalAuthority(
+    connection: SlackConnection,
+    profile: PersonalAuthority,
+    action: "enable" | "disable" | "revoke",
+  ) {
+    const csrf = csrfToken();
+    if (!csrf) {
+      setFailed(true);
+      setMessage("Your secure session needs to be refreshed. Sign in again, then retry.");
+      return;
+    }
+    setBusy(connection.connection_id);
     try {
-      return window.sessionStorage.getItem(WEB_SESSION_CSRF_STORAGE_KEY);
+      const response = await fetch(
+        `/api/integrations/slack/${encodeURIComponent(connection.connection_id)}/authority/${encodeURIComponent(profile.profile_kind)}`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+          body: JSON.stringify({ action }),
+        },
+      );
+      if (!response.ok) throw new Error("authority change failed");
+      setMessage(
+        action === "revoke"
+          ? "Your personal Slack access was withdrawn."
+          : action === "enable"
+            ? "Your personal Slack access is on."
+            : "Your personal Slack access is paused.",
+      );
+      await loadStatus();
     } catch {
-      return null;
+      setFailed(true);
+      setMessage("We could not change your personal Slack access.");
+    } finally {
+      setBusy(null);
     }
   }
 
-  async function connect(target?: SlackConnection) {
+  async function connect(target?: SlackConnection, family?: string) {
     const csrf = csrfToken();
     if (!csrf) {
       setFailed(true);
@@ -102,7 +170,7 @@ export default function ConnectSlackCard({
         credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
         body: JSON.stringify({
-          capabilities: CAPABILITIES,
+          ...(family ? { families: [family] } : { capabilities: CAPABILITIES }),
           return_to: "/integrations",
           target_connection_id: target?.connection_id,
           intended_team_id: target?.team_id,
@@ -163,21 +231,60 @@ export default function ConnectSlackCard({
       <div className="space-y-[8px]">
         {connections.map((connection) => {
           const name = connection.team_name ?? connection.team_id;
-          const missingUpload = !connection.enabled_capabilities.includes("slack.file.upload");
-          const missingPrivateChannels = !connection.enabled_capabilities.includes("slack.private_channels.list")
-            || !connection.enabled_capabilities.includes("slack.private_conversation.read")
-            || !connection.enabled_capabilities.includes("slack.private_thread.read");
+          const missing = connection.missing_families ?? [];
           return (
             <div key={connection.connection_id} role="group" aria-label={`${name} workspace`} className="rounded-[7px] border border-[var(--ag-card-border)] p-[8px]">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate text-[10px] font-semibold text-[var(--ag-text)]">{name}</span>
                 <span className={`rounded px-[6px] py-[2px] text-[8px] font-semibold ${connection.status === "connected" ? "bg-[#0B3B2B] text-[#22C55E]" : "bg-[#3B2A0B] text-[#FBBF24]"}`}>{connection.status === "connected" ? "Connected" : "Attention"}</span>
               </div>
-              {missingUpload && <p className="mt-1 text-[9px] text-[#FBBF24]">File uploads need an additional scope</p>}
-              {missingPrivateChannels && <p className="mt-1 text-[9px] text-[#FBBF24]">Private channels need additional scopes</p>}
+              {connection.owner !== false && missing.length > 0 && (
+                <ul className="mt-2 space-y-1">
+                  {missing.map((bundle) => (
+                    <li key={bundle.family} className="flex items-center justify-between gap-2">
+                      <span className="text-[9px] text-[#FBBF24]">
+                        To {familyLabel(bundle.family)}, Tessera needs {bundle.missing_scopes.join(", ")}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={busy !== null}
+                        onClick={() => void connect(connection, bundle.family)}
+                        className="shrink-0 rounded border border-[var(--ag-card-border)] px-2 py-1 text-[9px] text-[var(--ag-text)] disabled:opacity-50"
+                      >
+                        Allow {familyLabel(bundle.family)}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {(connection.personal_authority ?? []).map((profile) => (
+                <div key={profile.profile_kind} className="mt-2 rounded border border-[var(--ag-card-border)] p-[6px]">
+                  <p className="text-[9px] text-[var(--ag-text-secondary)]">
+                    You granted Tessera your own Slack access ({profile.granted_scopes.join(", ")}).
+                    {profile.enabled ? " It is on." : " It is paused."}
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void decidePersonalAuthority(connection, profile, profile.enabled ? "disable" : "enable")}
+                      className="rounded border border-[var(--ag-card-border)] px-2 py-1 text-[9px] text-[var(--ag-text)] disabled:opacity-50"
+                    >
+                      {profile.enabled ? "Pause my access" : "Turn on my access"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void decidePersonalAuthority(connection, profile, "revoke")}
+                      className="rounded border border-[#7F1D1D] px-2 py-1 text-[9px] text-[#FCA5A5] disabled:opacity-50"
+                    >
+                      Withdraw my access
+                    </button>
+                  </div>
+                </div>
+              ))}
               {connection.owner !== false && (
                 <div className="mt-2 flex flex-wrap gap-1">
-                  <button type="button" disabled={busy !== null} onClick={() => void connect(connection)} className="rounded border border-[var(--ag-card-border)] px-2 py-1 text-[9px] text-[var(--ag-text)] disabled:opacity-50">Upgrade {name} permissions</button>
                   <button type="button" disabled={busy !== null} onClick={() => void disconnect(connection)} className="rounded border border-[#7F1D1D] px-2 py-1 text-[9px] text-[#FCA5A5] disabled:opacity-50">Disconnect {name}</button>
                 </div>
               )}

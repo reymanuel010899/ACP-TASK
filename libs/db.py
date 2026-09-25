@@ -103,6 +103,8 @@ def bind_organization_id(organization_id: Optional[str]) -> None:
     would leave a *previous* request's bound value in place for a
     thread reused across keep-alive requests.
     """
+    if isinstance(organization_id, str):
+        organization_id = organization_id.strip()
     _org_context.value = organization_id or None
 
 

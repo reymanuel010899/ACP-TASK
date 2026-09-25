@@ -47,3 +47,20 @@ def test_slack_receipt_rejects_cross_workspace_observation():
     result = verifier.verify(_attestation())
     assert result["verdict"] == "rejected"
     assert "team_id" in result["reasoning"]
+
+
+def test_dm_receipt_verifies_selected_user_and_final_channel():
+    attestation = _attestation()
+    attestation["capability_id"] = "slack.direct_message.send"
+    attestation["provider_receipt"].update({
+        "capability_id": "slack.direct_message.send", "channel_id": "D1",
+        "user_id": "U1",
+    })
+    observed = {
+        **attestation["provider_receipt"],
+        "approved_payload_hash": attestation["approved_payload_hash"],
+        "material_hashes": attestation["material_hashes"],
+    }
+    assert SlackReceiptVerifier(Gateway(observed)).verify(attestation)["verdict"] == "verified"
+    observed["user_id"] = "U-OTHER"
+    assert SlackReceiptVerifier(Gateway(observed)).verify(attestation)["verdict"] == "rejected"

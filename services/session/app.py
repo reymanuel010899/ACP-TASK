@@ -10,7 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from libs import signing
-from services.session.repository import SessionRepository
+from libs.db import Database
+from services.session.repository import PostgresSessionRepository
 
 
 COOKIE_NAME = "tessera_session"
@@ -106,6 +107,10 @@ class SessionRequestHandler(BaseHTTPRequestHandler):
                 "principal_id": created["principal_id"],
                 "csrf_token": created["csrf_token"],
                 "expires_at": created["expires_at"],
+                # The idle window is served, not assumed, so the browser can
+                # enforce the SAME sliding cutoff this service does without a
+                # hardcoded copy of the number silently drifting from it.
+                "idle_ttl_seconds": created["idle_ttl_seconds"],
             },
             {"Set-Cookie": _session_cookie(created["session_id"])},
         )
@@ -149,13 +154,19 @@ class SessionRequestHandler(BaseHTTPRequestHandler):
 
 def make_server(host="127.0.0.1", port=8120, repository=None, clock=None):
     server = ThreadingHTTPServer((host, port), SessionRequestHandler)
-    server.repository = repository or SessionRepository(
-        os.environ.get("SESSION_DATABASE", "tessera-sessions.db"),
-        idle_ttl_seconds=int(os.environ.get("SESSION_IDLE_TTL_SECONDS", "1800")),
-        absolute_ttl_seconds=int(
-            os.environ.get("SESSION_ABSOLUTE_TTL_SECONDS", "43200")
-        ),
-    )
+    server.database = None
+    if repository is None:
+        server.database = Database()
+        repository = PostgresSessionRepository(
+            server.database,
+            idle_ttl_seconds=int(
+                os.environ.get("SESSION_IDLE_TTL_SECONDS", "1800")
+            ),
+            absolute_ttl_seconds=int(
+                os.environ.get("SESSION_ABSOLUTE_TTL_SECONDS", "43200")
+            ),
+        )
+    server.repository = repository
     server.clock = clock or time.time
     return server
 

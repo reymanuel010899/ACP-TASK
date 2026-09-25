@@ -88,6 +88,12 @@ async function makeFixture(): Promise<Fixture> {
 function mockFetchForFixture(fixture: Fixture) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input.toString();
+    if (url.startsWith("/api/auth/resolve")) {
+      return new Response(
+        JSON.stringify({ username: "bob", principal_id: fixture.principalIdB64 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     if (url.startsWith("/api/vault/keyring")) {
       const requested = new URL(url, "http://test.local").searchParams.get("principal_id");
       if (requested === fixture.principalIdB64) {
@@ -107,6 +113,7 @@ function mockFetchForFixture(fixture: Fixture) {
           principal_id: fixture.principalIdB64,
           csrf_token: "csrf-login-test",
           expires_at: 1_900_000_000,
+          idle_ttl_seconds: 1800,
         }),
         { status: 201, headers: { "Content-Type": "application/json" } },
       );
@@ -154,8 +161,8 @@ describe("LoginForm", () => {
     });
 
     expect(pushMock).toHaveBeenCalledWith("/");
-    expect(window.sessionStorage.getItem("tessera-csrf")).toBe("csrf-login-test");
-    expect(window.sessionStorage.getItem("tessera-session-expires-at")).toBe(
+    expect(window.localStorage.getItem("tessera-csrf")).toBe("csrf-login-test");
+    expect(window.localStorage.getItem("tessera-session-expires-at")).toBe(
       "1900000000",
     );
     expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith("/api/vault/keyring"))).toBe(true);
@@ -255,9 +262,9 @@ describe("LoginForm", () => {
     }
   }, 15_000);
 
-  it("edge case: a username with no local principal_id mapping auto-switches to principal_id mode with explanatory copy", async () => {
+  it("resolves a username through the Registry when this device has no local mapping", async () => {
     const fixture = await makeFixture();
-    mockFetchForFixture(fixture);
+    const fetchMock = mockFetchForFixture(fixture);
     // No mapping saved under "bob" -- this device has never seen that username.
 
     renderLoginForm();
@@ -266,17 +273,32 @@ describe("LoginForm", () => {
     await user.type(getPasswordInput(), PASSWORD);
     await user.click(screen.getByRole("button", { name: /sign in/i }));
 
-    // Auto-switched to principal_id mode, with inline explanatory copy --
-    // not a bare error, and no network call was made for this attempt.
     await waitFor(() => {
-      expect(screen.getByLabelText(/principal id/i)).toBeInTheDocument();
+      expect(screen.getByTestId("session-probe")).toHaveTextContent(
+        `principal:${fixture.principalIdB64}|username:bob`,
+      );
     });
-    expect(screen.getByRole("status")).toHaveTextContent(
-      /"bob" isn't recognized on this device/i,
+    expect(pushMock).toHaveBeenCalledWith("/");
+    expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith("/api/auth/resolve"))).toBe(true);
+  });
+
+  it("repairs a stale local username mapping from the Registry", async () => {
+    const fixture = await makeFixture();
+    window.localStorage.setItem(
+      AGENTTRUST_USERNAME_MAP_KEY,
+      JSON.stringify({ bob: "stale-principal" }),
     );
-    expect(screen.getByTestId("session-probe")).toHaveTextContent("signed-out");
-    // The identifier field is cleared, ready for the principal_id paste.
-    expect(getIdentifierInput()).toHaveValue("");
+    const fetchMock = mockFetchForFixture(fixture);
+
+    renderLoginForm();
+    await fillAndSubmit("bob", PASSWORD);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-probe")).toHaveTextContent(
+        `principal:${fixture.principalIdB64}|username:bob`,
+      );
+    });
+    expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith("/api/auth/resolve"))).toBe(true);
   });
 
   it("error path: an unknown principal_id (server 404) shows a distinct 'no account found' message", async () => {

@@ -28,7 +28,16 @@ import uuid
 import psycopg
 import pytest
 
-from libs.db import Database
+from libs.db import (
+    Database,
+    bind_organization_id,
+    current_organization_id,
+)
+from libs.repository_contract import (
+    TenantContextRequired,
+    normalize_tenant_id,
+    require_tenant_context,
+)
 from tools.migrate import run_migrations
 
 try:
@@ -41,6 +50,24 @@ DEFAULT_TEST_REDIS_URL = "redis://localhost:6379/0"
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ROLES_SQL_PATH = os.path.join(REPO_ROOT, "infra", "roles.sql")
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "\t\n"])
+def test_tenant_context_rejects_missing_or_blank_values(value):
+    bind_organization_id(value)
+    assert current_organization_id() is None
+    assert normalize_tenant_id(value) is None
+    with pytest.raises(TenantContextRequired, match="tenant membership is required"):
+        require_tenant_context()
+
+
+def test_tenant_context_normalizes_a_bound_organization():
+    bind_organization_id("  org:alpha  ")
+    try:
+        assert current_organization_id() == "org:alpha"
+        assert require_tenant_context() == "org:alpha"
+    finally:
+        bind_organization_id(None)
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +367,15 @@ def test_roles_sql_applies_cleanly_and_idempotently_with_no_schemas(pg_dsn):
             cur.execute(
                 "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname = ANY(%s) "
                 "ORDER BY rolname",
-                (["registry_svc", "vault_svc", "audit_svc", "trust_svc", "marketplace_svc"],),
+                (["agenttrust_app", "registry_svc", "vault_svc", "audit_svc", "trust_svc", "marketplace_svc"],),
             )
             roles = [row[0] for row in cur.fetchall()]
 
-    assert roles == ["audit_svc", "marketplace_svc", "registry_svc", "trust_svc", "vault_svc"]
+    assert roles == [
+        "agenttrust_app",
+        "audit_svc",
+        "marketplace_svc",
+        "registry_svc",
+        "trust_svc",
+        "vault_svc",
+    ]

@@ -39,6 +39,9 @@ function makeSession(overrides: Partial<Pick<StoredSession, "principalId" | "use
     sessionPublicKey: sessionPublicKeyB64,
     sessionPrivateKey: b64encode(session.privateKey),
     assertion,
+    absoluteExpiresAt: Math.floor(Date.now() / 1000) + 43_200,
+    idleTtlSeconds: 1800,
+    lastActivityAt: Math.floor(Date.now() / 1000),
   };
 }
 
@@ -63,12 +66,18 @@ function renderChip(session: StoredSession) {
 beforeEach(() => {
   pushMock.mockClear();
   replaceMock.mockClear();
+  window.localStorage.clear();
   window.sessionStorage.clear();
   __resetSessionStoreForTests();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(null, { status: 204 })),
+  );
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -97,8 +106,8 @@ describe("UserChip", () => {
 
   it("logout clears the session and redirects to /login", async () => {
     const user = userEvent.setup();
-    window.sessionStorage.setItem("tessera-csrf", "csrf-to-clear");
-    window.sessionStorage.setItem("tessera-session-expires-at", "1900000000");
+    window.localStorage.setItem("tessera-csrf", "csrf-to-clear");
+    window.localStorage.setItem("tessera-session-expires-at", "1900000000");
     renderChip(makeSession({ username: "alice" }));
 
     await act(async () => {
@@ -108,11 +117,56 @@ describe("UserChip", () => {
 
     await user.click(screen.getByRole("button", { name: "Log out" }));
 
-    expect(window.sessionStorage.getItem("agenttrust-session")).toBeNull();
-    expect(window.sessionStorage.getItem("tessera-csrf")).toBeNull();
+    expect(window.localStorage.getItem("agenttrust-session")).toBeNull();
+    expect(window.localStorage.getItem("tessera-csrf")).toBeNull();
     expect(
-      window.sessionStorage.getItem("tessera-session-expires-at"),
+      window.localStorage.getItem("tessera-session-expires-at"),
     ).toBeNull();
+    expect(replaceMock).toHaveBeenCalledWith("/login");
+  });
+
+  it("logout revokes the server-side session, not just the local record", async () => {
+    // The session cookie outlives the tab by up to 12 hours now, so a
+    // local-only logout would leave a live session usable on the machine.
+    const user = userEvent.setup();
+    window.localStorage.setItem("tessera-csrf", "csrf-to-revoke");
+    renderChip(makeSession({ username: "alice" }));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "sign-in" }).click();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Log out" }));
+
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const revocation = fetchMock.mock.calls.find(
+      ([url, init]) => String(url) === "/api/session" && (init as RequestInit)?.method === "DELETE",
+    );
+    expect(revocation).toBeDefined();
+    expect(
+      (revocation?.[1] as { headers: Record<string, string> }).headers["X-CSRF-Token"],
+    ).toBe("csrf-to-revoke");
+  });
+
+  it("logout still signs the user out locally when the revocation call fails", async () => {
+    // A failed revocation must never trap the user in a signed-in UI.
+    const user = userEvent.setup();
+    window.localStorage.setItem("tessera-csrf", "csrf-to-revoke");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
+    renderChip(makeSession({ username: "alice" }));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "sign-in" }).click();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Log out" }));
+
+    expect(window.localStorage.getItem("agenttrust-session")).toBeNull();
     expect(replaceMock).toHaveBeenCalledWith("/login");
   });
 });

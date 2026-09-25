@@ -37,12 +37,15 @@ export type NavKey =
   | "tasks"
   | "contracts"
   | "approvals"
+  | "contacts"
+  | "campaigns"
   | "negotiations"
   | "disputes"
   | "evidence-audit"
   | "billing"
   | "security"
   | "integrations"
+  | "voice"
   | "settings";
 
 type NavItem = {
@@ -50,6 +53,7 @@ type NavItem = {
   icon: string;
   label: string;
   href?: string;
+  status?: "preview";
 };
 
 type NavSection = {
@@ -78,6 +82,8 @@ const NAV_SECTIONS: NavSection[] = [
       { key: "tasks", icon: "▤", label: "Tasks", href: "/tasks" },
       { key: "contracts", icon: "▧", label: "Contracts", href: "/contracts" },
       { key: "approvals", icon: "♢", label: "Approvals", href: "/approvals" },
+      { key: "contacts", icon: "☰", label: "Contacts", href: "/contacts", status: "preview" },
+      { key: "campaigns", icon: "◉", label: "Campaigns", href: "/campaigns", status: "preview" },
       { key: "negotiations", icon: "▱", label: "Negotiations", href: "/negotiations" },
       { key: "disputes", icon: "◈", label: "Disputes", href: "/disputes" },
       { key: "evidence-audit", icon: "▧", label: "Evidence & Audit", href: "/evidence-audit" },
@@ -89,6 +95,7 @@ const NAV_SECTIONS: NavSection[] = [
       { key: "billing", icon: "▤", label: "Billing", href: "/billing" },
       { key: "security", icon: "⚙", label: "Security", href: "/security" },
       { key: "integrations", icon: "⌁", label: "Integrations", href: "/integrations" },
+      { key: "voice", icon: "☎", label: "Voice routing", href: "/voice", status: "preview" },
       { key: "settings", icon: "⚙", label: "Settings", href: "/settings" },
     ],
   },
@@ -117,6 +124,11 @@ function NavEntry({ item, active }: { item: NavItem; active: NavKey }) {
     <>
       <div className={iconClass(isActive)}>{item.icon}</div>
       <div className={labelClass(isActive)}>{item.label}</div>
+      {item.status === "preview" && (
+        <span className="ml-auto rounded-[4px] border border-[var(--ag2-border)] px-[5px] py-[2px] text-[8px]/[normal] font-semibold uppercase tracking-[0.08em] text-[var(--ag2-dim)]">
+          Preview
+        </span>
+      )}
     </>
   );
   if (item.href) {

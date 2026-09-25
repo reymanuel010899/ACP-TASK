@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { WEB_SESSION_CSRF_STORAGE_KEY } from "@/lib/agentSession";
+import { readStoredCsrfToken as csrfToken } from "@/lib/agentSession";
 import GoogleBrandIcon from "./GoogleBrandIcon";
 
 type GoogleState =
@@ -100,13 +100,6 @@ export default function ConnectGoogleCard({
     if (state === "pending_revocation") retryRef.current?.focus();
   }, [state]);
 
-  function csrfToken(): string | null {
-    try {
-      return window.sessionStorage.getItem(WEB_SESSION_CSRF_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  }
 
   async function connect(reconnect = false) {
     const csrf = csrfToken();

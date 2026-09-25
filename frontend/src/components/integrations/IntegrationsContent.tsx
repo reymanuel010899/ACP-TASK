@@ -5,8 +5,10 @@
  * marks are rendered as colored glyph tiles (no external logo assets).
  */
 
+import CapabilityFamilyControls from "./CapabilityFamilyControls";
 import ConnectGoogleCard from "./ConnectGoogleCard";
 import ConnectSlackCard from "./ConnectSlackCard";
+import ConnectTwilioCard from "./ConnectTwilioCard";
 
 const TABS = ["Overview", "All Integrations", "Connected", "Available", "Categories", "Webhooks", "Settings"];
 
@@ -164,6 +166,8 @@ export default function IntegrationsContent() {
             <ConnectSlackCard key={it.name} />
           ) : it.name === "Google Workspace" ? (
             <ConnectGoogleCard key={it.name} layout="grid" />
+          ) : it.name === "Twilio" ? (
+            <ConnectTwilioCard key={it.name} />
           ) : (
             <div key={it.name} className="box-border w-full h-fit flex flex-col gap-[10px] p-[13px] justify-start items-start bg-[var(--ag-card)] [border:1px_solid_var(--ag-card-border)] rounded-[8px]">
             <div className="box-border w-full h-fit shrink-0 flex flex-row gap-[9px] justify-start items-start">
@@ -208,6 +212,11 @@ export default function IntegrationsContent() {
             </div>
           ),
         )}
+      </div>
+
+      {/* What this account currently allows, and the switch that halts it. */}
+      <div className="box-border w-full h-fit shrink-0">
+        <CapabilityFamilyControls />
       </div>
 
       {/* Pagination */}

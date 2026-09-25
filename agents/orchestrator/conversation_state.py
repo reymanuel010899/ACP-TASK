@@ -10,8 +10,12 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+from libs.db import current_organization_id
 
 from libs.protocol import (
     TASK_CONTINUE,
@@ -147,24 +151,7 @@ class ConversationStateStore(object):
                 "updated_at": now,
                 "expires_at": now + self.timeout_seconds,
             }
-            self._connection.execute(
-                """
-                INSERT INTO orchestrator_conversations(
-                    task_id, conversation_id, agent_id, capability,
-                    state_json, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    conversation_id,
-                    agent_id,
-                    capability,
-                    _json(state),
-                    now,
-                    now,
-                    now + self.timeout_seconds,
-                ),
-            )
+            self._insert(state)
         return self.get_task(task_id)
 
     def get_task(self, task_id, include_expired=False):
@@ -424,6 +411,22 @@ class ConversationStateStore(object):
         ).fetchone()
         return json.loads(row["state_json"]) if row is not None else None
 
+    def _insert(self, state):
+        self._connection.execute(
+            """
+            INSERT INTO orchestrator_conversations(
+                task_id, conversation_id, agent_id, capability,
+                state_json, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state["task_id"], state["conversation_id"],
+                state["agent_id"], state["capability"], _json(state),
+                state["created_at"], state["updated_at"],
+                state["expires_at"],
+            ),
+        )
+
     def _save(self, state, now=None, expires_at=None):
         now = int(self.clock()) if now is None else int(now)
         state["updated_at"] = now
@@ -442,6 +445,111 @@ class ConversationStateStore(object):
                 state["task_id"],
             ),
         )
+
+
+class PostgresConversationStateStore(ConversationStateStore):
+    """Shared task-conversation state serialized per tenant and task."""
+
+    def __init__(self, db, clock=None, timeout_seconds=DEFAULT_TIMEOUT_SECONDS):
+        self.db = db
+        self.clock = clock or time.time
+        self.timeout_seconds = int(timeout_seconds)
+        self._lock = threading.RLock()
+        self._local = threading.local()
+
+    def close(self):
+        return None
+
+    @contextmanager
+    def _operation(self, task_id):
+        active = getattr(self._local, "connection", None)
+        if active is not None:
+            yield
+            return
+        tenant_id = current_organization_id()
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self.db.transaction() as conn:
+            conn.execute(
+                "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("%s:%s" % (tenant_id, task_id),),
+            )
+            self._local.connection = conn
+            self._local.tenant_id = tenant_id
+            try:
+                yield
+            finally:
+                self._local.connection = None
+                self._local.tenant_id = None
+
+    def create_task(self, task_id, *args, **kwargs):
+        with self._operation(task_id):
+            return super().create_task(task_id, *args, **kwargs)
+
+    def get_task(self, task_id, include_expired=False):
+        with self._operation(task_id):
+            return super().get_task(task_id, include_expired)
+
+    def record_need(self, task_id, need):
+        with self._operation(task_id):
+            return super().record_need(task_id, need)
+
+    def resolve_need(self, task_id, need, **kwargs):
+        with self._operation(task_id):
+            return super().resolve_need(task_id, need, **kwargs)
+
+    def continue_task(self, task_id, resolved_fields, sender, permissions=None):
+        with self._operation(task_id):
+            return super().continue_task(
+                task_id, resolved_fields, sender, permissions
+            )
+
+    def _load(self, task_id):
+        row = self._local.connection.execute(
+            """
+            select state_json from orchestrator.task_conversations
+            where tenant_id = %s and task_id = %s
+            """,
+            (self._local.tenant_id, task_id),
+        ).fetchone()
+        return dict(row[0]) if row is not None else None
+
+    def _insert(self, state):
+        self._local.connection.execute(
+            """
+            insert into orchestrator.task_conversations(
+                tenant_id, task_id, conversation_id, agent_id, capability,
+                state_json, created_at, updated_at, expires_at
+            ) values (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+            """,
+            (
+                self._local.tenant_id, state["task_id"],
+                state["conversation_id"], state["agent_id"],
+                state["capability"], _json(state), _utc(state["created_at"]),
+                _utc(state["updated_at"]), _utc(state["expires_at"]),
+            ),
+        )
+
+    def _save(self, state, now=None, expires_at=None):
+        now = int(self.clock()) if now is None else int(now)
+        state["updated_at"] = now
+        if expires_at is not None:
+            state["expires_at"] = int(expires_at)
+        self._local.connection.execute(
+            """
+            update orchestrator.task_conversations
+            set state_json = %s::jsonb, updated_at = %s, expires_at = %s
+            where tenant_id = %s and task_id = %s
+            """,
+            (
+                _json(state), _utc(now), _utc(state["expires_at"]),
+                self._local.tenant_id, state["task_id"],
+            ),
+        )
+
+
+def _utc(value):
+    return datetime.fromtimestamp(int(value), tz=timezone.utc)
 
 
 @dataclass
@@ -476,3 +584,104 @@ class TenantIdentityResolver:
 
     def resolve_email(self, tenant_id, slack_connection_id, slack_user_id):
         return self.links.get((tenant_id, slack_connection_id, slack_user_id))
+
+
+class ConciergeConversationStore:
+    """Clock-bound facade for native, principal-scoped Concierge state.
+
+    This is deliberately not part of ``ConversationStateStore``: native turns
+    have no selected agent and must not manufacture collaboration envelopes.
+    """
+
+    DEFAULT_TTL_SECONDS = 180
+
+    def __init__(self, repository, clock=None, ttl_seconds=DEFAULT_TTL_SECONDS):
+        self.repository = repository
+        self.clock = clock or time.time
+        self.ttl_seconds = int(ttl_seconds)
+
+    def create(self, tenant_id, principal_id, conversation_id=None, locale=None):
+        return self.repository.create_conversation(
+            tenant_id, principal_id, int(self.clock()), self.ttl_seconds,
+            conversation_id=conversation_id, locale=locale,
+        )
+
+    def get(self, conversation_id, tenant_id, principal_id, include_terminal=False):
+        return self.repository.get_conversation(
+            conversation_id, tenant_id, principal_id, int(self.clock()),
+            include_terminal=include_terminal,
+        )
+
+    def update(
+        self, conversation_id, tenant_id, principal_id,
+        expected_version=None, **changes
+    ):
+        return self.repository.update_conversation(
+            conversation_id, tenant_id, principal_id, changes,
+            int(self.clock()), self.ttl_seconds,
+            expected_version=expected_version,
+        )
+
+    def begin_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, request,
+    ):
+        return self.repository.begin_conversation_turn(
+            conversation_id, tenant_id, principal_id, client_turn_id,
+            expected_version, request, int(self.clock()), self.ttl_seconds,
+        )
+
+    def commit_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, changes, response,
+    ):
+        return self.repository.commit_conversation_turn(
+            conversation_id, tenant_id, principal_id, client_turn_id,
+            expected_version, changes, response, int(self.clock()),
+            self.ttl_seconds,
+        )
+
+    def record_need(self, conversation_id, tenant_id, principal_id, need):
+        if hasattr(need, "model_dump"):
+            need = need.model_dump()
+        elif hasattr(need, "dict"):
+            need = need.dict()
+        if not isinstance(need, dict) or not all(
+            isinstance(need.get(key), str) and need[key]
+            for key in ("kind", "field", "question")
+        ):
+            raise ValueError("blocking need requires kind, field and question")
+        return self.update(
+            conversation_id, tenant_id, principal_id,
+            status="needs_input", blocking_need=dict(need),
+        )
+
+    def answer(
+        self, conversation_id, tenant_id, principal_id, idempotency_key,
+        field_name, value, workflow_run_id=None, workflow_revision_id=None,
+    ):
+        return self.repository.apply_conversation_answer(
+            conversation_id, tenant_id, principal_id, idempotency_key,
+            field_name, value, int(self.clock()), workflow_run_id,
+            workflow_revision_id,
+        )
+
+    def present(self, conversation_id, tenant_id, principal_id, presentation):
+        if hasattr(presentation, "model_dump"):
+            presentation = presentation.model_dump()
+        elif hasattr(presentation, "dict"):
+            presentation = presentation.dict()
+        return self.repository.store_conversation_presentation(
+            conversation_id, tenant_id, principal_id, presentation,
+            int(self.clock()), self.ttl_seconds,
+        )
+
+    def close(self, conversation_id, tenant_id, principal_id):
+        return self.repository.close_conversation(
+            conversation_id, tenant_id, principal_id, int(self.clock())
+        )
+
+    def purge_expired_content(self):
+        return self.repository.purge_expired_conversation_content(
+            int(self.clock())
+        )

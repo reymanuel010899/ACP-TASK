@@ -7,6 +7,8 @@ import requests
 
 from agents.orchestrator.action_repository import ActionRepository
 from agents.orchestrator.attestation import ExecutionAttestor
+from agents.orchestrator.policy import PolicyEvaluator
+from libs.integrations.control_plane import build_tenant_control_plane
 from libs.aws_kms import AWSKMSClient
 from libs.config import ConfigurationError, get_google_oauth_config, get_slack_oauth_config
 from libs.connectors.google import (
@@ -14,11 +16,12 @@ from libs.connectors.google import (
     GoogleCredentialConnector,
 )
 from libs.connectors.slack import SlackActionExecutor, SlackCredentialConnector
+from libs.connectors.twilio import TwilioActionExecutor, TwilioCredentialConnector
 from libs.integrations.catalog import (
     ProviderRuntime,
     ProviderRuntimeRegistry,
-    google_definitions,
-    slack_definitions,
+    credential_strategy_for,
+    provider_definitions,
 )
 from libs.db import Database
 from libs.signing import load_signing_key
@@ -116,7 +119,8 @@ def build_broker():
         provider="google",
         connector=connector,
         executor=executor,
-        definitions=google_definitions(),
+        definitions=provider_definitions("google"),
+        credential_strategy=credential_strategy_for("google"),
     )]
     credential_rotators = {}
     vault_service = VaultService(
@@ -132,24 +136,41 @@ def build_broker():
             provider="slack",
             connector=slack_connector,
             executor=slack_executor,
-            definitions=slack_definitions(),
+            definitions=provider_definitions("slack"),
+            credential_strategy=credential_strategy_for("slack"),
         ))
         credential_rotators["slack"] = ManagedOAuthRotator(
             vault_service, slack_connector
         )
+    runtimes.append(ProviderRuntime(
+        provider="twilio",
+        connector=TwilioCredentialConnector(
+            expected_callback_base=os.environ.get("TWILIO_PUBLIC_CALLBACK_BASE")
+        ),
+        executor=TwilioActionExecutor(),
+        definitions=provider_definitions("twilio"),
+        credential_strategy=credential_strategy_for("twilio"),
+    ))
     runtime_registry = ProviderRuntimeRegistry(runtimes)
+    rollout_version = os.environ.get(
+        "TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"
+    )
+    policy_evaluator = PolicyEvaluator(
+        runtime_registry.definitions(), rollout_version
+    )
 
-    def dispatch_policy(binding):
-        if binding.get("workflow_revision_id") not in (None, "legacy"):
-            if os.environ.get(
-                "TESSERA_DYNAMIC_EXECUTION_ENABLED", "false"
-            ).lower() != "true":
-                return False
-        if str(binding.get("capability_id", "")).startswith("slack."):
-            return os.environ.get(
-                "TESSERA_SLACK_EXECUTION_ENABLED", "false"
-            ).lower() == "true"
-        return True
+    # Emergency stop and family state are enforced here, at the broker, and
+    # not only in the orchestrator: the orchestrator is the thing being
+    # stopped, so a stop honoured only there is bypassable by any other
+    # caller that can present a lease (KTD20).
+    #
+    # The gate reads durable, per-tenant state that an administrator changes
+    # without a restart. It replaces TESSERA_SLACK_EXECUTION_ENABLED and
+    # TESSERA_DYNAMIC_EXECUTION_ENABLED, both of which were process-wide and
+    # therefore could not express "this account is stopped".
+    dispatch_policy = build_tenant_control_plane(
+        oauth_repository, runtime_registry.definitions()
+    ).decide_binding
 
     return ActionBroker(
         ActionRepository(_required("TESSERA_ACTION_DATABASE_PATH")),
@@ -167,9 +188,9 @@ def build_broker():
         ),
         evidence_submitter=_evidence_submitter(),
         runtime_registry=runtime_registry,
-        rollout_version=os.environ.get(
-            "TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"
-        ),
+        rollout_version=rollout_version,
         credential_rotators=credential_rotators,
         dispatch_policy=dispatch_policy,
+        policy_evaluator=policy_evaluator,
+        connection_resolver=oauth_repository.get_installation,
     )

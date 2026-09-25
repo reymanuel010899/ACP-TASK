@@ -18,6 +18,16 @@ agent **discovery** and **tool-calling**. Neither defines:
 - **portable, per-capability reputation** — a score that travels across
   platforms instead of living inside one marketplace.
 
+Tessera's product direction is broader than this reference protocol: it is an
+open network where a person or orchestrator can discover independently built
+agents, compare offers, approve exact work, supervise durable execution, and
+accept success only after independent verification. Agents do **not** need to
+use Tessera's runtime; they join through a compatible Agent Card and A2A
+endpoint. See [`STRATEGY.md`](STRATEGY.md), the
+[`current-state inventory`](docs/architecture/current-state-inventory.md),
+the [`target architecture`](docs/architecture/target-architecture.md), and
+the [`compatibility contract`](docs/architecture/compatibility-contract.md).
+
 Building a rival messaging protocol would fight A2A/MCP on ground they already
 own and risk the fate of FIPA ACL (1997), which "never survived contact with
 the open internet." So AgentTrust rides on top of A2A's documented extension
@@ -108,10 +118,13 @@ requester and a provider — that exercise the full cycle (discovery →
 negotiation → execution → evidence → independent verification → reputation
 update) with **zero shared code beyond the published spec and schemas**.
 
-Every backend store (registry, vault, audit, verification service,
-marketplace/gig-board/agent_marketplace) persists to PostgreSQL 16, with
-Redis for the deliberately-ephemeral state — bring both up and apply the
-schema before running anything:
+The protocol reference stores (registry, vault, audit, verification service,
+marketplace/gig-board/agent_marketplace) persist to PostgreSQL 16, with Redis
+for deliberately ephemeral state. The broader Console product still has
+SQLite-backed session, OAuth, workflow, action, campaign, communications, and
+voice paths; those are an explicit consolidation target and must not be
+mistaken for the production target architecture. Bring PostgreSQL and Redis up
+and apply the schema before running the reference demo:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -124,6 +137,29 @@ python -m tools.migrate                             # apply pending migrations (
 pytest                        # full suite, including the e2e two-agent demo
 pytest tests/e2e -q           # just the two-agent demo (four separate processes)
 ```
+
+### Strict tenant-isolation verification
+
+Tenant-owned PostgreSQL data uses the single transaction-local setting
+`app.current_org_id` and fails closed when it is absent. Agent Cards and
+capability discovery remain public; agent ownership is private tenant data.
+
+Run the real RLS release gate against a dedicated test database, never a live
+development database:
+
+```bash
+createdb agenttrust_test
+psql -d agenttrust_test -v ON_ERROR_STOP=1 -f infra/roles.sql
+DATABASE_URL=postgresql:///agenttrust_test python -m tools.migrate
+TESSERA_ALLOW_SHARED_TEST_DATABASE=1 DATABASE_URL=postgresql:///agenttrust_test \
+  pytest -q tests/lib/test_multi_tenancy.py \
+           tests/integration/test_strict_tenant_isolation.py
+```
+
+The test asserts that runtime roles are neither table owners nor
+`BYPASSRLS`. Legacy rows without an organization remain preserved but are
+visible only to an administrative repair connection; see
+[`docs/runbooks/tenant-quarantine.md`](docs/runbooks/tenant-quarantine.md).
 
 To run it by hand — four processes, one command each — see
 [`docs/demo-runbook.md`](docs/demo-runbook.md). The demo task is Terraform
@@ -153,10 +189,37 @@ Design rationale and the full unit breakdown live in
 
 ## Status
 
-Draft. Schemas and RFCs are stable enough to build against; names, URIs, and
-the business model are explicitly open.
+The RFCs and schemas are draft public contracts with characterization tests.
+The reference two-agent flow is implemented. The Console is an active preview:
+its integrations and vertical applications exercise useful paths, but the
+canonical `request -> discovery -> offer -> approval -> execution ->
+verification -> reputation` lifecycle is not yet closed across every product
+path. Secondary vertical development is frozen during the architecture
+consolidation described in the
+[`active plan`](docs/plans/2026-08-25-001-refactor-core-architecture-consolidation-plan.md).
 
 ## Secure provider orchestration
 
 Tessera supports tenant-bound Google and Slack connections through its OAuth service, encrypted credential vault, action broker, signed receipts, and revisioned workflow engine. Dynamic workflows are compiled from the live capability catalog; provider combinations are not encoded as named scenarios. Keep Slack and dynamic execution disabled until the sandbox gates in [the Slack runbook](docs/operations/slack-integration-runbook.md) and [the orchestrator runbook](docs/operations/dynamic-orchestrator-runbook.md) pass.
+
+### Local HTTPS Slack Concierge
+
+Copy `.env.example` to `.env`, fill credentials only in the ignored local file,
+and register the exact HTTPS callback shown there in the Slack app. Start the
+session, OAuth, action-broker, Concierge, workflow-worker, and frontend
+services against the same local databases. Run the frontend with Next.js local
+HTTPS support:
+
+```bash
+cd frontend
+npm run dev -- --experimental-https --hostname localhost --port 3000
+```
+
+Open `https://localhost:3000`, accept the local development certificate, sign
+in, and reconnect Slack after adding scopes. The safe rollout order and manual
+F1–F4 sandbox script are documented in
+[`agents/orchestrator/README.md`](agents/orchestrator/README.md#7-conversational-slack).
+Keep all three conversational flags off until focused tests pass; enable reads,
+then writes, then DMs. Existing public-channel listing is independent of these
+flags.
 # ACP

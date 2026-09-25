@@ -32,8 +32,10 @@ class UserIndex(object):
 
     # -- user registration ----------------------------------------------------
 
-    def create_user(self, principal_id, username=None, public_key=None):
-        # type: (str, Optional[str], Optional[str]) -> dict
+    def create_user(
+        self, principal_id, username=None, public_key=None,
+        home_organization_id=None,
+    ):
         """Create a new user; return the user record.
 
         Key custody (Decision 8): only the PUBLIC side is ever stored — an
@@ -45,8 +47,13 @@ class UserIndex(object):
         map it to 409).
         """
         self._identity.register_principal(
-            principal_id, "user", display_name=username
+            principal_id, "user", display_name=username,
+            home_organization_id=home_organization_id,
         )
+        if home_organization_id:
+            self._identity.add_member(
+                home_organization_id, principal_id, role="member"
+            )
         if public_key:
             self._identity.register_key(principal_id, public_key)
         # Registration itself counts as "active": matches the prior
@@ -91,6 +98,12 @@ class UserIndex(object):
         """Check if a user exists."""
         principal_row = self._identity.get_principal(principal_id)
         return principal_row is not None and principal_row.get("principal_type") == "user"
+
+    def find_users_by_username(self, username):
+        # type: (str) -> List[dict]
+        """Find active users whose stored username matches exactly."""
+        rows = self._identity.find_user_principals_by_display_name(username)
+        return [self._user_dict(row["principal_id"], row) for row in rows]
 
     def update_last_active(self, principal_id):
         # type: (str) -> None

@@ -42,6 +42,8 @@ class SlackReceiptVerifier(object):
         }
         if receipt.get("message_ts") is not None:
             exact["message_ts"] = receipt["message_ts"]
+        if receipt.get("user_id") is not None:
+            exact["user_id"] = receipt["user_id"]
         for field, expected in exact.items():
             if observed.get(field) != expected:
                 return {

@@ -7,8 +7,8 @@ import ConnectGoogleCard from "./ConnectGoogleCard";
 
 
 beforeEach(() => {
-  window.sessionStorage.clear();
-  window.sessionStorage.setItem("tessera-csrf", "csrf-test");
+  window.sessionStorage.clear(); window.localStorage.clear();
+  window.localStorage.setItem("tessera-csrf", "csrf-test");
   window.history.replaceState({}, "", "/integrations");
 });
 

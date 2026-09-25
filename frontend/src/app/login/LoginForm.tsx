@@ -126,17 +126,44 @@ export default function LoginForm() {
     let principalId: string;
     if (mode === "username") {
       const mapped = lookupPrincipalId(capturedIdentifier);
-      if (!mapped) {
-        // Auto-switch rather than a bare error -- this device simply has no
-        // record of that username, which is a normal "new device" case.
-        setMode("principal_id");
-        setIdentifier("");
-        setSwitchNotice(
-          `"${capturedIdentifier}" isn't recognized on this device -- enter your principal_id instead.`,
-        );
-        return;
+      if (mapped) {
+        principalId = mapped;
+      } else {
+        setLoading(true);
+        try {
+          const resolved = await fetch(
+            `/api/auth/resolve?username=${encodeURIComponent(capturedIdentifier)}`,
+          );
+          if (resolved.status === 404) {
+            setErrorMessage("No account found for that username.");
+            registerFailure();
+            return;
+          }
+          if (resolved.status === 409) {
+            setMode("principal_id");
+            setIdentifier("");
+            setSwitchNotice(
+              `More than one account uses "${capturedIdentifier}" -- enter your principal_id instead.`,
+            );
+            return;
+          }
+          if (!resolved.ok) {
+            setErrorMessage("Service unavailable. Please try again in a moment.");
+            return;
+          }
+          const body = (await resolved.json()) as { principal_id?: unknown };
+          if (typeof body.principal_id !== "string" || !body.principal_id) {
+            setErrorMessage("Service unavailable. Please try again in a moment.");
+            return;
+          }
+          principalId = body.principal_id;
+        } catch {
+          setErrorMessage("Service unavailable. Please try again in a moment.");
+          return;
+        } finally {
+          setLoading(false);
+        }
       }
-      principalId = mapped;
     } else {
       principalId = capturedIdentifier;
     }
@@ -149,6 +176,33 @@ export default function LoginForm() {
       } catch {
         setErrorMessage("Service unavailable. Please try again in a moment.");
         return;
+      }
+
+      // A browser-local username mapping can outlive a partial/old
+      // registration. On a Vault miss, ask the Registry for the current
+      // authoritative principal and retry once before declaring the account
+      // missing.
+      if (response.status === 404 && mode === "username") {
+        try {
+          const resolved = await fetch(
+            `/api/auth/resolve?username=${encodeURIComponent(capturedIdentifier)}`,
+          );
+          if (resolved.ok) {
+            const body = (await resolved.json()) as { principal_id?: unknown };
+            if (
+              typeof body.principal_id === "string" &&
+              body.principal_id &&
+              body.principal_id !== principalId
+            ) {
+              principalId = body.principal_id;
+              response = await fetch(
+                `/api/vault/keyring?principal_id=${encodeURIComponent(principalId)}`,
+              );
+            }
+          }
+        } catch {
+          // Preserve the original, accurate Vault 404 below.
+        }
       }
 
       if (response.status === 404) {
@@ -182,8 +236,9 @@ export default function LoginForm() {
       const sessionKeypair = generateKeypair();
       const sessionPublicKeyB64 = b64encode(sessionKeypair.publicKey);
       const assertion = buildSessionAssertion(principalId, privateKey, sessionPublicKeyB64);
+      let webSession;
       try {
-        await establishWebSession(assertion);
+        webSession = await establishWebSession(assertion);
       } catch {
         setErrorMessage("Could not establish a secure session. Please try again.");
         return;
@@ -195,6 +250,12 @@ export default function LoginForm() {
         sessionPublicKey: sessionPublicKeyB64,
         sessionPrivateKey: b64encode(sessionKeypair.privateKey),
         assertion,
+        // The server's cutoffs, not the assertion's -- see SessionProvider's
+        // header. The assertion is a 15-minute one-shot proof; the session it
+        // just bought lasts 30 idle minutes / 12 hours absolute.
+        absoluteExpiresAt: webSession.expires_at,
+        idleTtlSeconds: webSession.idle_ttl_seconds,
+        lastActivityAt: Math.floor(Date.now() / 1000),
       });
       setFailureCount(0);
       setCooldownSeconds(0);

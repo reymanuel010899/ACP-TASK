@@ -9,7 +9,7 @@ import requests
 
 from libs.connectors.base import (
     ActionExecutor,
-    CredentialConnector,
+    OAuthCredentialConnector,
     ProviderAuthority,
     ProviderHTTPError,
     ProviderNetworkError,
@@ -49,7 +49,9 @@ def _request(http, timeout, method, url, operation, **kwargs):
     return response
 
 
-class GoogleCredentialConnector(CredentialConnector):
+class GoogleCredentialConnector(OAuthCredentialConnector):
+    provider = "google"
+
     def __init__(self, client_id, client_secret, redirect_uri, http=None,
                  timeout=10.0):
         if not client_id or not client_secret or not redirect_uri:

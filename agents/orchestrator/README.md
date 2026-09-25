@@ -78,3 +78,56 @@ Point it at a stack started in secure mode to exercise end-to-end
 signature enforcement. `--credential-id ID` tells the agent the work
 needs a vault credential; access to it is gated by the same approval
 policy, and only a granted/denied boolean ever reaches the brain.
+
+## 7. Conversational Slack
+
+The web Concierge supports bounded public-channel and thread reads, exact
+channel posts and thread replies, and one-to-one DMs.
+
+Which families an account holds is durable per-tenant state, not configuration.
+Every family lands disabled, so a new account does nothing until an
+administrator turns something on from Integrations — and turning it back off
+takes effect on the next dispatch, with no restart and no deploy:
+
+```bash
+python -m web.concierge --port 8130
+python -m services.workflow_worker.app
+```
+
+The Concierge and worker must share `WORKFLOW_DATABASE`; session, OAuth and
+broker services must use their shared configured stores. Configure either
+`ANTHROPIC_API_KEY` or `GROQ_API_KEY` for
+full natural-language planning. With neither key, the deterministic RuleBrain
+supports the documented common Slack phrases and reports its limitation.
+
+Roll out in this order: reads, channel/thread writes, then DMs. Each family is
+independent — disabling one leaves the others dispatching. The same switches
+are enforced at the broker, not only in the orchestrator, so a disabled family
+or a stopped account cannot be worked around by any other caller.
+
+A family disable and an emergency stop both gate writes only. Reconciliation
+reads survive both, because an unknown outcome can only be resolved by reading
+the very API the disable removed; blocking that would strand the family's own
+in-flight effects permanently.
+
+`POST /oauth/control-plane` changes one switch for the caller's own account —
+`{"action": "emergency_stop" | "family" | "sender", ...}` — and `GET` on the
+same path returns current state plus dispatched, prevented, in-progress and
+uncertain counts. The tenant always comes from the session, never the body.
+
+Required bot scopes are `channels:read` for channel discovery,
+`channels:history` for public-channel reads, `chat:write` for posts/replies,
+`users:read` for person resolution, and `im:write` for DMs. An installation
+owner must reconnect Slack after adding scopes; tenant members can use a
+healthy tenant installation but cannot change its OAuth lifecycle.
+
+For manual acceptance, use a dedicated sandbox workspace and test channel:
+
+1. Ask what one named person wrote in the previous seven days and open every citation.
+2. Ask to post without text, answer the one clarification, inspect the exact preview, then approve once.
+3. Read a thread and ask “reply there”; confirm the thread and exact text before approval.
+4. Resolve two same-named people, choose one, and approve one DM.
+5. Disable each rollout flag independently and confirm unrelated public-channel listing still works.
+
+Never paste tokens into chat, fixtures, screenshots, or logs. Inject rate-limit,
+missing-scope, and uncertain-outcome failures only in the sandbox.

@@ -138,6 +138,7 @@ function installFetchMock(script: FetchScript = {}) {
           principal_id: body.assertion.principal_id,
           csrf_token: "csrf-register-test",
           expires_at: 1_900_000_000,
+          idle_ttl_seconds: 1800,
         }),
         { status: 201, headers: { "Content-Type": "application/json" } },
       );
@@ -205,7 +206,7 @@ describe("RegisterForm", () => {
     });
     expect(pushMock).toHaveBeenCalledWith("/");
     expect(readUsernameMap().alice_1).toBe(principalId);
-    expect(window.sessionStorage.getItem("tessera-csrf")).toBe(
+    expect(window.localStorage.getItem("tessera-csrf")).toBe(
       "csrf-register-test",
     );
 

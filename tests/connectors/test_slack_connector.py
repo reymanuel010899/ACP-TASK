@@ -63,11 +63,18 @@ def test_authorization_is_bot_only_and_state_bound_without_pkce():
 def test_scope_catalog_keeps_private_channel_authority_explicit():
     catalog = connector(FakeHTTP([])).scope_catalog()
 
-    assert catalog["slack.channels.list"] == "channels:read"
-    assert catalog["slack.conversation.read"] == "channels:history"
-    assert catalog["slack.private_channels.list"] == "groups:read"
-    assert catalog["slack.private_conversation.read"] == "groups:history"
-    assert catalog["slack.private_thread.read"] == "groups:history"
+    assert catalog["slack.channels.list"] == frozenset({"channels:read"})
+    assert catalog["slack.conversation.read"] == frozenset({"channels:history"})
+    assert catalog["slack.private_channels.list"] == frozenset({"groups:read"})
+    assert catalog["slack.private_conversation.read"] == frozenset({"groups:history"})
+    assert catalog["slack.private_thread.read"] == frozenset({"groups:history"})
+    assert catalog["slack.users.list"] == frozenset({"users:read"})
+    assert catalog["slack.message.permalink"] == frozenset({"channels:history"})
+    # The DM opens a conversation and then posts to it, so the install
+    # must ask for both scopes or authorise a connection that cannot run it.
+    assert catalog["slack.direct_message.send"] == frozenset(
+        {"im:write", "chat:write"}
+    )
 
 
 def test_exchange_requires_bot_authority_and_keeps_workspace_metadata():

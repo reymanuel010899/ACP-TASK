@@ -1,9 +1,43 @@
 """Durable, one-step-at-a-time workflow scheduler."""
 
 import time
+from collections.abc import Mapping
+
+
+#: What a bare ``False`` from a step policy means. A policy that knows more
+#: than "no" -- the tenant control plane, for instance -- answers with a
+#: decision carrying its own reason, and the step parks under that instead, so
+#: the resume path can tell an emergency stop apart from a disabled family.
+DEFAULT_POLICY_REASON = "dispatch policy disabled"
+
+
+def _policy_allows(decision):
+    if isinstance(decision, Mapping):
+        return bool(decision.get("allowed", True))
+    return bool(decision)
+
+
+def _policy_reason(decision):
+    reason = getattr(decision, "reason", None)
+    if reason is None and isinstance(decision, Mapping):
+        reason = decision.get("reason")
+    return reason or DEFAULT_POLICY_REASON
 
 
 class RetryableStepError(Exception):
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class PausedStepError(Exception):
+    """A precondition outside the workflow is unavailable.
+
+    Waiting on it must not spend the step's bounded attempts. A provider
+    outage would otherwise convert perfectly good queued work into a
+    permanent `maximum attempts exceeded` failure.
+    """
+
     def __init__(self, message, retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
@@ -13,22 +47,32 @@ class AmbiguousStepError(Exception):
     pass
 
 
+class CorrectableStepError(Exception):
+    pass
+
+
 class WorkflowExecutor:
-    def __init__(self, repository, dispatcher, policy=None, clock=None, lease_ttl=60):
+    def __init__(self, repository, dispatcher, policy=None, clock=None,
+                 lease_ttl=60, paused_retry_seconds=60):
         self.repository = repository
         self.dispatcher = dispatcher
         self.policy = policy or (lambda _step: True)
         self.clock = clock or time.time
         self.lease_ttl = int(lease_ttl)
+        self.paused_retry_seconds = int(paused_retry_seconds)
 
     def run_next(self, workflow_run_id, revision_id, tenant_id, worker_id):
         revision = self.repository.get_revision(workflow_run_id, revision_id, tenant_id)
         if revision is None:
             raise ValueError("workflow revision not found")
-        if not self.repository.is_revision_approved(
+        effects = {step["effect"] for step in revision["steps"]}
+        authorized = all(self.repository.is_step_authorized(
             workflow_run_id, revision_id, tenant_id, revision["plan_graph_hash"],
-            int(self.clock()),
-        ):
+            effect, int(self.clock()),
+        ) for effect in effects) if hasattr(self.repository, "is_step_authorized") else self.repository.is_revision_approved(
+            workflow_run_id, revision_id, tenant_id, revision["plan_graph_hash"], int(self.clock())
+        )
+        if not authorized:
             return {"status": "needs_approval"}
         claim = self.repository.claim_ready_step(
             workflow_run_id, revision_id, tenant_id, worker_id,
@@ -57,18 +101,46 @@ class WorkflowExecutor:
                 claim, tenant_id, int(self.clock()), consumed=False
             )
             return {"status": "needs_replan", "step_id": step["step_id"]}
-        if not self.policy(step):
-            self.repository.pause_by_policy(revision_id, step["step_id"], tenant_id, "dispatch policy disabled")
+        decision = self.policy(step)
+        if not _policy_allows(decision):
+            reason = _policy_reason(decision)
+            self.repository.pause_by_policy(
+                revision_id, step["step_id"], tenant_id, reason
+            )
             self.repository.finish_claim_lease(
                 claim, tenant_id, int(self.clock()), consumed=False
             )
-            return {"status": "paused_by_policy", "step_id": step["step_id"]}
+            return {
+                "status": "paused_by_policy", "step_id": step["step_id"],
+                "reason": reason,
+            }
         try:
             result = self.dispatcher(step, claim)
         except AmbiguousStepError as exc:
             self.repository.mark_execution_unknown(revision_id, step["step_id"], tenant_id, str(exc))
             self.repository.finish_claim_lease(claim, tenant_id, int(self.clock()), consumed=True)
             return {"status": "execution_unknown", "step_id": step["step_id"]}
+        except PausedStepError as exc:
+            # The step never reached a provider and nothing about it is wrong,
+            # so this pass waits without drawing down the retry budget.
+            delay = max(1, int(exc.retry_after or self.paused_retry_seconds))
+            release = getattr(
+                self.repository, "release_without_consuming_attempt", None
+            )
+            if release is None:
+                self.repository.release_for_retry(
+                    revision_id, step["step_id"], tenant_id, str(exc),
+                    int(self.clock()) + delay,
+                )
+            else:
+                release(
+                    revision_id, step["step_id"], tenant_id, str(exc),
+                    int(self.clock()) + delay, claim["attempt"],
+                )
+            self.repository.finish_claim_lease(
+                claim, tenant_id, int(self.clock()), consumed=False
+            )
+            return {"status": "retry_wait", "step_id": step["step_id"]}
         except RetryableStepError as exc:
             delay = exc.retry_after or min(300, 2 ** int(claim["attempt"]))
             self.repository.release_for_retry(
@@ -81,6 +153,15 @@ class WorkflowExecutor:
             self.repository.pause_by_policy(revision_id, step["step_id"], tenant_id, str(exc))
             self.repository.finish_claim_lease(claim, tenant_id, int(self.clock()), consumed=False)
             return {"status": "blocked_connection", "step_id": step["step_id"]}
+        except CorrectableStepError as exc:
+            self.repository.pause_by_policy(
+                revision_id, step["step_id"], tenant_id, str(exc)
+            )
+            self.repository.finish_claim_lease(
+                claim, tenant_id, int(self.clock()), consumed=False
+            )
+            return {"status": "retryable_failure", "step_id": step["step_id"],
+                    "recovery": str(exc)}
         except Exception as exc:
             self.repository.mark_execution_unknown(
                 revision_id, step["step_id"], tenant_id,

@@ -4,10 +4,13 @@ from agents.orchestrator.planner import PlanCompiler, PlanRejected, descriptor_h
 from libs.integrations.catalog import ConnectionCapabilitySnapshot, TrustedCapabilityDefinition
 
 
-def definition(capability_id, provider="synthetic", effect="read", output=None):
+def definition(
+    capability_id, provider="synthetic", effect="read", input_schema=None,
+    output=None,
+):
     return TrustedCapabilityDefinition(
         capability_id=capability_id, version="1.0.0", provider=provider,
-        input_schema={"type": "object", "additionalProperties": True},
+        input_schema=input_schema or {"type": "object", "additionalProperties": True},
         output_schema=output or {"type": "object", "additionalProperties": True},
         required_scopes=frozenset({"scope"}), effect=effect, risk="low",
         retry_policy="safe", preview_fields=("payload",) if effect == "write" else (),
@@ -65,8 +68,19 @@ def test_rejects_stale_descriptor_and_unauthorized_connection():
 
 
 def test_cross_provider_output_reference_creates_compiler_owned_disclosure():
-    source = definition("source.read", provider="slack")
-    sink = definition("sink.write", provider="google", effect="write")
+    source = definition("source.read", provider="slack", output={
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "additionalProperties": False,
+    })
+    sink = definition(
+        "sink.write", provider="google", effect="write",
+        input_schema={
+            "type": "object",
+            "properties": {"body": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    )
     compiler = PlanCompiler(
         [source, sink],
         [snapshot("source.read", "conn:s"), snapshot("sink.write", "conn:g")],

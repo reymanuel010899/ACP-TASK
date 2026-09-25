@@ -26,7 +26,23 @@ import { sign } from "./agentCrypto";
 // Constants (mirror libs/signing.py)
 // ---------------------------------------------------------------------------
 
-/** Default session lifetime, seconds. Mirrors libs/signing.py::DEFAULT_SESSION_TTL. */
+/**
+ * Lifetime of the signed *identity proof*, seconds. Mirrors
+ * libs/signing.py::DEFAULT_SESSION_TTL.
+ *
+ * This is NOT how long a login lasts. The assertion is a one-shot proof
+ * consumed by `POST /sessions` (the session service records its fingerprint
+ * in `consumed_identity_proofs` and refuses to replay it); 15 minutes only
+ * has to cover minting it and handing it over. Once exchanged, how long the
+ * user stays signed in is owned entirely by the server-side session -- a
+ * 30-minute sliding idle window and a 12-hour absolute cap, both configured
+ * in `services/session/app.py` and reported back as `idle_ttl_seconds` /
+ * `expires_at` on {@link WebSession}.
+ *
+ * `SessionProvider.tsx` used to treat this constant as the session clock,
+ * which is why every login died after exactly 15 minutes regardless of what
+ * the user was doing. It no longer reads it.
+ */
 export const DEFAULT_SESSION_TTL = 900; // 15 minutes
 
 // ---------------------------------------------------------------------------
@@ -72,11 +88,73 @@ export interface SessionAssertion {
 export interface WebSession {
   principal_id: string;
   csrf_token: string;
+  /** Epoch seconds -- the server's ABSOLUTE cutoff (12h), unaffected by activity. */
   expires_at: number;
+  /** The server's sliding idle window in seconds (30 min). Served, never assumed. */
+  idle_ttl_seconds: number;
 }
 
 export const WEB_SESSION_CSRF_STORAGE_KEY = "tessera-csrf";
 export const WEB_SESSION_EXPIRY_STORAGE_KEY = "tessera-session-expires-at";
+
+/**
+ * Fallback idle window, seconds, mirroring `services/session/app.py`'s
+ * `SESSION_IDLE_TTL_SECONDS` default.
+ *
+ * The server reports its real value as `idle_ttl_seconds` and that always
+ * wins. This exists purely so a session service that predates that field
+ * degrades to the correct default instead of poisoning the session with an
+ * `undefined` window -- which `JSON.stringify` then drops entirely, leaving
+ * a stored record that fails validation and signs the user out on every
+ * single page load. Never treat a missing field from an older backend as a
+ * reason to fail closed on something this visible.
+ */
+export const DEFAULT_IDLE_TTL_SECONDS = 1800;
+
+/** Coerce a server-reported idle window into a usable number of seconds. */
+export function normalizeIdleTtlSeconds(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_IDLE_TTL_SECONDS;
+}
+
+/**
+ * `localStorage`, not `sessionStorage`: the HttpOnly session cookie already
+ * outlives the tab that created it (12h absolute), so keeping this metadata
+ * per-tab meant a closed tab stranded a still-valid server session with no
+ * CSRF token to ever revoke it. Kept in the same storage as
+ * `SessionProvider.tsx`'s own session record so the two can never disagree
+ * about whether a session exists.
+ */
+function metadataStore(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** The stored CSRF token for the active web session, if any. */
+export function readStoredCsrfToken(): string | null {
+  try {
+    return metadataStore()?.getItem(WEB_SESSION_CSRF_STORAGE_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function persistWebSessionMetadata(session: WebSession): void {
+  try {
+    const store = metadataStore();
+    if (!store) return;
+    store.setItem(WEB_SESSION_CSRF_STORAGE_KEY, session.csrf_token);
+    store.setItem(WEB_SESSION_EXPIRY_STORAGE_KEY, String(session.expires_at));
+  } catch {
+    // The HttpOnly cookie remains authoritative. Callers surface that CSRF
+    // recovery is unavailable if browser storage is disabled.
+  }
+}
 
 /**
  * Exchange the signed identity assertion for an opaque HttpOnly BFF session.
@@ -95,18 +173,67 @@ export async function establishWebSession(
   if (!response.ok) {
     throw new SessionAssertionError("failed to establish authenticated session");
   }
-  const session = (await response.json()) as WebSession;
-  try {
-    window.sessionStorage.setItem(WEB_SESSION_CSRF_STORAGE_KEY, session.csrf_token);
-    window.sessionStorage.setItem(
-      WEB_SESSION_EXPIRY_STORAGE_KEY,
-      String(session.expires_at),
-    );
-  } catch {
-    // The HttpOnly cookie remains authoritative. Callers surface that CSRF
-    // recovery is unavailable if browser session storage is disabled.
-  }
+  const raw = (await response.json()) as WebSession;
+  // Normalized at the boundary so no caller ever sees an absent idle window.
+  const session: WebSession = {
+    ...raw,
+    idle_ttl_seconds: normalizeIdleTtlSeconds(raw.idle_ttl_seconds),
+  };
+  persistWebSessionMetadata(session);
   return session;
+}
+
+/**
+ * Outcome of asking the session service whether the cookie session is still
+ * good: the refreshed session, `"expired"` when the server has positively
+ * rejected it (401 -- idle window elapsed, absolute cap hit, or revoked), or
+ * `"unavailable"` when the question could not be answered at all.
+ *
+ * The third case is load-bearing: a network blip, an offline laptop or a
+ * restarting BFF must NOT be read as "you are logged out". Callers treat
+ * `"unavailable"` as "keep whatever you had and ask again later", so only a
+ * real server verdict ever ends a session early.
+ */
+export type WebSessionProbe = WebSession | "expired" | "unavailable";
+
+/**
+ * Re-read the server-side session. This is also what SLIDES its idle window:
+ * `GET /sessions/current` bumps `last_seen_at` on every successful resolve
+ * (see `services/session/repository.py::resolve`), so this must only ever be
+ * called in response to genuine user activity -- calling it on a bare timer
+ * would keep an abandoned tab logged in forever, which is precisely the
+ * behavior the 30-minute idle window exists to prevent.
+ */
+export async function probeWebSession(): Promise<WebSessionProbe> {
+  let response: Response;
+  try {
+    response = await fetch("/api/session", {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch {
+    return "unavailable";
+  }
+  if (response.status === 401) return "expired";
+  if (!response.ok) return "unavailable";
+  try {
+    const session = (await response.json()) as WebSession;
+    // `GET /sessions/current` does not re-issue the CSRF token, so preserve
+    // the one minted at login rather than overwriting it with `undefined`.
+    if (typeof session.expires_at !== "number") return "unavailable";
+    try {
+      metadataStore()?.setItem(
+        WEB_SESSION_EXPIRY_STORAGE_KEY,
+        String(session.expires_at),
+      );
+    } catch {
+      // Non-fatal: the in-memory copy still drives this tab's clock.
+    }
+    return { ...session, idle_ttl_seconds: normalizeIdleTtlSeconds(session.idle_ttl_seconds) };
+  } catch {
+    return "unavailable";
+  }
 }
 
 export async function revokeWebSession(csrfToken: string): Promise<void> {
@@ -122,10 +249,11 @@ export async function revokeWebSession(csrfToken: string): Promise<void> {
 }
 
 export function clearStoredWebSessionMetadata(): void {
-  if (typeof window === "undefined") return;
   try {
-    window.sessionStorage.removeItem(WEB_SESSION_CSRF_STORAGE_KEY);
-    window.sessionStorage.removeItem(WEB_SESSION_EXPIRY_STORAGE_KEY);
+    const store = metadataStore();
+    if (!store) return;
+    store.removeItem(WEB_SESSION_CSRF_STORAGE_KEY);
+    store.removeItem(WEB_SESSION_EXPIRY_STORAGE_KEY);
   } catch {
     // Storage unavailable; there is no readable cookie material to clear.
   }

@@ -9,6 +9,7 @@ import jsonschema
 from pydantic import ValidationError
 
 from agents.orchestrator.workflow_models import WorkflowPlanDraft
+from agents.orchestrator.slack_conversation import interpret_slack_turn
 from libs.integrations.catalog import (
     ConnectionCapabilitySnapshot,
     TrustedCapabilityDefinition,
@@ -124,6 +125,16 @@ class PlanCompiler(object):
             safe_input, step_disclosures = self._authorize_data_flow(
                 step.input, definition.provider, step.step_id
             )
+            if definition.provider == "twilio" and definition.effect == "write":
+                referenced = {
+                    path[0] for path, _reference in
+                    _references_with_paths(safe_input) if path
+                }
+                protected = set(definition.preview_fields)
+                if referenced.intersection(protected):
+                    raise PlanRejected(
+                        "Twilio write preview fields must be literal"
+                    )
             disclosures.extend(step_disclosures)
             try:
                 jsonschema.validate(
@@ -209,10 +220,33 @@ class PlanCompiler(object):
                     raise PlanRejected("output reference is invalid")
                 source = by_id[pieces[0]]
                 recipient_fields = {"to", "recipient", "recipients", "attendee", "attendees"}
-                if step["provider"] == "google" and recipient_fields.intersection(path):
+                if step["provider"] == "google" and recipient_fields.intersection(
+                    str(part).lower() for part in path
+                ):
                     raise PlanRejected(
                         "dynamic identities require an explicit confirmed recipient"
                     )
+                source_definition = self.definitions[
+                    (source["capability_id"], source["capability_version"])
+                ]
+                destination_definition = self.definitions[
+                    (step["capability_id"], step["capability_version"])
+                ]
+                source_schemas = _schemas_at_path(
+                    source_definition.output_schema, pieces[2:]
+                )
+                if not source_schemas:
+                    raise PlanRejected("undeclared source output path")
+                destination_schemas = _schemas_at_path(
+                    destination_definition.input_schema, path,
+                    allow_array_indices=True,
+                )
+                if not destination_schemas:
+                    raise PlanRejected("undeclared destination input path")
+                if not _schemas_are_compatible(
+                    source_schemas, destination_schemas
+                ):
+                    raise PlanRejected("incompatible reference type")
 
     @staticmethod
     def _reference_disclosures(steps):
@@ -301,6 +335,7 @@ class DynamicPlanner(object):
             raw_plan = generate_plan(goal, capabilities, context)
         else:
             raw_plan = _offline_public_slack_plan(goal, capabilities, context)
+        _ground_slack_entity_ids(raw_plan, context)
         compiled = self.compiler.compile(raw_plan)
         compiled["shadow_mode"] = self.shadow_mode
         return compiled
@@ -308,27 +343,64 @@ class DynamicPlanner(object):
 
 def _offline_public_slack_plan(goal, capabilities, context):
     normalized = unicodedata.normalize("NFKD", str(goal).lower())
-    normalized = "".join(
-        character for character in normalized
-        if not unicodedata.combining(character)
-    )
+    normalized = "".join(character for character in normalized
+                         if not unicodedata.combining(character))
+    resolution = dict(context.get("slack_resolution") or {})
+    turn = interpret_slack_turn(goal, resolution)
     is_public_channel_list = (
-        "slack" in normalized
-        and ("canal" in normalized or "channel" in normalized)
-        and ("public" in normalized)
+        "slack" in normalized and ("canal" in normalized or "channel" in normalized)
+        and "public" in normalized
         and any(word in normalized for word in ("lista", "listar", "muestra", "show", "list"))
     )
-    capability = next(
-        (
-            item for item in capabilities
-            if item["capability_id"] == "slack.channels.list"
-            and item.get("connections")
-        ),
-        None,
+    is_private_channel_list = (
+        "slack" in normalized and ("canal" in normalized or "channel" in normalized)
+        and ("privad" in normalized or "private" in normalized)
+        and any(word in normalized for word in ("lista", "listar", "muestra", "show", "list"))
     )
+    operation = ("private_channels" if is_private_channel_list else
+                 "channels" if is_public_channel_list else turn.operation)
+    capability_ids = {
+        "channels": "slack.channels.list",
+        "private_channels": "slack.private_channels.list",
+        "read": "slack.conversation.read",
+        "summarize": "slack.conversation.read",
+        "post": "slack.message.send",
+        "reply": "slack.thread.reply",
+        "dm": "slack.direct_message.send",
+    }
+    wanted = capability_ids.get(operation)
+    candidates = [item for item in capabilities
+                  if item["capability_id"] == wanted and item.get("connections")]
     tenant_id = context.get("tenant_id")
-    if not is_public_channel_list or capability is None or not tenant_id:
+    connection = (resolution.get("active_connection") or {}).get("id")
+    capability = next((item for item in candidates
+                       if connection in item["connections"]), None) if connection else None
+    if capability is None and len(candidates) == 1 and len(candidates[0]["connections"]) == 1:
+        capability = candidates[0]
+        connection = capability["connections"][0]
+    if capability is None or not tenant_id:
         raise PlanRejected("planning model cannot generate this workflow")
+    payload = {}
+    channel = (resolution.get("active_channel") or {}).get("id")
+    person = (resolution.get("active_person") or {}).get("id")
+    thread = resolution.get("active_thread") or {}
+    message = resolution.get("message_text") or turn.message_text
+    if operation in ("read", "summarize", "post", "reply"):
+        if not channel:
+            raise PlanRejected("Slack channel must be resolved before planning")
+        payload["channel_id"] = channel
+    if operation == "reply":
+        if not thread.get("thread_ts"):
+            raise PlanRejected("Slack thread must be resolved before planning")
+        payload["thread_ts"] = thread["thread_ts"]
+    if operation == "dm":
+        if not person:
+            raise PlanRejected("Slack person must be resolved before planning")
+        payload["user_id"] = person
+    if operation in ("post", "reply", "dm"):
+        if not message:
+            raise PlanRejected("Slack message text is required before planning")
+        payload["text"] = message
     return {
         "tenant_id": tenant_id,
         "goal": goal,
@@ -336,12 +408,33 @@ def _offline_public_slack_plan(goal, capabilities, context):
             "step_id": "slack-public-channels",
             "capability_id": capability["capability_id"],
             "capability_version": capability["version"],
-            "connection_id": capability["connections"][0],
+            "connection_id": connection,
             "descriptor_snapshot_hash": capability["descriptor_snapshot_hash"],
-            "input": {},
+            "input": payload,
             "depends_on": [],
         }],
     }
+
+
+def _ground_slack_entity_ids(raw_plan, context):
+    """A model can name an operation, never mint provider entity authority."""
+    if hasattr(raw_plan, "model_dump"):
+        material = raw_plan.model_dump()
+    else:
+        material = raw_plan
+    resolution = dict((context or {}).get("slack_resolution") or {})
+    trusted = {
+        "channel_id": (resolution.get("active_channel") or {}).get("id"),
+        "user_id": (resolution.get("active_person") or {}).get("id"),
+        "thread_ts": (resolution.get("active_thread") or {}).get("thread_ts"),
+    }
+    for step in material.get("steps", []) if isinstance(material, dict) else []:
+        if not str(step.get("capability_id", "")).startswith("slack."):
+            continue
+        payload = step.get("input") if isinstance(step.get("input"), dict) else {}
+        for field, expected in trusted.items():
+            if field in payload and (expected is None or payload[field] != expected):
+                raise PlanRejected("Slack entity is not deterministically resolved")
 
 
 def _references(value):
@@ -365,11 +458,126 @@ def _references_with_paths(value, path=()):
             found.append((path, value["$ref"]))
         else:
             for key, item in value.items():
-                found.extend(_references_with_paths(item, path + (str(key).lower(),)))
+                found.extend(_references_with_paths(item, path + (str(key),)))
     elif isinstance(value, list):
         for index, item in enumerate(value):
             found.extend(_references_with_paths(item, path + (str(index),)))
     return found
+
+
+def _schemas_at_path(schema, path, allow_array_indices=False):
+    candidates = _schema_alternatives(schema)
+    for part in path:
+        next_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            properties = candidate.get("properties")
+            if isinstance(properties, dict) and part in properties:
+                next_candidates.extend(_schema_alternatives(properties[part]))
+                continue
+            if (
+                allow_array_indices
+                and _schema_allows_type(candidate, "array")
+                and str(part).isdigit()
+            ):
+                items = candidate.get("items")
+                if isinstance(items, dict):
+                    next_candidates.extend(_schema_alternatives(items))
+        candidates = next_candidates
+        if not candidates:
+            break
+    return candidates
+
+
+def _schema_alternatives(schema):
+    if not isinstance(schema, dict):
+        return []
+    alternatives = [schema]
+    for keyword in ("oneOf", "anyOf", "allOf"):
+        values = schema.get(keyword)
+        if isinstance(values, list):
+            for value in values:
+                alternatives.extend(_schema_alternatives(value))
+    return alternatives
+
+
+def _schemas_are_compatible(source_schemas, destination_schemas):
+    source_types = set().union(*(
+        _schema_types(schema) for schema in source_schemas
+    ))
+    destination_types = set().union(*(
+        _schema_types(schema) for schema in destination_schemas
+    ))
+    if not source_types or not destination_types:
+        return False
+    compatible_destination_types = set(destination_types)
+    if "number" in destination_types:
+        compatible_destination_types.add("integer")
+    return source_types.issubset(compatible_destination_types)
+
+
+def _schema_allows_type(schema, expected):
+    types = _schema_types(schema)
+    return expected in types or (expected == "integer" and "number" in types)
+
+
+def _schema_types(schema):
+    if not isinstance(schema, dict):
+        return set()
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        types = {declared}
+    elif isinstance(declared, list):
+        types = {item for item in declared if isinstance(item, str)}
+    elif "properties" in schema:
+        types = {"object"}
+    elif "items" in schema:
+        types = {"array"}
+    elif "const" in schema:
+        types = {_json_type(schema["const"])}
+    elif isinstance(schema.get("enum"), list):
+        types = {_json_type(item) for item in schema["enum"]}
+    else:
+        types = set()
+    alternatives = set()
+    for keyword in ("oneOf", "anyOf"):
+        values = schema.get(keyword)
+        if isinstance(values, list):
+            for item in values:
+                alternatives.update(_schema_types(item))
+    if alternatives:
+        types = types.intersection(alternatives) if types else alternatives
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list) and all_of:
+        all_types = [_schema_types(item) for item in all_of]
+        constrained_types = [item for item in all_types if item]
+        constrained = (
+            set.intersection(*constrained_types) if constrained_types else set()
+        )
+        types = (
+            types.intersection(constrained)
+            if types and constrained else constrained or types
+        )
+    return types
+
+
+def _json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
 
 
 def _allow_declared_references(schema, allow_self=False):

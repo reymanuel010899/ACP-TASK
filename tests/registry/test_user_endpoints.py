@@ -39,6 +39,41 @@ def service(index):
 
 
 class TestUserRegistration:
+    def test_registration_assigns_the_configured_home_organization(self, index):
+        class Users:
+            def __init__(self):
+                self.created = None
+
+            def user_exists(self, _principal_id):
+                return False
+
+            def create_user(self, principal_id, **values):
+                self.created = (principal_id, values)
+                return {"principal_id": principal_id}
+
+            def get_aggregated_reputation(self, _principal_id):
+                return {
+                    "tasks_verified": 0, "tasks_rejected": 0,
+                    "verification_rate": None,
+                }
+
+        users = Users()
+        service = RegistryService(
+            index, user_index=users,
+            default_organization_id="org:local",
+        )
+
+        status, _body = service.register_user({
+            "principal_id": "principal:new", "username": "new-user",
+        })
+
+        assert status == 200
+        assert users.created == ("principal:new", {
+            "username": "new-user",
+            "public_key": None,
+            "home_organization_id": "org:local",
+        })
+
     def test_register_new_user_with_principal(self, service):
         """User registration returns 200 with principal_id stored."""
         status, body = service.register_user(
@@ -136,6 +171,29 @@ class TestUserLogin:
         """Login with non-string principal_id returns 422."""
         status, body = service.login_user({"principal_id": 456})
         assert status == 422, body
+
+    def test_resolve_username_returns_principal(self, service):
+        service.user_index.find_users_by_username = lambda username: [
+            {"principal_id": "ed25519_user_resolved"}
+        ] if username == "resolved-user" else []
+
+        status, body = service.resolve_username("resolved-user")
+
+        assert status == 200
+        assert body == {
+            "username": "resolved-user",
+            "principal_id": "ed25519_user_resolved",
+        }
+
+    def test_resolve_username_handles_missing_and_ambiguous_names(self, service):
+        service.user_index.find_users_by_username = lambda _username: []
+        assert service.resolve_username("missing")[0] == 404
+
+        service.user_index.find_users_by_username = lambda _username: [
+            {"principal_id": "one"},
+            {"principal_id": "two"},
+        ]
+        assert service.resolve_username("duplicate")[0] == 409
 
 
 class TestUserReputationQuery:

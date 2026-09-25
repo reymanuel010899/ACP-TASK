@@ -4,8 +4,22 @@ import hashlib
 import json
 import time
 
-from agents.orchestrator.planner import DynamicPlanner, PlanCompiler
-from libs.integrations.catalog import ConnectionCapabilitySnapshot
+from agents.orchestrator.compound import (
+    apply_effect_decision,
+    build_effect_group,
+    dispatchable_effects,
+    group_outcome,
+)
+from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
+from agents.orchestrator.slack_conversation import SlackConversationCoordinator
+from agents.orchestrator.slack_operations import (
+    load_contacts_operations,
+    load_slack_operations,
+)
+from libs.integrations.catalog import (
+    CONTACTS_PROVIDER,
+    ConnectionCapabilitySnapshot,
+)
 
 
 def _hash(value):
@@ -14,7 +28,12 @@ def _hash(value):
 
 class DynamicWorkflowService:
     def __init__(self, brain, definitions, connection_repository, workflow_repository,
-                 rollout_version="production-v1", shadow_mode=True, clock=None):
+                 rollout_version="production-v1", shadow_mode=True, clock=None,
+                 conversation_store=None, conversational_reads_enabled=True,
+                 slack_writes_enabled=True, slack_dms_enabled=True,
+                 slack_policy_visible=None, slack_family_flags=None,
+                 private_read_authorizer=None, control_plane=None,
+                 contacts_family_flags=None, contacts_policy_visible=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -22,9 +41,1298 @@ class DynamicWorkflowService:
         self.rollout_version = rollout_version
         self.shadow_mode = bool(shadow_mode)
         self.clock = clock or time.time
+        self.conversation_store = conversation_store
+        self.conversational_reads_enabled = bool(conversational_reads_enabled)
+        self.slack_writes_enabled = bool(slack_writes_enabled)
+        self.slack_dms_enabled = bool(slack_dms_enabled)
+        self.slack_policy_visible = slack_policy_visible
+        self.slack_family_flags = dict(slack_family_flags or {})
+        # Absent an audited tenant grant, private reads stay denied (R21).
+        self.private_read_authorizer = private_read_authorizer
+        #: Durable per-tenant family and emergency-stop state. When one is
+        #: wired it outranks every constructor default below, because those
+        #: defaults are process-wide and this is not: two tenants on one
+        #: process must be able to hold different answers, and an
+        #: administrator must be able to change theirs without a restart.
+        self.control_plane = control_plane
+        self.slack_coordinator = SlackConversationCoordinator()
+        slack_definitions = tuple(
+            item for item in self.definitions if item.provider == "slack"
+        )
+        self.slack_operation_registry = (
+            load_slack_operations(slack_definitions)
+            if slack_definitions else None
+        )
+        #: Contacts is first-party, so there is no installation to check and no
+        #: consent screen to have visited: being registered in the catalog is
+        #: what "installed" means for it. Family state still gates it, and a
+        #: family with no answer is off.
+        self.contacts_family_flags = dict(contacts_family_flags or {})
+        self.contacts_policy_visible = contacts_policy_visible
+        contacts_capabilities = tuple(
+            item for item in self.definitions
+            if item.provider == CONTACTS_PROVIDER
+        )
+        self.contacts_operation_registry = (
+            load_contacts_operations(contacts_capabilities)
+            if contacts_capabilities else None
+        )
+
+    def coordinate_slack_turn(
+        self, tenant_id, principal_id, text, conversation_id=None,
+        channels=None, users=None,
+    ):
+        """Interpret and ground one turn without compiling unresolved authority."""
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            # R28: a stop is account-wide and covers inbound handling too. It
+            # is refused here, before any interpretation, so a stopped account
+            # neither plans work it can never dispatch nor spends model calls
+            # discovering that. This is the only inbound path a stop degrades;
+            # reconciliation and provider callbacks are deliberately untouched.
+            return self._slack_limitation("emergency_stop", "contact_admin")
+        active = None
+        if conversation_id and self.conversation_store is not None:
+            active = self.conversation_store.get(
+                conversation_id, tenant_id, principal_id
+            )
+        installations = self._tenant_installations(tenant_id, principal_id)
+        if channels is None and hasattr(self.connections, "list_slack_channels"):
+            channels = self.connections.list_slack_channels(tenant_id, principal_id)
+        if users is None and hasattr(self.connections, "list_slack_users"):
+            users = self.connections.list_slack_users(tenant_id, principal_id)
+        interpretation = None
+        projection = ()
+        if (
+            self.slack_operation_registry is not None
+            or self.contacts_operation_registry is not None
+        ) and hasattr(self.brain, "understand_slack"):
+            # One projection, two manifests. The model sees a single list of
+            # operations it may name and cannot tell which store or provider
+            # backs any of them, which is what keeps "may never invent an
+            # operation" a property of the join rather than of the prompt.
+            projection = (
+                self._slack_operation_projection(installations, tenant_id)
+                + self.contacts_operation_projection(tenant_id)
+            )
+            interpretation = self.brain.understand_slack(text, {
+                "slack_operation_projection": projection,
+                "active_conversation": active or {},
+            })
+            limitation = self._interpretation_limitation(
+                text, interpretation, installations, projection, tenant_id
+            )
+            if limitation is not None:
+                return limitation
+        result = self.slack_coordinator.coordinate(
+            text, active_state=active, installations=installations,
+            channels=channels, users=users, interpretation=interpretation,
+        )
+        disabled_feature = self._disabled_slack_feature(
+            result.turn.operation, tenant_id
+        )
+        if disabled_feature:
+            return {
+                "state": "retryable_failure",
+                "error": {"code": "feature_disabled"},
+                "recovery": {
+                    "action": "contact_admin", "feature": disabled_feature,
+                },
+            }
+        if conversation_id and active is None and result.turn.refers_to_active_target:
+            return {
+                "state": "expired", "conversation_id": conversation_id,
+                "need": result.need,
+                "message": (
+                    "Esta conversación expiró; vuelve a indicar el destino."
+                    if result.turn.locale == "es"
+                    else "This conversation expired; please name the target again."
+                ),
+            }
+        payload = result.model_dump()
+        if interpretation is not None:
+            proposal = interpretation.model_dump()
+            payload["slack_interpretation"] = proposal
+            payload["compound_operations"] = proposal["operations"]
+            payload["dependencies"] = proposal["dependencies"]
+        if self.conversation_store is not None:
+            if active is None:
+                active = self.conversation_store.create(
+                    tenant_id, principal_id, conversation_id,
+                    locale=result.turn.locale,
+                )
+                conversation_id = active["conversation_id"]
+            updates = {
+                key: value for key, value in result.resolved.items()
+                if key in {
+                    "active_connection", "active_channel", "active_person",
+                    "active_thread", "active_message", "active_file",
+                    "active_reaction", "read_period", "pending_draft",
+                }
+            }
+            prior_refs = {
+                item.get("slot"): item
+                for item in (active.get("entity_refs") or [])
+                if isinstance(item, dict) and item.get("slot")
+            }
+            entity_refs = self._persist_grounded_slack_entities(
+                active, result.resolved, installations,
+                "brain" if interpretation is not None else "deterministic",
+            )
+            if entity_refs:
+                updates["entity_refs"] = entity_refs
+            if interpretation is not None:
+                proposal = interpretation.model_dump()
+                updates["operation_candidates"] = proposal["operations"]
+                updates["slot_state"] = proposal["slots"]
+                updates["dependencies"] = proposal["dependencies"]
+                updates["blockers"] = proposal["blockers"]
+                updates["effect_candidates"] = proposal["operations"]
+                known_inputs = dict(active.get("known_inputs") or {})
+                for slot in proposal["slots"]:
+                    known_inputs[slot["name"]] = slot["value"]
+                updates["known_inputs"] = known_inputs
+                current_refs = {
+                    item.get("slot"): item
+                    for item in entity_refs
+                    if isinstance(item, dict) and item.get("slot")
+                }
+                corrections = list(active.get("corrections") or [])
+                slot_names = {
+                    "channel": "active_channel",
+                    "person": "active_person",
+                    "thread": "active_thread",
+                    "message": "active_message",
+                    "file": "active_file",
+                    "reaction": "active_reaction",
+                    "workspace": "active_connection",
+                }
+                for correction in proposal["corrections"]:
+                    slot = slot_names.get(correction["slot"])
+                    previous = prior_refs.get(slot) or {}
+                    replacement = current_refs.get(slot) or {}
+                    corrections.append({
+                        **correction,
+                        "recorded_at": int(self.clock()),
+                        "base_state_version": active["state_version"],
+                        "previous_entity_ref_id": previous.get("entity_ref_id"),
+                        "replacement_entity_ref_id": replacement.get(
+                            "entity_ref_id"
+                        ),
+                    })
+                updates["corrections"] = corrections
+            persisted_status = "succeeded" if result.state == "completed" else result.state
+            updates.update(status=persisted_status, locale=result.turn.locale,
+                           operation=result.turn.operation, blocking_need=None)
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id, **updates
+            )
+            if result.need:
+                self.conversation_store.record_need(
+                    conversation_id, tenant_id, principal_id, result.need
+                )
+            self._record_conversation_outcomes(
+                conversation_id, tenant_id, principal_id, result,
+                updates.get("corrections"), active.get("corrections"),
+            )
+            payload["conversation_id"] = conversation_id
+        return payload
+
+    OUTCOME_STATUS_EVENTS = {
+        "needs_input": "clarification_requested",
+        "awaiting_approval": "previewed",
+        "succeeded": "completed",
+        "completed": "completed",
+        "ready": "completed",
+        "failed": "failed",
+        "retryable_failure": "failed",
+    }
+
+    def _record_conversation_outcomes(
+        self, conversation_id, tenant_id, principal_id, result, corrections,
+        prior_corrections,
+    ):
+        """Emit privacy-safe outcome facts that Phase 1 baselines depend on."""
+        if not hasattr(self.workflows, "append_conversation_outcome_event"):
+            return
+        now = int(self.clock())
+        operation = result.turn.operation
+        metrics = {
+            "locale": result.turn.locale,
+            "correction_count": len(corrections or ()),
+        }
+        events = []
+        if operation:
+            events.append(("operation_attempted", metrics))
+        if len(corrections or ()) > len(prior_corrections or ()):
+            events.append(("corrected", metrics))
+        status_event = self.OUTCOME_STATUS_EVENTS.get(
+            "succeeded" if result.state == "completed" else result.state
+        )
+        if status_event:
+            events.append((status_event, metrics))
+        for event_type, event_metrics in events:
+            self._emit_conversation_outcome(
+                conversation_id, tenant_id, principal_id, event_type,
+                operation_family=operation, metrics=event_metrics,
+            )
+
+    def _emit_conversation_outcome(self, conversation_id, tenant_id,
+                                   principal_id, event_type,
+                                   operation_family=None, metrics=None):
+        """Never let a metrics write break the operation it measures."""
+        if not hasattr(self.workflows, "append_conversation_outcome_event"):
+            return False
+        try:
+            self.workflows.append_conversation_outcome_event(
+                conversation_id, tenant_id, principal_id, event_type,
+                int(self.clock()), operation_family=operation_family,
+                metrics=metrics,
+            )
+        except (KeyError, ValueError):
+            return False
+        return True
+
+    def advance_slack_turn(self, conversation_id, tenant_id, principal_id,
+                           text, turn_payload):
+        """Compile a fully grounded turn; unresolved turns remain intake-only."""
+        need = turn_payload.get("need") or {}
+        turn = turn_payload.get("turn") or {}
+        query = turn.get("channel_name") if need.get("field") == "channel" else turn.get("person_name")
+        if turn_payload.get("state") == "needs_input" and query and need.get("field") in {"channel", "person"}:
+            return self._start_slack_entity_resolution(
+                conversation_id, tenant_id, principal_id, text, turn, need["field"], query
+            )
+        if turn_payload.get("state") != "resolving":
+            return turn_payload
+        if len(turn_payload.get("compound_operations") or ()) > 1:
+            return self._offer_compound_effects(
+                conversation_id, tenant_id, principal_id, turn_payload,
+            )
+        resolved = turn_payload.get("resolved") or {}
+        operation = turn.get("operation")
+        if operation in {"post", "reply", "dm"}:
+            capability = {
+                "post": "slack.message.send",
+                "reply": "slack.thread.reply",
+                "dm": "slack.direct_message.send",
+            }[operation]
+            draft = self.materialize_slack_write(
+                conversation_id, tenant_id, principal_id, capability,
+                resolved.get("message_text") or turn.get("message_text"),
+            )
+            return {
+                "state": "awaiting_approval", "conversation_id": conversation_id,
+                "draft": draft,
+            }
+        if operation in self.READ_CAPABILITIES:
+            run, revision = self._dispatch_slack_read(
+                tenant_id, principal_id, operation, resolved,
+            )
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id, status="retrieving",
+                workflow_run_id=run["workflow_run_id"],
+                workflow_revision_id=revision["workflow_revision_id"],
+            )
+            return {
+                "state": "retrieving", "conversation_id": conversation_id,
+                "workflow": {"workflowId": run["workflow_run_id"],
+                             "revisionId": revision["workflow_revision_id"]},
+            }
+        return turn_payload
+
+    READ_CAPABILITIES = {
+        "list_channels": "slack.channels.list",
+        "list_private_channels": "slack.private_channels.list",
+        "read": "slack.conversation.read",
+        "summarize": "slack.conversation.read",
+    }
+    DEFAULT_READ_DAYS = 7
+    # Each capability declares its own maximum; exceeding it is rejected as a
+    # schema violation at the broker, not clamped.
+    READ_PAGE_LIMITS = {
+        "slack.channels.list": 200,
+        "slack.private_channels.list": 200,
+        "slack.conversation.read": 100,
+        "slack.thread.read": 100,
+        "slack.private_conversation.read": 100,
+        "slack.private_thread.read": 100,
+        "slack.users.list": 200,
+    }
+
+    def _dispatch_slack_read(self, tenant_id, principal_id, operation, resolved,
+                             cursor=None):
+        """Compile the read workflow deterministically.
+
+        The operation and its slots are already grounded by this point, so
+        asking the planner brain to invent a graph adds a second model call
+        that can fail schema validation and strand the turn. U4 makes the
+        bounded pipeline the only conversational read path.
+        """
+        thread = resolved.get("active_thread") or {}
+        private = bool((resolved.get("active_channel") or {}).get("is_private"))
+        if operation in {"read", "summarize"}:
+            capability_id = self._private_read_capability(thread, private)
+        else:
+            capability_id = self.READ_CAPABILITIES[operation]
+        connection_id = (resolved.get("active_connection") or {}).get("id")
+        connection = next((
+            item for item in self._tenant_installations(tenant_id, principal_id)
+            if item.get("connection_id") == connection_id
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            required = sorted(definition.required_scopes)[0] if definition else "unknown"
+            raise PermissionError("missing_scope:%s" % required)
+        # Scope answers whether this workspace grants the read at all; the
+        # visibility check answers whether this requester may borrow it.
+        if capability_id in self.PRIVATE_READ_CAPABILITIES:
+            self._require_requester_visibility(
+                tenant_id, principal_id, resolved, capability_id,
+            )
+        now = int(self.clock())
+        payload = self._slack_read_input(capability_id, resolved, thread, now)
+        if cursor and "cursor" in (definition.input_schema.get("properties") or {}):
+            payload = dict(payload, cursor=cursor)
+        steps = [{
+            "step_id": "slack-read-%s" % operation,
+            "capability_id": capability_id,
+            "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload),
+            "depends_on": [], "effect": "read",
+        }]
+        directory = self._slack_directory_step(capability_id, connection_id, connection)
+        if directory is not None:
+            steps.append(directory)
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": steps})
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("read:%s" % operation), now
+        )
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, steps, now
+        )
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        return run, revision
+
+    PRIVATE_READ_CAPABILITIES = frozenset({
+        "slack.private_conversation.read", "slack.private_thread.read",
+        "slack.private_channels.list",
+    })
+
+    @staticmethod
+    def _private_read_capability(thread, private):
+        if thread.get("thread_ts"):
+            return "slack.private_thread.read" if private else "slack.thread.read"
+        return ("slack.private_conversation.read" if private
+                else "slack.conversation.read")
+
+    def _require_requester_visibility(self, tenant_id, principal_id, resolved,
+                                      capability_id):
+        """Deny bot-authorized private reads the requester could not do alone.
+
+        The bot's membership is not the requester's. Without proof that the
+        asking principal is themselves in the private conversation, reading it
+        through bot authority would let any tenant member borrow the bot's
+        access. R21 requires this fail closed, naming both the limitation and
+        the audited override, rather than quietly widening visibility.
+        """
+        authorizer = self.private_read_authorizer
+        if authorizer is None:
+            raise PermissionError(
+                "requester_visibility_unverified:%s" % capability_id
+            )
+        channel = (resolved.get("active_channel") or {}).get("id")
+        decision = authorizer(tenant_id, principal_id, channel, capability_id)
+        if not (decision or {}).get("allowed"):
+            raise PermissionError(
+                "requester_visibility_denied:%s" % (
+                    (decision or {}).get("reason") or "not_a_member"
+                )
+            )
+        return decision
+
+    def continue_slack_read(self, conversation, now=None):
+        """Dispatch the next read page for a turn still inside its budget."""
+        progress = (conversation or {}).get("read_progress") or {}
+        if conversation.get("status") != "retrieving":
+            return False
+        if progress.get("awaiting_links") and not progress.get("links_dispatched"):
+            return self._dispatch_slack_permalinks(conversation, progress)
+        cursor = progress.get("cursor")
+        if not cursor:
+            return False
+        if progress.get("dispatched") == cursor:
+            return False
+        operation = conversation.get("operation")
+        if operation not in self.READ_CAPABILITIES:
+            return False
+        resolved = {
+            key: conversation.get(key) for key in (
+                "active_connection", "active_channel", "active_thread",
+                "read_period",
+            ) if conversation.get(key) is not None
+        }
+        run, revision = self._dispatch_slack_read(
+            conversation["tenant_id"], conversation["principal_id"], operation,
+            resolved, cursor=cursor,
+        )
+        self.conversation_store.update(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"], status="retrieving",
+            read_progress=dict(progress, dispatched=cursor),
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
+
+    def _dispatch_slack_permalinks(self, conversation, progress):
+        """Fetch one clickable link per cited message, within a fixed budget."""
+        tenant_id = conversation["tenant_id"]
+        principal_id = conversation["principal_id"]
+        connection_id = (conversation.get("active_connection") or {}).get("id")
+        connection = next((
+            item for item in self._tenant_installations(tenant_id, principal_id)
+            if item.get("connection_id") == connection_id
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == "slack.message.permalink"),
+                          None)
+        cited = [item for item in (progress.get("messages") or [])
+                 if item.get("ts")][-self.workflows.CITATION_LINK_BUDGET:]
+        if not connection or not definition or not cited or (
+            "slack.message.permalink" not in set(
+                connection.get("enabled_capabilities") or ()
+            )
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            # Without link authority the answer still stands on its stable
+            # references, so finish rather than strand the turn.
+            return self._finish_unlinked_slack_read(conversation, progress)
+        now = int(self.clock())
+        channel_id = progress.get("channel_id")
+        steps = []
+        for message in cited:
+            payload = {"channel_id": channel_id, "message_ts": message["ts"]}
+            steps.append({
+                "step_id": "slack-permalink-%s" % message["ts"].replace(".", "-"),
+                "capability_id": "slack.message.permalink",
+                "capability_version": definition.version,
+                "connection_id": connection_id,
+                "descriptor_snapshot_hash": descriptor_hash(definition),
+                "credential_version": int(connection.get("credential_version") or 0),
+                "input": payload, "input_hash": _hash(payload),
+                "depends_on": [], "effect": "read",
+            })
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": steps})
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("permalinks"), now
+        )
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, steps, now
+        )
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        self.conversation_store.update(
+            conversation["conversation_id"], tenant_id, principal_id,
+            status="retrieving",
+            read_progress=dict(progress, links_dispatched=True),
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
+
+    def _finish_unlinked_slack_read(self, conversation, progress):
+        self.conversation_store.update(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"],
+            read_progress=dict(progress, awaiting_links=False,
+                               links_dispatched=True),
+        )
+        return False
+
+    def _slack_directory_step(self, capability_id, connection_id, connection):
+        """Fetch the member directory alongside a message read.
+
+        Evidence attributed to `U0BFT8SDGK1` is technically cited and
+        practically unreadable. The directory resolves those ids to names.
+        It runs beside the read rather than after it, because it depends on
+        the workspace and not on which messages came back.
+        """
+        if capability_id in {"slack.channels.list", "slack.private_channels.list"}:
+            return None
+        definition = next((item for item in self.definitions
+                           if item.capability_id == "slack.users.list"), None)
+        if definition is None or "slack.users.list" not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(
+            set(connection.get("granted_scopes") or ())
+        ):
+            return None
+        payload = {"limit": self.READ_PAGE_LIMITS["slack.users.list"]}
+        return {
+            "step_id": "slack-read-directory",
+            "capability_id": "slack.users.list",
+            "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload),
+            "depends_on": [], "effect": "read",
+        }
+
+    def _slack_read_input(self, capability_id, resolved, thread, now):
+        """Bound every read by page size and an explicit, disclosed period."""
+        limit = self.READ_PAGE_LIMITS[capability_id]
+        if capability_id in {"slack.channels.list", "slack.private_channels.list"}:
+            return {"limit": limit}
+        channel = resolved.get("active_channel") or {}
+        channel_id = thread.get("channel_id") or channel.get("id")
+        if not channel_id:
+            raise ValueError("Slack read target is unresolved")
+        if capability_id == "slack.private_conversation.read":
+            return {"channel_id": channel_id, "limit": limit}
+        if capability_id == "slack.private_thread.read":
+            # The private thread descriptor takes no period; bound it by size.
+            return {"channel_id": channel_id, "limit": limit,
+                    "thread_ts": thread["thread_ts"]}
+        period = resolved.get("read_period") or {}
+        days = int(period.get("days") or self.DEFAULT_READ_DAYS)
+        payload = {
+            "channel_id": channel_id, "limit": limit,
+            "oldest": str(now - days * 86400), "latest": str(now),
+        }
+        if capability_id == "slack.thread.read":
+            payload["thread_ts"] = thread["thread_ts"]
+        return payload
+
+    def _offer_compound_effects(self, conversation_id, tenant_id, principal_id,
+                                turn_payload):
+        """Offer a compound request as effects that can be answered one by one.
+
+        Refusing compound requests outright was the old behaviour, and it sent
+        people back to chaining turns — which the Phase 1 comparison measured
+        completing a quarter of the time. Each effect is now previewed and
+        approved on its own, and no approval carries another.
+        """
+        group = build_effect_group(
+            conversation_id, turn_payload["compound_operations"],
+            turn_payload.get("resolved") or {},
+            dependencies=turn_payload.get("dependencies") or [],
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="awaiting_approval", effect_group=group,
+            dependencies=turn_payload.get("dependencies") or [],
+        )
+        return {
+            "state": "awaiting_approval", "conversation_id": conversation_id,
+            "effect_group": group,
+        }
+
+    def dispatch_approved_effects(self, conversation_id, tenant_id,
+                                  principal_id):
+        """Run the effects that are approved and owed nothing, and only those.
+
+        Called after any decision. A sibling failing neither blocks nor drags
+        an effect along, so this is deliberately a loop over independent items
+        rather than a plan the group executes as one.
+        """
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        group = (conversation or {}).get("effect_group")
+        if not group:
+            return []
+        dispatched = []
+        for effect in dispatchable_effects(group):
+            try:
+                self._dispatch_one_effect(
+                    conversation, tenant_id, principal_id, effect,
+                )
+            except (PermissionError, ValueError, KeyError) as exc:
+                group = apply_effect_decision(
+                    group, effect["effect_id"], "failed",
+                )
+                effect = dict(effect, recovery=str(exc).split(":", 1)[0])
+            else:
+                group = apply_effect_decision(
+                    group, effect["effect_id"], "dispatched",
+                )
+            dispatched.append(effect["effect_id"])
+        if dispatched:
+            outcome = group_outcome(group)
+            self.conversation_store.update(
+                conversation_id, tenant_id, principal_id,
+                effect_group=group,
+                status="ready" if outcome["terminal"] else "executing",
+            )
+        return dispatched
+
+    def _dispatch_one_effect(self, conversation, tenant_id, principal_id,
+                             effect):
+        resolved = {
+            key: conversation.get(key) for key in (
+                "active_connection", "active_channel", "active_person",
+                "active_thread", "read_period",
+            ) if conversation.get(key) is not None
+        }
+        if effect["effect_kind"] == "read":
+            operation = "read"
+            return self._dispatch_slack_read(
+                tenant_id, principal_id, operation, resolved,
+            )
+        return self.materialize_slack_write(
+            conversation["conversation_id"], tenant_id, principal_id,
+            effect["capability_id"],
+            (conversation.get("known_inputs") or {}).get("message"),
+        )
+
+    def decide_compound_effect(self, conversation_id, tenant_id, principal_id,
+                               effect_id, decision):
+        """Answer exactly one effect of a group."""
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        group = (conversation or {}).get("effect_group")
+        if not group:
+            raise KeyError("conversation has no effect group")
+        updated = apply_effect_decision(group, effect_id, decision)
+        outcome = group_outcome(updated)
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            effect_group=updated,
+            status="ready" if outcome["terminal"] else "awaiting_approval",
+        )
+        return {"effect_group": updated, "outcome": outcome}
+
+    def _start_slack_entity_resolution(self, conversation_id, tenant_id,
+                                       principal_id, text, turn, field, query):
+        capability_id = "slack.channels.list" if field == "channel" else "slack.users.list"
+        conversation = self.conversation_store.get(conversation_id, tenant_id, principal_id)
+        connection_id = ((conversation or {}).get("active_connection") or {}).get("id")
+        connection = next((item for item in self._tenant_installations(tenant_id, principal_id)
+                           if item.get("connection_id") == connection_id), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(set(connection.get("granted_scopes") or ())):
+            required = sorted(definition.required_scopes)[0] if definition else "unknown"
+            raise PermissionError("missing_scope:%s" % required)
+        now = int(self.clock())
+        resolver_run = self._reserve_slack_resolver_run(
+            conversation, conversation_id, tenant_id, principal_id,
+            connection_id, field, query, now,
+        )
+        run, revision = self._dispatch_slack_resolver_page(
+            tenant_id, principal_id, field, capability_id, definition,
+            connection_id, connection, None, now,
+        )
+        if resolver_run is not None:
+            self.workflows.attach_slack_resolver_workflow(
+                resolver_run["resolver_run_id"], tenant_id,
+                run["workflow_run_id"], revision["workflow_revision_id"], now,
+            )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id, status="retrieving",
+            blocking_need=None, workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+            resolution_request={"field": field, "query": query,
+                                "text": text, "turn": turn,
+                                "locale": turn.get("locale", "es"),
+                                "resolver_run_id": (resolver_run or {}).get(
+                                    "resolver_run_id"
+                                )},
+        )
+        return {"state": "retrieving", "conversation_id": conversation_id,
+                "workflow": {"workflowId": run["workflow_run_id"],
+                             "revisionId": revision["workflow_revision_id"]}}
+
+    def _reserve_slack_resolver_run(
+        self, conversation, conversation_id, tenant_id, principal_id,
+        connection_id, field, query, now,
+    ):
+        """Reserve the durable run that owns this resolution's pagination."""
+        if not hasattr(self.workflows, "start_slack_resolver_run"):
+            return None
+        return self.workflows.start_slack_resolver_run(
+            conversation_id, tenant_id, principal_id, connection_id,
+            "channel" if field == "channel" else "user",
+            _hash({"field": field, "query": query}),
+            int((conversation or {}).get("state_version") or 1), now,
+        )
+
+    def _dispatch_slack_resolver_page(
+        self, tenant_id, principal_id, field, capability_id, definition,
+        connection_id, connection, cursor, now,
+    ):
+        run = self.workflows.create_run(
+            tenant_id, principal_id, _hash("resolve:%s" % field), now
+        )
+        payload = {"limit": 200}
+        if cursor:
+            payload["cursor"] = cursor
+        step = {
+            "step_id": "resolve-slack-%s" % field,
+            "capability_id": capability_id, "capability_version": definition.version,
+            "connection_id": connection_id,
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload), "depends_on": [], "effect": "read",
+        }
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step]})
+        revision = self.workflows.create_revision(run["workflow_run_id"], tenant_id,
+                                                  graph_hash, [step], now)
+        self.workflows.authorize_requested_read(
+            run["workflow_run_id"], revision["workflow_revision_id"], tenant_id,
+            graph_hash, principal_id, now,
+        )
+        return run, revision
+
+    def apply_slack_resolver_completion(self, tenant_id, conversation_id,
+                                        payload, now=None):
+        """Continue a resolved turn from its durable event, never from a GET."""
+        principal_id = payload.get("principal_id")
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        ) if self.conversation_store and principal_id else None
+        if conversation is None:
+            return False
+        request = conversation.get("resolution_request") or {}
+        if request.get("resolver_run_id") != payload.get("resolver_run_id"):
+            return False
+        if conversation.get("status") != "resolving":
+            return False
+        self.resume_resolved_slack_turn(conversation)
+        return True
+
+    def continue_slack_resolver_run(self, run, now=None):
+        """Dispatch the next durable page after completion or a restart."""
+        cursor = run.get("cursor") or {}
+        next_cursor = cursor.get("next")
+        if not next_cursor or next_cursor in (cursor.get("consumed") or []):
+            return False
+        if cursor.get("dispatched") == next_cursor:
+            return False
+        conversation = self.conversation_store.get(
+            run["conversation_id"], run["tenant_id"], run["principal_id"]
+        ) if self.conversation_store else None
+        if conversation is None:
+            return False
+        request = conversation.get("resolution_request") or {}
+        if request.get("resolver_run_id") != run["resolver_run_id"]:
+            return False
+        field = request.get("field")
+        capability_id = (
+            "slack.channels.list" if field == "channel" else "slack.users.list"
+        )
+        connection = next((
+            item for item in self._tenant_installations(
+                run["tenant_id"], run["principal_id"]
+            ) if item.get("connection_id") == run["connection_id"]
+        ), None)
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if not connection or not definition:
+            return False
+        now = int(self.clock() if now is None else now)
+        page_run, revision = self._dispatch_slack_resolver_page(
+            run["tenant_id"], run["principal_id"], field, capability_id,
+            definition, run["connection_id"], connection, next_cursor, now,
+        )
+        self.workflows.attach_slack_resolver_workflow(
+            run["resolver_run_id"], run["tenant_id"],
+            page_run["workflow_run_id"], revision["workflow_revision_id"],
+            now, cursor_token=next_cursor,
+        )
+        self.conversation_store.update(
+            run["conversation_id"], run["tenant_id"], run["principal_id"],
+            status="retrieving",
+            workflow_run_id=page_run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        return True
+
+    def resume_resolved_slack_turn(self, conversation):
+        request = conversation.get("resolution_request") or {}
+        text = request.get("text") or "Slack conversational request"
+        channels = [conversation["active_channel"]] if conversation.get("active_channel") else []
+        users = [conversation["active_person"]] if conversation.get("active_person") else []
+        payload = self.coordinate_slack_turn(
+            conversation["tenant_id"], conversation["principal_id"], text,
+            conversation_id=conversation["conversation_id"], channels=channels, users=users,
+        )
+        result = self.advance_slack_turn(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"], text, payload,
+        )
+        current = self.conversation_store.get(
+            conversation["conversation_id"], conversation["tenant_id"],
+            conversation["principal_id"],
+        )
+        if (current or {}).get("resolution_request") == request:
+            self.conversation_store.update(
+                conversation["conversation_id"], conversation["tenant_id"],
+                conversation["principal_id"], resolution_request=None,
+            )
+        return result
+
+    #: The families each legacy switch stood for, before family state became
+    #: durable. Kept only as the fallback for a service constructed without a
+    #: control plane; a wired control plane never consults it.
+    _LEGACY_FEATURE_FAMILIES = {
+        "slack_conversational_reads": (
+            "slack_channel_discovery", "slack_private_reads",
+            "slack_conversation_reads",
+        ),
+        "slack_writes": ("slack_messaging",),
+        "slack_dms": ("slack_direct_messages",),
+    }
+
+    def _disabled_slack_feature(self, operation, tenant_id=None):
+        reads = operation in {
+            "read", "summarize", "list_channels", "list_private_channels"
+        }
+        writes = operation in {"post", "reply", "dm"}
+        if self.control_plane is not None:
+            families = self._slack_family_state(tenant_id)
+            if reads and not any(
+                families.get(name) is True for name in
+                self._LEGACY_FEATURE_FAMILIES["slack_conversational_reads"]
+            ):
+                return "slack_conversational_reads"
+            if writes and families.get("slack_messaging") is not True:
+                return "slack_writes"
+            if operation == "dm" and families.get(
+                "slack_direct_messages"
+            ) is not True:
+                return "slack_dms"
+            return None
+        if reads and not self.conversational_reads_enabled:
+            return "slack_conversational_reads"
+        if writes and not self.slack_writes_enabled:
+            return "slack_writes"
+        if operation == "dm" and not self.slack_dms_enabled:
+            return "slack_dms"
+        return None
+
+    def _slack_family_state(self, tenant_id=None):
+        """Which families this tenant currently holds.
+
+        With a control plane wired, the answer is durable per-tenant state and
+        nothing else: two tenants sharing this process must be able to hold
+        different answers, and an administrator must be able to change theirs
+        without anyone restarting anything. The constructor defaults below are
+        the pre-control-plane fallback and are process-wide by construction,
+        which is exactly why they cannot be the authority.
+        """
+        if self.control_plane is not None:
+            return dict(self.control_plane.family_flags(tenant_id))
+        state = {
+            "slack_connection_status": True,
+            "slack_channel_discovery": self.conversational_reads_enabled,
+            "slack_private_reads": self.conversational_reads_enabled,
+            "slack_conversation_reads": self.conversational_reads_enabled,
+            "slack_user_discovery": True,
+            "slack_messaging": self.slack_writes_enabled,
+            "slack_direct_messages": self.slack_writes_enabled and self.slack_dms_enabled,
+            "slack_reactions": False,
+        }
+        state.update(self.slack_family_flags)
+        return state
+
+    #: The rollout allowlist that predates durable family state. A service
+    #: with a control plane derives the same answer from family state instead,
+    #: so there is one place to change and not two that can disagree.
+    _STATIC_RUNTIME_SLACK_OPERATION_IDS = frozenset({
+        "slack.connection.status", "slack.channels.list",
+        "slack.private_channels.list", "slack.conversation.read",
+        "slack.conversation.summarize", "slack.message.send",
+        "slack.thread.reply", "slack.direct_message.send",
+    })
+
+    def _runtime_slack_operation_ids(self, tenant_id=None):
+        if self.control_plane is None:
+            return self._STATIC_RUNTIME_SLACK_OPERATION_IDS
+        if self.slack_operation_registry is None:
+            return frozenset()
+        families = self._slack_family_state(tenant_id)
+        return frozenset(
+            operation.operation_id
+            for operation in self.slack_operation_registry.operations
+            if families.get(operation.family_flag) is True
+        )
+
+    def _policy_allows_slack_operation(self, operation, tenant_id=None):
+        if operation.operation_id not in self._runtime_slack_operation_ids(
+            tenant_id
+        ):
+            return False
+        if self.slack_policy_visible is None:
+            return True
+        try:
+            return self.slack_policy_visible(operation) is True
+        except Exception:
+            return False
+
+    def _contacts_family_state(self, tenant_id=None):
+        """Which contacts families this tenant holds. Absent means off.
+
+        A first-party store has no install callback to derive enablement from,
+        which makes the fail-closed default load-bearing rather than merely
+        tidy: without it, registering the catalog entry would be enough to
+        expose a directory of personal data to every tenant on the process.
+        """
+        if self.contacts_operation_registry is None:
+            return {}
+        live = (
+            dict(self.control_plane.family_flags(tenant_id))
+            if self.control_plane is not None else {}
+        )
+        state = {
+            family: live.get(family) is True
+            for family in self.contacts_operation_registry.family_flags
+        }
+        state.update(self.contacts_family_flags)
+        return state
+
+    def _policy_allows_contacts_operation(self, operation, tenant_id=None):
+        if self._contacts_family_state(tenant_id).get(
+            operation.family_flag
+        ) is not True:
+            return False
+        if self.contacts_policy_visible is None:
+            return True
+        try:
+            return self.contacts_policy_visible(operation) is True
+        except Exception:
+            return False
+
+    def contacts_operation_projection(self, tenant_id=None):
+        """Language-only metadata for the contacts operations a tenant holds.
+
+        Public because the parity assertion needs it: "every operation the
+        interface can reach has a manifest entry and a renderable
+        presentation" is only checkable against the same projection the
+        interface is built from. The repository already carries three trusted
+        Slack capabilities no interface can reach, and a review checklist did
+        not catch that.
+        """
+        if self.contacts_operation_registry is None:
+            return ()
+        installed = {
+            definition.capability_id for definition in self.definitions
+            if definition.provider == CONTACTS_PROVIDER
+        }
+        return self.contacts_operation_registry.model_projection(
+            installed, self._contacts_family_state(tenant_id),
+            lambda operation: self._policy_allows_contacts_operation(
+                operation, tenant_id
+            ),
+        )
+
+    def _registry_for(self, operation_id):
+        """Which manifest owns this namespace, or nothing at all.
+
+        Returning ``None`` for an unknown namespace is the point. A model that
+        names ``twilio.sms.send`` before Phase 3 exists must land on a named
+        limitation here, not on a registry that happens to answer.
+        """
+        for prefix, registry in (
+            ("slack.", self.slack_operation_registry),
+            ("contacts.", self.contacts_operation_registry),
+        ):
+            if str(operation_id or "").startswith(prefix):
+                return registry
+        return None
+
+    def _slack_operation_projection(self, installations, tenant_id=None):
+        if self.slack_operation_registry is None:
+            return ()
+        connected = [
+            item for item in installations if item.get("status") == "connected"
+        ]
+        installed = set()
+        for connection in connected:
+            enabled = set(connection.get("enabled_capabilities") or ())
+            scopes = set(connection.get("granted_scopes") or ())
+            for definition in self.definitions:
+                if (
+                    definition.provider == "slack"
+                    and definition.capability_id in enabled
+                    and definition.required_scopes.issubset(scopes)
+                ):
+                    installed.add(definition.capability_id)
+        return self.slack_operation_registry.model_projection(
+            installed, self._slack_family_state(tenant_id),
+            lambda operation: self._policy_allows_slack_operation(
+                operation, tenant_id
+            ),
+        )
+
+    def _interpretation_limitation(
+        self, text, interpretation, installations, projection, tenant_id=None,
+    ):
+        proposed = [item.operation_id for item in interpretation.operations]
+        visible = {item["operation_id"] for item in projection}
+        if proposed:
+            for operation_id in proposed:
+                registry = self._registry_for(operation_id)
+                descriptor = (
+                    registry.get(operation_id) if registry is not None else None
+                )
+                if descriptor is None:
+                    # R2's floor. An operation the catalog does not carry never
+                    # reaches a provider, a store, or a plan; it stops here
+                    # with a name the surface can explain.
+                    return self._slack_limitation(
+                        "unsupported_operation", "choose_supported_operation",
+                        operation_id=operation_id,
+                    )
+                if operation_id not in visible:
+                    if registry is self.contacts_operation_registry:
+                        return self._contacts_operation_unavailable(
+                            descriptor, tenant_id
+                        )
+                    return self._operation_unavailable(
+                        descriptor, installations, tenant_id
+                    )
+            return None
+        alias = None
+        if self.slack_operation_registry is not None:
+            alias = self.slack_operation_registry.lookup_alias(text)
+        if alias is None and self.contacts_operation_registry is not None:
+            alias = self.contacts_operation_registry.lookup_alias(text)
+            if alias is not None and alias.operation_id not in visible:
+                return self._contacts_operation_unavailable(alias, tenant_id)
+        if alias is not None and alias.operation_id not in visible:
+            return self._operation_unavailable(alias, installations, tenant_id)
+        blockers = list(getattr(interpretation, "blockers", ()) or ())
+        if blockers and blockers[0].kind == "unsupported_operation":
+            return self._slack_limitation(
+                "unsupported_operation", "choose_supported_operation",
+            )
+        return None
+
+    def _contacts_operation_unavailable(self, descriptor, tenant_id=None):
+        """Why a contacts operation the catalog carries is not reachable here.
+
+        Deliberately shorter than the Slack path: there is no installation to
+        reconnect and no scope to upgrade, so the only honest answers are that
+        the account is stopped, the family is off, or policy refused. Reusing
+        the Slack path would produce "connect Slack" for a first-party store.
+        """
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            return self._slack_limitation("emergency_stop", "contact_admin")
+        families = self._contacts_family_state(tenant_id)
+        if families.get(descriptor.family_flag) is not True:
+            return self._slack_limitation(
+                "feature_disabled", "contact_admin",
+                feature=descriptor.family_flag,
+            )
+        if not self._policy_allows_contacts_operation(descriptor, tenant_id):
+            return self._slack_limitation(
+                "policy_denied", "contact_admin",
+                operation_id=descriptor.operation_id,
+            )
+        return self._slack_limitation(
+            "capability_unavailable", "reconnect_or_enable_capability",
+            operation_id=descriptor.operation_id,
+        )
+
+    def _operation_unavailable(self, descriptor, installations, tenant_id=None):
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            # Say the account is stopped rather than blaming the family. An
+            # operator who hit the stop needs the message to name the stop,
+            # not send them hunting for a family switch they did not touch.
+            return self._slack_limitation("emergency_stop", "contact_admin")
+        families = self._slack_family_state(tenant_id)
+        # The family is checked before the rollout allowlist: an operator who
+        # turned a family off should be told that, not told to wait for a
+        # rollout that already happened.
+        if families.get(descriptor.family_flag) is not True:
+            return self._slack_limitation(
+                "feature_disabled", "contact_admin", feature=descriptor.family_flag,
+            )
+        if descriptor.operation_id not in self._runtime_slack_operation_ids(
+            tenant_id
+        ):
+            return self._slack_limitation(
+                "operation_unavailable", "wait_for_family_rollout",
+                operation_id=descriptor.operation_id,
+            )
+        if not self._policy_allows_slack_operation(descriptor, tenant_id):
+            return self._slack_limitation(
+                "policy_denied", "contact_admin", operation_id=descriptor.operation_id,
+            )
+        connected = [item for item in installations if item.get("status") == "connected"]
+        if descriptor.operation_kind != "local" and not connected:
+            return self._slack_limitation(
+                "connection_unavailable", "connect_slack",
+                operation_id=descriptor.operation_id,
+            )
+        required = {
+            step.capability_id for step in descriptor.capability_recipe
+        }
+        definitions = {
+            item.capability_id: item for item in self.definitions
+            if item.provider == "slack"
+        }
+        enabled_anywhere = any(
+            required.issubset(set(item.get("enabled_capabilities") or ()))
+            for item in connected
+        )
+        missing_scopes = sorted({
+            scope
+            for capability_id in required
+            for scope in definitions[capability_id].required_scopes
+            if not any(
+                capability_id in set(item.get("enabled_capabilities") or ())
+                and scope in set(item.get("granted_scopes") or ())
+                for item in connected
+            )
+        })
+        if enabled_anywhere and missing_scopes:
+            return self._slack_limitation(
+                "missing_scope", "upgrade_slack_scopes",
+                operation_id=descriptor.operation_id, scopes=missing_scopes,
+            )
+        return self._slack_limitation(
+            "capability_unavailable", "reconnect_or_enable_capability",
+            operation_id=descriptor.operation_id,
+        )
+
+    @staticmethod
+    def _slack_limitation(code, action, **details):
+        return {
+            "state": "retryable_failure",
+            "error": {"code": code, **details},
+            "recovery": {"action": action, **details},
+        }
+
+    def _tenant_installations(self, tenant_id, principal_id):
+        if hasattr(self.connections, "list_tenant_installations"):
+            return self.connections.list_tenant_installations(tenant_id, "slack")
+        if hasattr(self.connections, "list_for_tenant"):
+            return self.connections.list_for_tenant(tenant_id, "slack")
+        return self.connections.list_installations(tenant_id, principal_id)
+
+    def _persist_grounded_slack_entities(
+        self, conversation, resolved, installations, matched_by,
+    ):
+        """Persist minimized provider-grounded refs without trusting model IDs."""
+        existing = [
+            dict(item) for item in (conversation.get("entity_refs") or [])
+            if isinstance(item, dict) and item.get("slot")
+        ]
+        by_slot = {item["slot"]: item for item in existing}
+        connection = resolved.get("active_connection") or conversation.get(
+            "active_connection"
+        ) or {}
+        connection_id = connection.get("id")
+        installation = next((
+            item for item in installations
+            if item.get("connection_id") == connection_id
+        ), None)
+        team_id = (installation or {}).get("team_id")
+        if not connection_id or not team_id:
+            return existing
+        now = int(self.clock())
+        stale_after = now + 300
+        candidates = [(
+            "active_connection", "workspace", str(team_id), {
+                "id": str(team_id),
+                "name": (installation or {}).get("team_name")
+                or connection.get("label"),
+                "domain": (installation or {}).get("team_domain"),
+            },
+        )]
+        targets = (
+            ("active_channel", "channel"),
+            ("active_person", "user"),
+            ("active_message", "message"),
+            ("active_thread", "thread"),
+            ("active_file", "file"),
+            ("active_reaction", "reaction"),
+        )
+        for slot, kind in targets:
+            value = resolved.get(slot)
+            if not isinstance(value, dict):
+                continue
+            provider_entity_id = self._slack_provider_entity_id(kind, value)
+            if provider_entity_id:
+                candidates.append((slot, kind, provider_entity_id, value))
+        for slot, kind, provider_entity_id, value in candidates:
+            stored = self.workflows.store_slack_conversation_entity(
+                conversation["conversation_id"], conversation["tenant_id"],
+                conversation["principal_id"], kind, connection_id, team_id,
+                provider_entity_id, value,
+                {"source": "turn_grounding", "matched_by": matched_by},
+                now, stale_after,
+                expected_state_version=conversation["state_version"],
+            )
+            by_slot[slot] = {
+                "slot": slot,
+                "entity_kind": kind,
+                "entity_ref_id": stored["entity_ref_id"],
+                "entity_version": stored["entity_version"],
+                "entity_hash": stored["entity_hash"],
+                "connection_id": connection_id,
+                "team_id": team_id,
+                "observed_at": stored["observed_at"],
+                "stale_after": stored["stale_after"],
+            }
+        return list(by_slot.values())
+
+    @staticmethod
+    def _slack_provider_entity_id(kind, value):
+        if kind in {"channel", "user", "file"}:
+            return value.get("id")
+        if kind == "message":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("ts") or value.get("message_ts")
+            return "%s:%s" % (channel, timestamp) if channel and timestamp else None
+        if kind == "thread":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("thread_ts") or value.get("parent_ts")
+            return "%s:%s" % (channel, timestamp) if channel and timestamp else None
+        if kind == "reaction":
+            channel = value.get("channel_id") or value.get("channel")
+            timestamp = value.get("message_ts") or value.get("ts")
+            name = value.get("name")
+            return (
+                "%s:%s:%s" % (channel, timestamp, name)
+                if channel and timestamp and name else None
+            )
+        return None
 
     def plan(self, tenant_id, principal_id, goal, context=None):
-        installations = self.connections.list_installations(tenant_id, principal_id)
+        context = dict(context or {})
+        installations = (
+            self.connections.list_tenant_installations(tenant_id, "slack")
+            if context.get("slack_resolution") is not None
+            and hasattr(self.connections, "list_tenant_installations")
+            else self.connections.list_installations(tenant_id, principal_id)
+        )
         connection_labels = {
             item["connection_id"]: (
                 item.get("team_name") or item.get("provider_account")
@@ -49,7 +1357,7 @@ class DynamicWorkflowService:
                 ))
         compiler = PlanCompiler(self.definitions, snapshots, self.rollout_version)
         compiled = DynamicPlanner(self.brain, compiler, self.shadow_mode).plan(
-            goal, {**(context or {}), "tenant_id": tenant_id}
+            goal, {**context, "tenant_id": tenant_id}
         )
         if compiled["tenant_id"] != tenant_id:
             raise ValueError("planner tenant binding changed")
@@ -65,6 +1373,15 @@ class DynamicWorkflowService:
             run["workflow_run_id"], tenant_id, compiled["plan_graph_hash"],
             persisted_steps, now,
         )
+        effects = {step["effect"] for step in persisted_steps}
+        if effects == {"read"} and hasattr(self.workflows, "authorize_requested_read"):
+            self.workflows.authorize_requested_read(
+                run["workflow_run_id"], revision["workflow_revision_id"],
+                tenant_id, compiled["plan_graph_hash"], principal_id, now,
+            )
+            revision = self.workflows.get_revision(
+                run["workflow_run_id"], revision["workflow_revision_id"], tenant_id
+            )
         disclosures = {item["step_id"]: item for item in compiled["disclosures"]}
         definitions = {
             (item.capability_id, item.version): item for item in self.definitions
@@ -99,3 +1416,193 @@ class DynamicWorkflowService:
                          for item in compiled["blockers"]],
         }
         return {"run": run, "revision": revision, "plan": compiled, "preview": preview}
+
+    def present_read_once(
+        self, conversation_id, tenant_id, principal_id, presenter,
+        question, evidence, locale,
+    ):
+        if self.conversation_store is None:
+            raise ValueError("conversation store is required")
+        current = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        if current is None:
+            raise KeyError("conversation unavailable")
+        if current.get("presentation") is not None:
+            return current["presentation"]
+        presentation = presenter.present(question, evidence, locale)
+        stored = self.conversation_store.present(
+            conversation_id, tenant_id, principal_id, presentation
+        )
+        return stored["presentation"]
+
+    def materialize_slack_write(
+        self, conversation_id, tenant_id, principal_id, capability_id, text,
+    ):
+        if capability_id not in {
+            "slack.message.send", "slack.thread.reply", "slack.direct_message.send"
+        }:
+            raise ValueError("unsupported Slack write capability")
+        if not self.slack_writes_enabled:
+            raise PermissionError("feature_disabled:slack_writes")
+        if capability_id == "slack.direct_message.send" and not self.slack_dms_enabled:
+            raise PermissionError("feature_disabled:slack_dms")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("exact message text is required")
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        if conversation is None:
+            raise KeyError("conversation unavailable")
+        connection_ref = conversation.get("active_connection") or {}
+        connection = next((item for item in self._tenant_installations(
+            tenant_id, principal_id
+        ) if item.get("connection_id") == connection_ref.get("id")), None)
+        if connection is None or connection.get("status") != "connected":
+            raise ValueError("Slack connection is unavailable")
+        definition = next((item for item in self.definitions
+                           if item.capability_id == capability_id), None)
+        if definition is None or capability_id not in set(
+            connection.get("enabled_capabilities") or ()
+        ) or not definition.required_scopes.issubset(set(
+            connection.get("granted_scopes") or ()
+        )):
+            raise PermissionError("missing_scope:%s" % (
+                sorted(definition.required_scopes)[0] if definition else "unknown"
+            ))
+        payload = {"text": text}
+        label = None
+        entity_version = None
+        if capability_id == "slack.message.send":
+            target = conversation.get("active_channel") or {}
+            payload["channel_id"] = target.get("id")
+            label = "#%s" % target.get("name") if target.get("name") else None
+            entity_version = _hash(target)
+        elif capability_id == "slack.thread.reply":
+            thread = conversation.get("active_thread") or {}
+            channel = conversation.get("active_channel") or {}
+            payload.update(channel_id=thread.get("channel_id") or channel.get("id"),
+                           thread_ts=thread.get("thread_ts"))
+            label = "#%s thread" % channel.get("name") if channel.get("name") else "Slack thread"
+            entity_version = _hash({"channel": channel, "thread": thread})
+        else:
+            target = conversation.get("active_person") or {}
+            payload["user_id"] = target.get("id")
+            label = target.get("display_name") or target.get("real_name") or target.get("handle")
+            entity_version = _hash(target)
+        if any(not isinstance(value, str) or not value for value in payload.values()):
+            raise ValueError("Slack write target is unresolved")
+        now = int(self.clock())
+        run_id = conversation.get("workflow_run_id")
+        run = self.workflows.get_run(run_id, tenant_id) if run_id else None
+        if run is None:
+            run = self.workflows.create_run(tenant_id, principal_id, _hash("slack-write"), now)
+        step = {
+            "step_id": "slack-write", "capability_id": capability_id,
+            "capability_version": definition.version,
+            "connection_id": connection["connection_id"],
+            "descriptor_snapshot_hash": descriptor_hash(definition),
+            "credential_version": int(connection.get("credential_version") or 0),
+            "input": payload, "input_hash": _hash(payload), "depends_on": [],
+            "effect": "write",
+        }
+        binding = {
+            "connection_id": connection["connection_id"],
+            "credential_version": int(connection.get("credential_version") or 0),
+            "entity_version": entity_version, "destination_label": label,
+            "payload_hash": _hash(payload), "capability_id": capability_id,
+        }
+        graph_hash = _hash({"tenant_id": tenant_id, "steps": [step], "binding": binding})
+        revision = self.workflows.create_revision(
+            run["workflow_run_id"], tenant_id, graph_hash, [step], now
+        )
+        draft = {
+            **binding, "workflow_run_id": run["workflow_run_id"],
+            "workflow_revision_id": revision["workflow_revision_id"],
+            "plan_graph_hash": graph_hash, "text": text,
+        }
+        draft["draft_hash"] = _hash(draft)
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="awaiting_approval", pending_draft=draft,
+            workflow_run_id=run["workflow_run_id"],
+            workflow_revision_id=revision["workflow_revision_id"],
+        )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "previewed",
+            operation_family=(conversation or {}).get("operation"),
+            metrics={"locale": (conversation or {}).get("locale", "es")},
+        )
+        return dict(draft)
+
+    def approve_slack_draft(
+        self, conversation_id, tenant_id, principal_id, draft_hash,
+    ):
+        conversation = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        draft = (conversation or {}).get("pending_draft") or {}
+        if not draft or draft.get("draft_hash") != draft_hash:
+            raise ValueError("draft binding changed")
+        capability_id = draft.get("capability_id")
+        if not self.slack_writes_enabled:
+            raise PermissionError("feature_disabled:slack_writes")
+        if capability_id == "slack.direct_message.send" and not self.slack_dms_enabled:
+            raise PermissionError("feature_disabled:slack_dms")
+        if capability_id == "slack.message.send":
+            current_entity_version = _hash(conversation.get("active_channel") or {})
+        elif capability_id == "slack.thread.reply":
+            current_entity_version = _hash({
+                "channel": conversation.get("active_channel") or {},
+                "thread": conversation.get("active_thread") or {},
+            })
+        else:
+            current_entity_version = _hash(conversation.get("active_person") or {})
+        if current_entity_version != draft.get("entity_version"):
+            raise ValueError("draft binding changed")
+        connection = next((item for item in self._tenant_installations(
+            tenant_id, principal_id
+        ) if item.get("connection_id") == draft.get("connection_id")), None)
+        if (
+            connection is None or connection.get("status") != "connected"
+            or int(connection.get("credential_version") or 0) != draft.get("credential_version")
+        ):
+            raise ValueError("draft binding changed")
+        self.workflows.record_approval(
+            draft["workflow_run_id"], draft["workflow_revision_id"], tenant_id,
+            draft["plan_graph_hash"], principal_id, int(self.clock()),
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id, status="executing"
+        )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "approved",
+            operation_family=conversation.get("operation"),
+            metrics={"locale": conversation.get("locale", "es")},
+        )
+        return dict(draft)
+
+    def complete_slack_write(
+        self, conversation_id, tenant_id, principal_id, locale="es"
+    ):
+        presentation = {
+            "locale": locale,
+            "answer": "Mensaje enviado" if locale == "es" else "Message sent",
+            "citations": [], "partial": False,
+        }
+        self.conversation_store.present(
+            conversation_id, tenant_id, principal_id, presentation
+        )
+        self.conversation_store.update(
+            conversation_id, tenant_id, principal_id,
+            status="succeeded", pending_draft=None,
+        )
+        completed = self.conversation_store.get(
+            conversation_id, tenant_id, principal_id
+        )
+        self._emit_conversation_outcome(
+            conversation_id, tenant_id, principal_id, "completed",
+            operation_family=(completed or {}).get("operation"),
+            metrics={"terminal_outcome": "sent", "locale": locale},
+        )
+        return presentation

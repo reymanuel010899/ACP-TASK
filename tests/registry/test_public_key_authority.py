@@ -27,6 +27,9 @@ from registry.app import RegistryService, make_server
 from registry.index_store import IndexStore
 
 
+REGISTRY_TEST_ORGANIZATION_ID = "org:test-registry-suite"
+
+
 AGENT_CARD = {
     "name": "deploy-bot",
     "description": "Deploys infrastructure to AWS",
@@ -181,6 +184,7 @@ class TestPublicKeyAuthorityHTTP:
                 "created_by": "ed25519_user_http",
                 "public_key": "ed25519-pub-agent-http",
             },
+            headers={"X-Organization-Id": REGISTRY_TEST_ORGANIZATION_ID},
             timeout=5,
         )
         assert resp.status_code == 200, resp.text

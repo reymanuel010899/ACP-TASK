@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { WEB_SESSION_CSRF_STORAGE_KEY } from "@/lib/agentSession";
+import { readStoredCsrfToken } from "@/lib/agentSession";
 
 export type ActionProposalView = {
   proposalId: string;
@@ -30,7 +30,7 @@ export default function ActionApprovalCard({
   const [status, setStatus] = useState<"idle" | "saving" | "approved" | "rejected" | "failed">("idle");
 
   async function decide(approved: boolean) {
-    const csrf = window.sessionStorage.getItem(WEB_SESSION_CSRF_STORAGE_KEY);
+    const csrf = readStoredCsrfToken();
     if (!csrf) {
       setStatus("failed");
       return;

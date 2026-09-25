@@ -1,3 +1,5 @@
+import pytest
+
 import json
 from urllib.parse import parse_qs, urlsplit
 
@@ -8,28 +10,40 @@ from services.oauth.repository import OAuthRepository
 
 class SessionRepository:
     def resolve(self, session_id, now, touch=True):
-        if session_id != "session-1":
+        principals = {"session-1": "user:alice", "session-2": "user:bob"}
+        if session_id not in principals:
             return None
-        return {"principal_id": "user:alice", "tenant_id": "org:acme"}
+        return {"principal_id": principals[session_id], "tenant_id": "org:acme"}
 
     def csrf_matches(self, session_id, token):
-        return session_id == "session-1" and token == "csrf-1"
+        return (session_id, token) in {
+            ("session-1", "csrf-1"), ("session-2", "csrf-2")
+        }
 
 
 class SlackConnector:
     def scope_catalog(self):
+        # Mirrors the real contract: a capability declares every scope its
+        # executor needs, so the DM carries both of its.
         return {
-            "slack.channels.list": "channels:read",
-            "slack.private_channels.list": "groups:read",
-            "slack.private_conversation.read": "groups:history",
-            "slack.private_thread.read": "groups:history",
-            "slack.message.send": "chat:write",
+            "slack.channels.list": frozenset({"channels:read"}),
+            "slack.private_channels.list": frozenset({"groups:read"}),
+            "slack.private_conversation.read": frozenset({"groups:history"}),
+            "slack.private_thread.read": frozenset({"groups:history"}),
+            "slack.message.send": frozenset({"chat:write"}),
+            "slack.users.list": frozenset({"users:read"}),
+            "slack.message.permalink": frozenset({"channels:history"}),
+            "slack.direct_message.send": frozenset({"im:write", "chat:write"}),
         }
 
-    def authorization_url(self, state, code_challenge, scopes):
-        return "https://slack.test/oauth?state=%s&scope=%s" % (
+    def authorization_url(self, state, code_challenge, scopes,
+                          user_scopes=None):
+        url = "https://slack.test/oauth?state=%s&scope=%s" % (
             state, ",".join(scopes)
         )
+        if user_scopes:
+            url += "&user_scope=%s" % ",".join(user_scopes)
+        return url
 
     def exchange_code(self, code, verifier):
         assert code == "valid-code"
@@ -57,9 +71,11 @@ class Crypto:
 class Vault:
     def __init__(self):
         self.records = {}
+        self.sequence = 0
 
     def store_managed_oauth(self, body, signer=None):
-        credential_id = "cred:%s" % (len(self.records) + 1)
+        self.sequence += 1
+        credential_id = "cred:%s" % self.sequence
         self.records[credential_id] = body
         return 200, {"credential_id": credential_id}
 
@@ -129,6 +145,102 @@ def test_private_channel_capabilities_request_only_private_bot_scopes(tmp_path):
     assert set(scopes.split(",")) == {"groups:read", "groups:history"}
 
 
+def test_people_and_dm_upgrade_requests_only_optional_bot_scopes(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"capabilities": [
+            "slack.users.list", "slack.direct_message.send"
+        ]},
+    )
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    # chat:write travels with the DM: its executor posts after opening.
+    assert set(scopes.split(",")) == {"users:read", "im:write", "chat:write"}
+
+
+def test_tenant_member_can_see_owner_installation_but_cannot_mutate_it(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = service.repository.upsert_installation(
+        tenant_id="org:acme", principal_id="user:alice", provider="slack",
+        app_id="A123", team_id="T123", credential_id="cred:1",
+        granted_scopes=["channels:read"],
+        enabled_capabilities=["slack.channels.list"], now_ts=1,
+    )
+
+    status, body = service.slack_status("session-2")
+    assert status == 200
+    assert body["connections"][0]["connection_id"] == connection["connection_id"]
+    assert body["connections"][0]["owner"] is False
+    assert service.initiate_slack("session-2", "csrf-2", {
+        "capabilities": ["slack.users.list"],
+        "target_connection_id": connection["connection_id"],
+        "intended_team_id": "T123",
+    })[0] == 404
+    assert service.disconnect_slack(
+        "session-2", "csrf-2", connection["connection_id"]
+    )[0] == 404
+
+
+def test_fresh_consent_repairs_orphaned_workspace_for_same_tenant(tmp_path):
+    service, _crypto, vault = _service(tmp_path)
+    _, started = service.initiate_slack(
+        "session-1", "csrf-1", {"capabilities": ["slack.message.send"]}
+    )
+    first_state = parse_qs(
+        urlsplit(started["authorization_url"]).query
+    )["state"][0]
+    status, first = service.complete_slack(
+        "session-1", "valid-code", first_state
+    )
+    assert status == 200
+    original = service.repository.get_installation(
+        first["connection_id"], "org:acme"
+    )
+    vault.records.pop(original["credential_id"])
+
+    _, restarted = service.initiate_slack(
+        "session-2", "csrf-2", {"capabilities": ["slack.message.send"]}
+    )
+    second_state = parse_qs(
+        urlsplit(restarted["authorization_url"]).query
+    )["state"][0]
+    status, repaired = service.complete_slack(
+        "session-2", "valid-code", second_state
+    )
+
+    assert status == 200
+    assert repaired["connection_id"] == first["connection_id"]
+    current = service.repository.get_installation(
+        repaired["connection_id"], "org:acme"
+    )
+    assert current["principal_id"] == "user:bob"
+    assert current["credential_id"] == "cred:2"
+    assert "cred:2" in vault.records
+
+
+def test_same_tenant_reauthorization_retires_replaced_credential(tmp_path):
+    service, _crypto, vault = _service(tmp_path)
+    connection_ids = []
+    for session_id, csrf_token in (
+        ("session-1", "csrf-1"), ("session-2", "csrf-2")
+    ):
+        _, started = service.initiate_slack(
+            session_id, csrf_token,
+            {"capabilities": ["slack.message.send"]},
+        )
+        state = parse_qs(
+            urlsplit(started["authorization_url"]).query
+        )["state"][0]
+        status, completed = service.complete_slack(
+            session_id, "valid-code", state
+        )
+        assert status == 200
+        connection_ids.append(completed["connection_id"])
+
+    assert connection_ids[0] == connection_ids[1]
+    assert set(vault.records) == {"cred:2"}
+
+
 def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):
     service, _crypto, vault = _service(tmp_path)
     _, started = service.initiate_slack(
@@ -140,3 +252,162 @@ def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):
     assert service.complete_slack("session-1", "valid-code", state)[0] == 200
     assert service.complete_slack("session-1", "valid-code", state)[0] == 400
     assert len(vault.records) == 1
+
+
+def test_a_rotated_principal_no_longer_inherits_the_local_tenant(monkeypatch):
+    """The inverse of what this asserted until U5.
+
+    An unmapped principal used to fall back to `TESSERA_LOCAL_TENANT_ID`,
+    which on this service meant it could install a provider connection into
+    an account it was never granted, and list back every connection already
+    sitting there. Unmapped is now refused (KTD11).
+    """
+    from libs.tenancy import UnmappedPrincipalError
+    from services.oauth.app import _configured_tenant_resolver
+
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+
+    with pytest.raises(UnmappedPrincipalError):
+        _configured_tenant_resolver()("new-principal")
+
+
+def test_the_local_tenant_is_reached_by_being_mapped_like_any_other(monkeypatch):
+    from services.oauth.app import _configured_tenant_resolver
+
+    monkeypatch.setenv(
+        "TESSERA_PRINCIPAL_TENANTS_JSON", '{"new-principal": "org:local"}',
+    )
+    monkeypatch.delenv("TESSERA_LOCAL_TENANT_ID", raising=False)
+
+    assert _configured_tenant_resolver()("new-principal") == "org:local"
+
+
+def test_an_unmapped_principal_gets_a_refusal_not_a_default_account(monkeypatch):
+    """The service turns the refusal into its existing no-tenant answer."""
+    from services.oauth.app import OAuthService, _configured_tenant_resolver
+
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+    service = OAuthService.__new__(OAuthService)
+    service.tenant_resolver = _configured_tenant_resolver()
+
+    assert service._tenant_id({"principal_id": "new-principal"}) is None
+    assert service._tenant_id(
+        {"principal_id": "new-principal", "tenant_id": "org:acme"},
+    ) == "org:acme"
+
+
+def _granted(service, scopes):
+    return service.repository.upsert_installation(
+        tenant_id="org:acme", principal_id="user:alice", provider="slack",
+        app_id="A123", team_id="T123", credential_id="cred:1",
+        granted_scopes=scopes, enabled_capabilities=[], now_ts=1,
+    )
+
+
+def test_a_family_request_asks_for_that_family_and_nothing_else(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"families": ["slack_pins"]},
+    )
+
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    assert set(scopes.split(",")) == {"pins:write"}
+
+
+def test_an_upgrade_asks_only_for_the_scopes_the_connection_lacks(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = _granted(service, ["chat:write"])
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_direct_messages"],
+            "target_connection_id": connection["connection_id"],
+        },
+    )
+
+    assert status == 200
+    scopes = parse_qs(urlsplit(started["authorization_url"]).query)["scope"][0]
+    # chat:write is already held, so the prompt shows only what it adds.
+    assert set(scopes.split(",")) == {"im:write"}
+
+
+def test_an_already_granted_family_is_refused_rather_than_re_prompted(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    connection = _granted(service, ["pins:write"])
+
+    status, body = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_pins"],
+            "target_connection_id": connection["connection_id"],
+        },
+    )
+
+    assert status == 409
+    assert body["error"] == "requested families are already granted"
+
+
+@pytest.mark.parametrize("families", [[], ["not_a_family"], "slack_pins"])
+def test_an_unknown_family_is_rejected(tmp_path, families):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, body = service.initiate_slack(
+        "session-1", "csrf-1", {"families": families},
+    )
+
+    assert status == 422
+    assert body["error"] == "unsupported or missing families"
+
+
+def test_status_tells_the_ui_which_families_are_missing_and_why(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+    _granted(service, ["channels:read", "channels:history", "chat:write"])
+
+    status, body = service.slack_status("session-1")
+
+    assert status == 200
+    families = {
+        item["family"]: item
+        for item in body["connections"][0]["missing_families"]
+    }
+    assert "slack_messaging" not in families
+    assert families["slack_pins"]["missing_scopes"] == ["pins:write"]
+    assert families["slack_pins"]["operations"] == [
+        "slack.message.pin", "slack.message.unpin",
+    ]
+    # The DM already holds chat:write, so only the absent scope is offered.
+    assert families["slack_direct_messages"]["missing_scopes"] == ["im:write"]
+
+
+def test_a_search_request_asks_the_person_not_the_workspace(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {"families": ["slack_search"]},
+    )
+
+    assert status == 200
+    query = parse_qs(urlsplit(started["authorization_url"]).query)
+    # search:read is personal authority, so it must never be requested as a
+    # workspace scope: the install would then hold authority nobody granted
+    # as themselves.
+    assert query.get("user_scope") == ["search:read"]
+    assert "search:read" not in (query.get("scope") or [""])[0]
+
+
+def test_a_mixed_request_splits_workspace_and_personal_consent(tmp_path):
+    service, _crypto, _vault = _service(tmp_path)
+
+    status, started = service.initiate_slack(
+        "session-1", "csrf-1", {
+            "families": ["slack_search", "slack_channel_discovery"],
+        },
+    )
+
+    assert status == 200
+    query = parse_qs(urlsplit(started["authorization_url"]).query)
+    assert set(query["scope"][0].split(",")) == {"channels:read"}
+    assert query["user_scope"] == ["search:read"]

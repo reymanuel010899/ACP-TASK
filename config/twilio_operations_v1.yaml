@@ -1,0 +1,112 @@
+{
+  "manifest_version": "twilio.operations.v1",
+  "provider": "twilio",
+  "operations": [
+    {
+      "operation_id": "twilio.sms.send",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": ["enviar sms", "manda un mensaje de texto", "send sms", "text"],
+      "slots": [
+        {"name": "contact", "entity_kind": "contacts.contact", "required": true},
+        {"name": "body", "entity_kind": "scalar.text", "required": true},
+        {"name": "purpose", "entity_kind": "scalar.purpose", "required": true},
+        {"name": "sender", "entity_kind": "twilio.sender", "required": true},
+        {"name": "system", "entity_kind": "twilio.system_binding", "required": true}
+      ],
+      "capability_recipe": [{
+        "step_id": "send_sms", "capability_id": "twilio.sms.send",
+        "capability_version": "1.0.0", "input_bindings": {
+          "contact_id": "contact.id", "contact_version": "contact.version",
+          "address_id": "contact.address_id", "to": "contact.address",
+          "from": "sender.address", "body": "body", "purpose": "purpose",
+          "status_callback": "system.callback_url"
+        }, "depends_on": []
+      }],
+      "authority_profile": "account", "family_flag": "sms",
+      "prerequisites": ["resolved_contact", "exact_approval", "live_eligibility"],
+      "recovery": {"unavailable": "explain_twilio_connection", "missing_slot": "clarify_message"},
+      "presentation": {"kind": "message_effect", "label": "SMS"}
+    },
+    {
+      "operation_id": "twilio.voice.call",
+      "operation_kind": "capability", "availability": "supported",
+      "aliases": ["llamar", "haz una llamada", "call", "place a call"],
+      "slots": [
+        {"name": "contact", "entity_kind": "contacts.contact", "required": true},
+        {"name": "voice_definition", "entity_kind": "twilio.voice_definition", "required": true},
+        {"name": "purpose", "entity_kind": "scalar.purpose", "required": true},
+        {"name": "sender", "entity_kind": "twilio.sender", "required": true},
+        {"name": "system", "entity_kind": "twilio.system_binding", "required": true}
+      ],
+      "capability_recipe": [{
+        "step_id": "place_call", "capability_id": "twilio.voice.call",
+        "capability_version": "1.0.0", "input_bindings": {
+          "contact_id": "contact.id", "contact_version": "contact.version",
+          "address_id": "contact.address_id", "to": "contact.address",
+          "from": "sender.address", "purpose": "purpose",
+          "status_callback": "system.voice_status_callback_url",
+          "twiml_url": "system.voice_connect_url",
+          "definition_hash": "voice_definition.hash",
+          "maximum_duration_seconds": "voice_definition.maximum_duration_seconds",
+          "ring_timeout_seconds": "voice_definition.ring_timeout_seconds",
+          "recording": "voice_definition.recording"
+        }, "depends_on": []
+      }],
+      "authority_profile": "account", "family_flag": "voice",
+      "prerequisites": ["resolved_contact", "exact_voice_approval", "live_eligibility"],
+      "recovery": {"unavailable": "offer_human_followup", "missing_slot": "clarify_call"},
+      "presentation": {"kind": "voice_effect", "label": "Llamada de voz"}
+    },
+    {
+      "operation_id": "twilio.whatsapp.freeform.send",
+      "operation_kind": "capability", "availability": "supported",
+      "aliases": ["enviar whatsapp", "manda un whatsapp", "send whatsapp"],
+      "slots": [{"name": "contact", "entity_kind": "contacts.contact", "required": true}, {"name": "body", "entity_kind": "scalar.text", "required": true}, {"name": "sender", "entity_kind": "twilio.sender", "required": true}, {"name": "system", "entity_kind": "twilio.system_binding", "required": true}],
+      "capability_recipe": [{
+        "step_id": "send_whatsapp", "capability_id": "twilio.whatsapp.freeform.send",
+        "capability_version": "1.0.0", "input_bindings": {
+          "contact_id": "contact.id", "contact_version": "contact.version",
+          "address_id": "contact.address_id", "to": "contact.address",
+          "from": "sender.address", "body": "body", "purpose": "system.purpose",
+          "status_callback": "system.callback_url"
+        }, "depends_on": []
+      }], "authority_profile": "account",
+      "family_flag": "whatsapp", "prerequisites": ["open_session_window"],
+      "recovery": {"unavailable": "offer_template_message", "missing_slot": "clarify_message"},
+      "presentation": {"kind": "message_effect", "label": "WhatsApp"}
+    },
+    {
+      "operation_id": "twilio.whatsapp.template.send",
+      "operation_kind": "capability", "availability": "supported",
+      "aliases": ["enviar plantilla whatsapp", "send whatsapp template"],
+      "slots": [{"name": "contact", "entity_kind": "contacts.contact", "required": true}, {"name": "template", "entity_kind": "twilio.template", "required": true}, {"name": "sender", "entity_kind": "twilio.sender", "required": true}, {"name": "system", "entity_kind": "twilio.system_binding", "required": true}],
+      "capability_recipe": [{
+        "step_id": "send_whatsapp_template", "capability_id": "twilio.whatsapp.template.send",
+        "capability_version": "1.0.0", "input_bindings": {
+          "contact_id": "contact.id", "contact_version": "contact.version",
+          "address_id": "contact.address_id", "to": "contact.address",
+          "from": "sender.address", "purpose": "system.purpose",
+          "status_callback": "system.callback_url", "content_sid": "template.sid",
+          "content_variables": "template.variables", "template_category": "template.category"
+        }, "depends_on": []
+      }], "authority_profile": "account",
+      "family_flag": "whatsapp", "prerequisites": ["approved_template"],
+      "recovery": {"unavailable": "explain_template_status", "missing_slot": "clarify_template"},
+      "presentation": {"kind": "message_effect", "label": "Plantilla WhatsApp"}
+    }
+  ],
+  "method_coverage": {
+    "supported": [
+      {"method": "Messages.create", "family": "messaging", "state": "runtime", "prerequisites": ["exact_approval"]},
+      {"method": "Calls.create", "family": "voice", "state": "runtime", "prerequisites": ["exact_voice_approval"]}
+    ],
+    "conditional": [
+      {"method": "Recordings.create", "family": "voice_recording", "state": "runtime", "prerequisites": ["recording_consent"]}
+    ],
+    "excluded": [
+      {"method": "IncomingPhoneNumbers.*", "family": "numbers", "state": "dormant", "prerequisites": ["number_administration"], "reason": "number purchase, porting and release are deferred"},
+      {"method": "*", "family": "arbitrary_api", "state": "dormant", "prerequisites": ["trusted_catalog_review"], "reason": "only trusted catalog capabilities execute"}
+    ]
+  }
+}

@@ -16,7 +16,7 @@ import { useSession } from "@/lib/SessionProvider";
  * through it -- every page under `src/app/` except `/login` does, so
  * enforcing "no session -> redirect to /login" here covers the whole
  * protected surface from one place rather than per-page. `useSession()` is a
- * client hook (backed by `sessionStorage`, unavailable during SSR), so this
+ * client hook (backed by `localStorage`, unavailable during SSR), so this
  * check can only run client-side; while signed out this renders `null`
  * instead of the shell so the authenticated UI never flashes before the
  * redirect lands. Note the server-rendered/first-hydration snapshot from

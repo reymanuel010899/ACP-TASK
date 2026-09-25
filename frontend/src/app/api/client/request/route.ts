@@ -14,6 +14,8 @@ export async function POST(request: Request): Promise<Response> {
   const headers = new Headers({ "Content-Type": "application/json" });
   const cookie = request.headers.get("cookie");
   if (cookie) headers.set("Cookie", cookie);
+  const csrf = request.headers.get("x-csrf-token");
+  if (csrf) headers.set("X-CSRF-Token", csrf);
   try {
     const upstream = await fetch(`${getConciergeUrl()}/concierge`, {
       method: "POST",
@@ -26,9 +28,9 @@ export async function POST(request: Request): Promise<Response> {
       status: upstream.status,
       headers: { "Content-Type": "application/json" },
     });
-  } catch (err) {
+  } catch {
     return Response.json(
-      { status: "failed", reply: `El concierge no respondió: ${err instanceof Error ? err.message : String(err)}` },
+      { status: "failed", reply: "El concierge no respondió." },
       { status: 502 },
     );
   }

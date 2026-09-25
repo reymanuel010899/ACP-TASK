@@ -3,6 +3,8 @@
 import threading
 import time
 
+from libs.connectors.base import REFRESH_AUTHORITY_UNSUPPORTED
+
 
 class ManagedOAuthRotator(object):
     def __init__(self, vault, connector, clock=None, refresh_skew_seconds=300):
@@ -21,10 +23,25 @@ class ManagedOAuthRotator(object):
             )
             if status != "active":
                 raise PermissionError("credential is not active")
+            # A provider that issues no refresh tokens has not lost its
+            # refresh authority; it never had any. Reporting that as a named
+            # limitation keeps a static credential dispatchable, while a
+            # provider that does refresh and arrives without a refresh token
+            # still fails closed below.
+            if not getattr(self.connector, "supports_refresh", True):
+                return {
+                    "credential_version": version,
+                    "status": "active",
+                    "limitation": REFRESH_AUTHORITY_UNSUPPORTED,
+                }
             if document.get("expires_at", 0) > (
                 self.clock() + self.refresh_skew_seconds
             ):
-                return {"credential_version": version, "status": "active"}
+                return {
+                    "credential_version": version,
+                    "status": "active",
+                    "limitation": None,
+                }
             refresh_token = document.get("refresh_token")
             if not isinstance(refresh_token, str) or not refresh_token:
                 raise PermissionError("refresh authority is unavailable")
@@ -48,7 +65,11 @@ class ManagedOAuthRotator(object):
                 service_identity,
             ):
                 raise PermissionError("credential rotation lost its version fence")
-            return {"credential_version": version + 1, "status": "active"}
+            return {
+                "credential_version": version + 1,
+                "status": "active",
+                "limitation": None,
+            }
 
     def _connection_lock(self, connection_id):
         with self._guard:

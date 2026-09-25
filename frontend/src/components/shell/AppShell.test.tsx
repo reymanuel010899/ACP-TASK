@@ -38,6 +38,9 @@ function makeSession(ttlSeconds = 900): StoredSession {
     sessionPublicKey: sessionPublicKeyB64,
     sessionPrivateKey: b64encode(session.privateKey),
     assertion,
+    absoluteExpiresAt: Math.floor(Date.now() / 1000) + 43_200,
+    idleTtlSeconds: 1800,
+    lastActivityAt: Math.floor(Date.now() / 1000),
   };
 }
 
@@ -64,6 +67,7 @@ function renderShell() {
 beforeEach(() => {
   pushMock.mockClear();
   replaceMock.mockClear();
+  window.localStorage.clear();
   window.sessionStorage.clear();
   __resetSessionStoreForTests();
 });
