@@ -1,66 +1,9 @@
-"""Tests for unit U9 -- multi-tenancy (organizations + RLS) end to end.
+"""End-to-end tests for the strict tenant foundation.
 
-Needs a real Postgres with EVERY migration through
-``migrations/0009_rls_policies.sql`` already applied (run ``infra/roles.sql``
-then ``python -m tools.migrate`` first -- see the env var contract at the
-top of ``libs/db.py``), and the ``registry_svc``/``marketplace_svc``/
-``audit_svc`` roles ``infra/roles.sql`` creates (this unit connects with
-those exact roles -- the plan's own instruction -- rather than throwaway
-roles, unlike ``tests/lib/test_identity_repository.py``'s RLS test, which
-predates ``infra/roles.sql`` defining any dedicated role for the schema it
-covers).
-
-If Postgres isn't reachable, or ``migrations/0009_rls_policies.sql`` hasn't
-been applied yet, every test in this module is skipped (not failed).
-
-Reality check this unit documents (see migrations/0009_rls_policies.sql's
-header for the full reasoning) -- restated briefly here since it's what
-every assertion below is checking:
-
-  * ``registry.agents`` has no organization_id column -- RLS is a JOIN
-    through ``identity.principals.home_organization_id``.
-  * ``marketplace.tasks`` / ``audit.audit_log`` DO have a (nullable)
-    organization_id column -- direct-column RLS.
-  * EVERY policy is permissive on NULL (``... OR organization_id IS NULL``
-    / ``... OR home_organization_id IS NULL``): nothing populates these
-    columns on any real write path yet, so a strict (non-permissive) policy
-    would make almost every existing row invisible to every session,
-    scoped or not. NULL rows stay visible to everyone; only an EXPLICIT,
-    non-null organization_id on the OTHER org is what a scoped session
-    can't see.
-  * ``vault.*`` and ``marketplace.hiring_grants``/``ratings``/
-    ``rating_summary`` are EXPLICITLY excluded from RLS this unit -- no
-    organization_id column, and adding one is a separate, future decision
-    (U3's/U8's own reports already flagged this; this file does not test
-    them because there's no policy to test).
-
-Test scenarios:
-    * Integration, plus the edge case (a NULL organization_id / no
-      home_organization_id row is visible to every session -- proving the
-      NULL-permissive decision) inline in each --
-        - test_registry_agents_rls_blocks_cross_org_reads (also covers the
-          solo/unaffiliated-agent edge case)
-        - test_marketplace_tasks_rls_blocks_cross_org_reads (also covers
-          the unscoped-task edge case)
-        - test_audit_log_rls_blocks_cross_org_reads (also covers the
-          unscoped-entry edge case)
-    * Integration (libs/db.py's automatic per-request wiring, not just raw
-      SQL SET LOCAL) -- test_bind_organization_id_is_applied_automatically_by_database
-    * Integration (FORCE, not just ENABLE) --
-      test_force_row_level_security_binds_owner_role_on_tasks
-    * Regression -- identity.organization_members's OWN U2 RLS test is not
-      duplicated here; it's confirmed still green via the full-suite run
-      (see this unit's report), per tests/lib/test_identity_repository.py.
-    * (Role-based org settings enforcement, "member can't modify
-      admin/owner-only settings") -- searched the codebase for any
-      repository/service-layer authorization gate keyed on
-      identity.org_role; none exists anywhere (org_role is storage-only as
-      of U2 -- see libs/identity_repository.py). There is therefore nothing
-      to test beyond U2's own test_organization_members_with_different_roles,
-      which already covers creating/listing members by role; building a new
-      authorization mechanism to give this scenario something to test would
-      be scope creep beyond U9's RLS mandate, so it is intentionally not
-      added here.
+These tests require every migration through 0029 plus ``infra/roles.sql``.
+They connect through the real Registry, Marketplace, and Audit runtime roles.
+Public Agent Cards remain globally readable; tenant-private ownership, tasks,
+and audit entries fail closed. Legacy NULL rows are preserved but invisible.
 """
 
 import os
@@ -96,15 +39,11 @@ def pg_dsn():
     try:
         with psycopg.connect(dsn, connect_timeout=3) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM pg_catalog.pg_policies "
-                    "WHERE schemaname = 'marketplace' AND tablename = 'tasks' "
-                    "AND policyname = 'tasks_org_isolation'"
-                )
+                cur.execute("SELECT to_regclass('registry.agent_ownership')")
                 if cur.fetchone() is None:
                     pytest.skip(
-                        "migrations/0009_rls_policies.sql not applied -- run "
-                        "`python -m tools.migrate` against this DATABASE_URL first."
+                        "migrations/0029_strict_tenant_foundation.sql not applied -- "
+                        "run `python -m tools.migrate` against this DATABASE_URL first."
                     )
                 cur.execute(
                     "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'registry_svc'"
@@ -118,7 +57,7 @@ def pg_dsn():
         pytest.skip(
             f"Postgres not reachable at {dsn!r} ({exc}). Bring up a Postgres 16 "
             f"instance, run infra/roles.sql + `python -m tools.migrate` through "
-            f"0009_rls_policies.sql, and point DATABASE_URL at it to run "
+            f"0029_strict_tenant_foundation.sql, and point DATABASE_URL at it to run "
             f"tests/lib/test_multi_tenancy.py."
         )
     return dsn
@@ -190,12 +129,13 @@ def _cleanup_rows(pg_dsn, principal_ids=(), organization_ids=(), task_ids=(),
 
 
 # ---------------------------------------------------------------------------
-# 1. Integration -- registry.agents, JOIN-based policy through
-#    identity.principals.home_organization_id.
+# 1. Integration -- public Agent Cards, private explicit ownership.
 # ---------------------------------------------------------------------------
 
 
-def test_registry_agents_rls_blocks_cross_org_reads(pg_dsn, admin_db, run_id):
+def test_registry_cards_are_public_but_ownership_is_tenant_private(
+    pg_dsn, admin_db, run_id
+):
     org_a = f"org_a_{run_id}"
     org_b = f"org_b_{run_id}"
     pid_a = f"agent_a_{run_id}"
@@ -218,6 +158,11 @@ def test_registry_agents_rls_blocks_cross_org_reads(pg_dsn, admin_db, run_id):
                         "VALUES (%s, '{}'::jsonb)",
                         (pid,),
                     )
+                cur.execute(
+                    "INSERT INTO registry.agent_ownership "
+                    "(principal_id, organization_id) VALUES (%s, %s), (%s, %s)",
+                    (pid_a, org_a, pid_b, org_b),
+                )
 
         role_dsn = _role_dsn(pg_dsn, "registry_svc")
         with psycopg.connect(role_dsn, connect_timeout=3) as conn:
@@ -231,18 +176,15 @@ def test_registry_agents_rls_blocks_cross_org_reads(pg_dsn, admin_db, run_id):
                     ([pid_a, pid_b, pid_solo],),
                 )
                 visible = {row[0] for row in cur.fetchall()}
+                cur.execute(
+                    "SELECT principal_id FROM registry.agent_ownership "
+                    "WHERE principal_id = ANY(%s)",
+                    ([pid_a, pid_b, pid_solo],),
+                )
+                owned = {row[0] for row in cur.fetchall()}
 
-        assert pid_a in visible, "org A's own agent must be visible"
-        assert pid_b not in visible, (
-            "registry_svc scoped to org A must not see org B's agent, "
-            "even via a hand-crafted query joining through "
-            "identity.principals.home_organization_id"
-        )
-        assert pid_solo in visible, (
-            "an agent with no home_organization_id (solo/unaffiliated) is "
-            "the documented NULL-permissive edge case -- visible to every "
-            "session regardless of org context"
-        )
+        assert visible == {pid_a, pid_b, pid_solo}
+        assert owned == {pid_a}
     finally:
         _cleanup_rows(
             pg_dsn,
@@ -294,11 +236,9 @@ def test_marketplace_tasks_rls_blocks_cross_org_reads(pg_dsn, admin_db, run_id):
             "even via a hand-crafted query bypassing the app layer's own "
             "filters"
         )
-        assert task_none["id"] in visible, (
-            "a task with organization_id IS NULL (today's overwhelming "
-            "majority -- nothing populates it on any real write path yet) "
-            "stays visible to every session per this unit's documented "
-            "NULL-permissive decision"
+        assert task_none["id"] not in visible, (
+            "a quarantined task with no organization must be invisible to "
+            "every tenant runtime role"
         )
     finally:
         _cleanup_rows(
@@ -358,11 +298,9 @@ def test_audit_log_rls_blocks_cross_org_reads(pg_dsn, admin_db, run_id):
             "even via a hand-crafted query bypassing the app layer's own "
             "filters"
         )
-        assert entry_none["entry_id"] in visible, (
-            "an audit entry with organization_id IS NULL (nothing "
-            "populates it on any real write path yet) stays visible to "
-            "every session per this unit's documented NULL-permissive "
-            "decision"
+        assert entry_none["entry_id"] not in visible, (
+            "a quarantined audit entry with no organization must be "
+            "invisible to every tenant runtime role"
         )
     finally:
         _cleanup_rows(

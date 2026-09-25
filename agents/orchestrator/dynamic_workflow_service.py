@@ -13,9 +13,13 @@ from agents.orchestrator.compound import (
 from agents.orchestrator.planner import DynamicPlanner, PlanCompiler, descriptor_hash
 from agents.orchestrator.slack_conversation import SlackConversationCoordinator
 from agents.orchestrator.slack_operations import (
+    load_contacts_operations,
     load_slack_operations,
 )
-from libs.integrations.catalog import ConnectionCapabilitySnapshot
+from libs.integrations.catalog import (
+    CONTACTS_PROVIDER,
+    ConnectionCapabilitySnapshot,
+)
 
 
 def _hash(value):
@@ -28,7 +32,8 @@ class DynamicWorkflowService:
                  conversation_store=None, conversational_reads_enabled=True,
                  slack_writes_enabled=True, slack_dms_enabled=True,
                  slack_policy_visible=None, slack_family_flags=None,
-                 private_read_authorizer=None, control_plane=None):
+                 private_read_authorizer=None, control_plane=None,
+                 contacts_family_flags=None, contacts_policy_visible=None):
         self.brain = brain
         self.definitions = tuple(definitions)
         self.connections = connection_repository
@@ -58,6 +63,20 @@ class DynamicWorkflowService:
             load_slack_operations(slack_definitions)
             if slack_definitions else None
         )
+        #: Contacts is first-party, so there is no installation to check and no
+        #: consent screen to have visited: being registered in the catalog is
+        #: what "installed" means for it. Family state still gates it, and a
+        #: family with no answer is off.
+        self.contacts_family_flags = dict(contacts_family_flags or {})
+        self.contacts_policy_visible = contacts_policy_visible
+        contacts_capabilities = tuple(
+            item for item in self.definitions
+            if item.provider == CONTACTS_PROVIDER
+        )
+        self.contacts_operation_registry = (
+            load_contacts_operations(contacts_capabilities)
+            if contacts_capabilities else None
+        )
 
     def coordinate_slack_turn(
         self, tenant_id, principal_id, text, conversation_id=None,
@@ -85,16 +104,24 @@ class DynamicWorkflowService:
             users = self.connections.list_slack_users(tenant_id, principal_id)
         interpretation = None
         projection = ()
-        if self.slack_operation_registry is not None and hasattr(
-            self.brain, "understand_slack"
-        ):
-            projection = self._slack_operation_projection(installations)
+        if (
+            self.slack_operation_registry is not None
+            or self.contacts_operation_registry is not None
+        ) and hasattr(self.brain, "understand_slack"):
+            # One projection, two manifests. The model sees a single list of
+            # operations it may name and cannot tell which store or provider
+            # backs any of them, which is what keeps "may never invent an
+            # operation" a property of the join rather than of the prompt.
+            projection = (
+                self._slack_operation_projection(installations, tenant_id)
+                + self.contacts_operation_projection(tenant_id)
+            )
             interpretation = self.brain.understand_slack(text, {
                 "slack_operation_projection": projection,
                 "active_conversation": active or {},
             })
             limitation = self._interpretation_limitation(
-                text, interpretation, installations, projection
+                text, interpretation, installations, projection, tenant_id
             )
             if limitation is not None:
                 return limitation
@@ -102,7 +129,9 @@ class DynamicWorkflowService:
             text, active_state=active, installations=installations,
             channels=channels, users=users, interpretation=interpretation,
         )
-        disabled_feature = self._disabled_slack_feature(result.turn.operation)
+        disabled_feature = self._disabled_slack_feature(
+            result.turn.operation, tenant_id
+        )
         if disabled_feature:
             return {
                 "state": "retryable_failure",
@@ -961,7 +990,80 @@ class DynamicWorkflowService:
         except Exception:
             return False
 
+    def _contacts_family_state(self, tenant_id=None):
+        """Which contacts families this tenant holds. Absent means off.
+
+        A first-party store has no install callback to derive enablement from,
+        which makes the fail-closed default load-bearing rather than merely
+        tidy: without it, registering the catalog entry would be enough to
+        expose a directory of personal data to every tenant on the process.
+        """
+        if self.contacts_operation_registry is None:
+            return {}
+        live = (
+            dict(self.control_plane.family_flags(tenant_id))
+            if self.control_plane is not None else {}
+        )
+        state = {
+            family: live.get(family) is True
+            for family in self.contacts_operation_registry.family_flags
+        }
+        state.update(self.contacts_family_flags)
+        return state
+
+    def _policy_allows_contacts_operation(self, operation, tenant_id=None):
+        if self._contacts_family_state(tenant_id).get(
+            operation.family_flag
+        ) is not True:
+            return False
+        if self.contacts_policy_visible is None:
+            return True
+        try:
+            return self.contacts_policy_visible(operation) is True
+        except Exception:
+            return False
+
+    def contacts_operation_projection(self, tenant_id=None):
+        """Language-only metadata for the contacts operations a tenant holds.
+
+        Public because the parity assertion needs it: "every operation the
+        interface can reach has a manifest entry and a renderable
+        presentation" is only checkable against the same projection the
+        interface is built from. The repository already carries three trusted
+        Slack capabilities no interface can reach, and a review checklist did
+        not catch that.
+        """
+        if self.contacts_operation_registry is None:
+            return ()
+        installed = {
+            definition.capability_id for definition in self.definitions
+            if definition.provider == CONTACTS_PROVIDER
+        }
+        return self.contacts_operation_registry.model_projection(
+            installed, self._contacts_family_state(tenant_id),
+            lambda operation: self._policy_allows_contacts_operation(
+                operation, tenant_id
+            ),
+        )
+
+    def _registry_for(self, operation_id):
+        """Which manifest owns this namespace, or nothing at all.
+
+        Returning ``None`` for an unknown namespace is the point. A model that
+        names ``twilio.sms.send`` before Phase 3 exists must land on a named
+        limitation here, not on a registry that happens to answer.
+        """
+        for prefix, registry in (
+            ("slack.", self.slack_operation_registry),
+            ("contacts.", self.contacts_operation_registry),
+        ):
+            if str(operation_id or "").startswith(prefix):
+                return registry
+        return None
+
     def _slack_operation_projection(self, installations, tenant_id=None):
+        if self.slack_operation_registry is None:
+            return ()
         connected = [
             item for item in installations if item.get("status") == "connected"
         ]
@@ -990,18 +1092,34 @@ class DynamicWorkflowService:
         visible = {item["operation_id"] for item in projection}
         if proposed:
             for operation_id in proposed:
-                descriptor = self.slack_operation_registry.get(operation_id)
+                registry = self._registry_for(operation_id)
+                descriptor = (
+                    registry.get(operation_id) if registry is not None else None
+                )
                 if descriptor is None:
+                    # R2's floor. An operation the catalog does not carry never
+                    # reaches a provider, a store, or a plan; it stops here
+                    # with a name the surface can explain.
                     return self._slack_limitation(
                         "unsupported_operation", "choose_supported_operation",
                         operation_id=operation_id,
                     )
                 if operation_id not in visible:
+                    if registry is self.contacts_operation_registry:
+                        return self._contacts_operation_unavailable(
+                            descriptor, tenant_id
+                        )
                     return self._operation_unavailable(
                         descriptor, installations, tenant_id
                     )
             return None
-        alias = self.slack_operation_registry.lookup_alias(text)
+        alias = None
+        if self.slack_operation_registry is not None:
+            alias = self.slack_operation_registry.lookup_alias(text)
+        if alias is None and self.contacts_operation_registry is not None:
+            alias = self.contacts_operation_registry.lookup_alias(text)
+            if alias is not None and alias.operation_id not in visible:
+                return self._contacts_operation_unavailable(alias, tenant_id)
         if alias is not None and alias.operation_id not in visible:
             return self._operation_unavailable(alias, installations, tenant_id)
         blockers = list(getattr(interpretation, "blockers", ()) or ())
@@ -1010,6 +1128,34 @@ class DynamicWorkflowService:
                 "unsupported_operation", "choose_supported_operation",
             )
         return None
+
+    def _contacts_operation_unavailable(self, descriptor, tenant_id=None):
+        """Why a contacts operation the catalog carries is not reachable here.
+
+        Deliberately shorter than the Slack path: there is no installation to
+        reconnect and no scope to upgrade, so the only honest answers are that
+        the account is stopped, the family is off, or policy refused. Reusing
+        the Slack path would produce "connect Slack" for a first-party store.
+        """
+        if self.control_plane is not None and self.control_plane.emergency_stop(
+            tenant_id
+        ):
+            return self._slack_limitation("emergency_stop", "contact_admin")
+        families = self._contacts_family_state(tenant_id)
+        if families.get(descriptor.family_flag) is not True:
+            return self._slack_limitation(
+                "feature_disabled", "contact_admin",
+                feature=descriptor.family_flag,
+            )
+        if not self._policy_allows_contacts_operation(descriptor, tenant_id):
+            return self._slack_limitation(
+                "policy_denied", "contact_admin",
+                operation_id=descriptor.operation_id,
+            )
+        return self._slack_limitation(
+            "capability_unavailable", "reconnect_or_enable_capability",
+            operation_id=descriptor.operation_id,
+        )
 
     def _operation_unavailable(self, descriptor, installations, tenant_id=None):
         if self.control_plane is not None and self.control_plane.emergency_stop(

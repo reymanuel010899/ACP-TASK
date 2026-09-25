@@ -21,6 +21,7 @@ request and plain state dicts -- never credentials or vault material.
 import json
 import os
 import re
+import time
 import unicodedata
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -1130,14 +1131,30 @@ class GroqBrain:
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        resp = requests.post(
-            self.base_url + "/chat/completions",
-            json=body,
-            headers={"Authorization": "Bearer " + self.api_key},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    self.base_url + "/chat/completions",
+                    json=body,
+                    headers={"Authorization": "Bearer " + self.api_key},
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except requests.RequestException as exc:
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+                temporary = status is None or status == 429 or status >= 500
+                if not temporary or attempt == 2:
+                    raise
+                retry_after = (getattr(response, "headers", {}) or {}).get(
+                    "Retry-After"
+                )
+                try:
+                    delay = min(2.0, max(0.1, float(retry_after)))
+                except (TypeError, ValueError):
+                    delay = 0.25 * (attempt + 1)
+                time.sleep(delay)
 
     def understand(self, nl_request: str, context: Optional[dict] = None) -> Intent:
         memory = _memory_intent(nl_request, context)
@@ -1155,8 +1172,14 @@ class GroqBrain:
         except (requests.RequestException, ValueError, KeyError) as exc:
             return Intent(
                 capability="",
-                missing_info=["Disculpe, no pude interpretar su solicitud en este momento. ¿Podría reformularla?"],
-                user_message="Con gusto le ayudo en cuanto me confirme qué necesita.",
+                missing_info=[
+                    "El servicio de interpretación está temporalmente "
+                    "indisponible. Inténtelo nuevamente en un momento."
+                ],
+                user_message=(
+                    "Su solicitud está clara, pero el servicio de "
+                    "interpretación no respondió."
+                ),
             )
         intent = Intent(
             capability=str(data.get("capability") or ""),

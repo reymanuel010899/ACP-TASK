@@ -15,14 +15,25 @@ def _sessions(tmp_path):
 
 
 class _Actions:
+    """Stands in for `ActionRepository`, including its tenant scope.
+
+    Both reads take a tenant now, and this fake records the one it was given
+    so the tests below can see that the browser session's account -- not the
+    proposal id alone -- is what opens the row.
+    """
+
     def __init__(self, reinforced):
         self.reinforced = reinforced
         self.decided = None
+        self.scopes = []
 
-    def get(self, proposal_id):
+    def get(self, proposal_id, version=None, tenant_id=None):
+        self.scopes.append(tenant_id)
         return {"proposal_id": proposal_id, "reinforced": self.reinforced}
 
-    def decide(self, proposal_id, version, principal, approved, now):
+    def decide(self, proposal_id, version, principal, approved, now,
+               tenant_id=None):
+        self.scopes.append(tenant_id)
         self.decided = (proposal_id, version, principal, approved)
         return True
 

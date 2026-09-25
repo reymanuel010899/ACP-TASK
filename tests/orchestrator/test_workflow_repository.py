@@ -31,6 +31,30 @@ def _create(repository):
     return run, revision
 
 
+def test_campaign_envelope_authorizes_one_short_write_revision(tmp_path):
+    repository = _repository(tmp_path)
+    run, revision = _create(repository)
+
+    repository.record_campaign_authorization(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme",
+        "graph-hash-v1", "campaign:1", "envelope-hash", "user:operator",
+        now_ts=100, envelope_expires_at=200,
+    )
+
+    assert repository.revision_authorization_mode(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme",
+        "graph-hash-v1", now_ts=150,
+    ) == "campaign_envelope"
+    assert repository.is_step_authorized(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme",
+        "graph-hash-v1", "write", now_ts=150,
+    )
+    assert not repository.is_step_authorized(
+        run["workflow_run_id"], revision["workflow_revision_id"], "org:acme",
+        "graph-hash-v1", "write", now_ts=201,
+    )
+
+
 def test_outbox_append_is_deduplicated_and_ordered_per_aggregate(tmp_path):
     repository = _repository(tmp_path)
 

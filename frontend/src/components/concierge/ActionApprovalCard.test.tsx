@@ -20,7 +20,7 @@ const proposal = {
 };
 
 beforeEach(() => {
-  window.sessionStorage.clear();
+  window.sessionStorage.clear(); window.localStorage.clear();
 });
 
 afterEach(() => {
@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 it("shows material action fields and approves the exact version once", async () => {
-  window.sessionStorage.setItem("tessera-csrf", "csrf-1");
+  window.localStorage.setItem("tessera-csrf", "csrf-1");
   const fetchMock = vi.fn<typeof fetch>();
   fetchMock.mockResolvedValue(Response.json({ status: "approved" }));
   vi.stubGlobal("fetch", fetchMock);

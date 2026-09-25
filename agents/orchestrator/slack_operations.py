@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Mapping, Tuple
 
 from libs.integrations.catalog import (
+    AUTHORITY_PROFILES,
     TrustedCapabilityDefinition,
     provider_registration,
 )
@@ -27,6 +28,20 @@ MANIFEST_VERSION = provider_registration("slack").manifest_version
 DEFAULT_MANIFEST_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "slack_operations_v1.yaml"
 )
+CONTACTS_MANIFEST_VERSION = provider_registration("contacts").manifest_version
+CONTACTS_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[2] / "config"
+    / "contacts_operations_v1.yaml"
+)
+TWILIO_MANIFEST_VERSION = provider_registration("twilio").manifest_version
+TWILIO_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "twilio_operations_v1.yaml"
+)
+
+#: Profiles a manifest may name. Drawn from the catalog rather than restated,
+#: so a profile the catalog has stopped honouring cannot survive in a manifest,
+#: plus ``none`` for a local operation that executes nothing at all.
+MANIFEST_AUTHORITY_PROFILES = frozenset(AUTHORITY_PROFILES) | {"none"}
 
 _TRUSTED_ONLY_FIELDS = frozenset({
     "input_schema", "output_schema", "required_scopes", "effect", "risk",
@@ -406,6 +421,40 @@ def load_slack_operations(definitions, manifest_path=DEFAULT_MANIFEST_PATH):
     )
 
 
+CONTACTS_MANIFEST = OperationManifestSpec(
+    provider="contacts",
+    manifest_version=CONTACTS_MANIFEST_VERSION,
+    manifest_path=CONTACTS_MANIFEST_PATH,
+)
+
+TWILIO_MANIFEST = OperationManifestSpec(
+    provider="twilio", manifest_version=TWILIO_MANIFEST_VERSION,
+    manifest_path=TWILIO_MANIFEST_PATH,
+)
+
+
+def load_twilio_operations(definitions, manifest_path=TWILIO_MANIFEST_PATH):
+    return load_operations(
+        replace(TWILIO_MANIFEST, manifest_path=Path(manifest_path)), definitions,
+    )
+
+
+def load_contacts_operations(
+    definitions, manifest_path=CONTACTS_MANIFEST_PATH,
+):
+    """The contacts manifest, through the same join Slack uses.
+
+    Same function, same fail-closed checks, same refusal to let a manifest
+    declare authority. A first-party store gets no shortcut here: its
+    operations are trusted because the catalog says so, not because the store
+    happens to be ours.
+    """
+    return load_operations(
+        replace(CONTACTS_MANIFEST, manifest_path=Path(manifest_path)),
+        definitions,
+    )
+
+
 def _parse_operation(value, provider):
     if not isinstance(value, Mapping):
         raise SlackOperationManifestError("manifest operation fields are invalid")
@@ -441,7 +490,7 @@ def _parse_operation(value, provider):
     if len({step.step_id for step in recipe}) != len(recipe):
         raise SlackOperationManifestError("recipe step ids must be unique")
     authority_profile = value.get("authority_profile")
-    if authority_profile not in {"none", "bot", "user", "enterprise_admin"}:
+    if authority_profile not in MANIFEST_AUTHORITY_PROFILES:
         raise SlackOperationManifestError("authority profile is invalid")
     family_flag = _required_string(value.get("family_flag"), "family flag")
     prerequisites = _string_tuple(value.get("prerequisites"), "prerequisites")

@@ -1,6 +1,27 @@
 """Durable, one-step-at-a-time workflow scheduler."""
 
 import time
+from collections.abc import Mapping
+
+
+#: What a bare ``False`` from a step policy means. A policy that knows more
+#: than "no" -- the tenant control plane, for instance -- answers with a
+#: decision carrying its own reason, and the step parks under that instead, so
+#: the resume path can tell an emergency stop apart from a disabled family.
+DEFAULT_POLICY_REASON = "dispatch policy disabled"
+
+
+def _policy_allows(decision):
+    if isinstance(decision, Mapping):
+        return bool(decision.get("allowed", True))
+    return bool(decision)
+
+
+def _policy_reason(decision):
+    reason = getattr(decision, "reason", None)
+    if reason is None and isinstance(decision, Mapping):
+        reason = decision.get("reason")
+    return reason or DEFAULT_POLICY_REASON
 
 
 class RetryableStepError(Exception):
@@ -80,12 +101,19 @@ class WorkflowExecutor:
                 claim, tenant_id, int(self.clock()), consumed=False
             )
             return {"status": "needs_replan", "step_id": step["step_id"]}
-        if not self.policy(step):
-            self.repository.pause_by_policy(revision_id, step["step_id"], tenant_id, "dispatch policy disabled")
+        decision = self.policy(step)
+        if not _policy_allows(decision):
+            reason = _policy_reason(decision)
+            self.repository.pause_by_policy(
+                revision_id, step["step_id"], tenant_id, reason
+            )
             self.repository.finish_claim_lease(
                 claim, tenant_id, int(self.clock()), consumed=False
             )
-            return {"status": "paused_by_policy", "step_id": step["step_id"]}
+            return {
+                "status": "paused_by_policy", "step_id": step["step_id"],
+                "reason": reason,
+            }
         try:
             result = self.dispatcher(step, claim)
         except AmbiguousStepError as exc:

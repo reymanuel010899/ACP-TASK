@@ -3,19 +3,22 @@
 from urllib.parse import urlencode
 from urllib.parse import urlsplit
 import ipaddress
+import logging
 import socket
 from contextlib import nullcontext
 
 import requests
 
 from libs.connectors.base import (
-    CredentialConnector,
+    OAuthCredentialConnector,
     ProviderAuthority,
     ProviderError,
     ProviderHTTPError,
     ProviderNetworkError,
 )
 
+
+logger = logging.getLogger(__name__)
 
 AUTHORIZATION_URL = "https://slack.com/oauth/v2/authorize"
 TOKEN_URL = "https://slack.com/api/oauth.v2.access"
@@ -56,7 +59,9 @@ class SlackRateLimitError(ProviderError):
         self.retry_after = retry_after
 
 
-class SlackCredentialConnector(CredentialConnector):
+class SlackCredentialConnector(OAuthCredentialConnector):
+    provider = "slack"
+
     def __init__(self, client_id, client_secret, redirect_uri, http=None,
                  timeout=10.0):
         if not client_id or not client_secret or not redirect_uri:
@@ -85,12 +90,17 @@ class SlackCredentialConnector(CredentialConnector):
             query["user_scope"] = ",".join(sorted(set(user_scopes)))
         return "%s?%s" % (AUTHORIZATION_URL, urlencode(query))
 
-    def exchange_code_with_user(self, code):
+    def exchange_code_with_user(self, code, require_bot=True):
         """Exchange once and separate the two authorities Slack returns.
 
         The personal token comes back apart from the bot's, and never inside
         provider metadata: metadata is persisted with the connection row, so a
         user token placed there would sit unencrypted beside it.
+
+        ``require_bot`` is false when the round asked for personal scopes
+        only. Slack correctly answers those with an ``authed_user`` block and
+        no bot token; demanding one unconditionally rejected a valid response
+        and made personal consent impossible to complete.
         """
         payload = self._request("POST", TOKEN_URL, "code exchange", data={
             "client_id": self.client_id,
@@ -98,10 +108,16 @@ class SlackCredentialConnector(CredentialConnector):
             "redirect_uri": self.redirect_uri,
             "code": code,
         })
-        return (
-            self._bot_authority(payload, "code exchange"),
-            self._user_authority(payload),
-        )
+        user_authority = self._user_authority(payload)
+        if not require_bot:
+            if user_authority is None:
+                logger.warning(
+                    "Slack code exchange asked for personal scopes only but "
+                    "returned no usable authed_user block"
+                )
+                raise ProviderHTTPError("slack", 200, "code exchange")
+            return None, user_authority
+        return self._bot_authority(payload, "code exchange"), user_authority
 
     @staticmethod
     def _user_authority(payload):
@@ -163,15 +179,36 @@ class SlackCredentialConnector(CredentialConnector):
         refresh_token = payload.get("refresh_token")
         expires_in = payload.get("expires_in")
         token_type = payload.get("token_type")
-        if (
-            not isinstance(access_token, str)
-            or not access_token.startswith(("xoxb-", "xoxe.xoxb-"))
-            or not isinstance(refresh_token, str)
-            or not refresh_token
-            or not isinstance(expires_in, int)
-            or expires_in <= 0
-            or token_type not in ("bot", "Bearer")
-        ):
+        # Which requirement failed, by name. Six conditions reported as one
+        # "HTTP 200" told an operator nothing. Names only: a value here would
+        # put a bot token in the log.
+        unmet = []
+        if not isinstance(access_token, str):
+            unmet.append("access_token missing")
+        elif not access_token.startswith(("xoxb-", "xoxe.xoxb-")):
+            unmet.append("access_token is not a bot token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            unmet.append("refresh_token missing")
+        if not isinstance(expires_in, int) or expires_in <= 0:
+            unmet.append("expires_in missing")
+        if token_type not in ("bot", "Bearer"):
+            unmet.append("token_type is %r" % (token_type,))
+        if unmet:
+            # Two very different causes land here, so name both rather than
+            # guessing: a whole payload with nothing in it is a personal-scope
+            # round answered correctly, while a payload missing only the
+            # rotation fields is an app with token rotation switched off.
+            if access_token is None and refresh_token is None:
+                unmet.append(
+                    "no bot token at all — the round may have asked for "
+                    "personal scopes only"
+                )
+            elif isinstance(access_token, str) and refresh_token is None:
+                unmet.append("token rotation may be off for this app")
+            logger.warning(
+                "Slack %s returned a payload we cannot accept: %s",
+                operation, "; ".join(unmet),
+            )
             raise ProviderHTTPError("slack", 200, operation)
         team = payload.get("team") if isinstance(payload.get("team"), dict) else {}
         enterprise = (
@@ -254,6 +291,11 @@ class SlackActionExecutor:
             "slack.message.pin": self._pin_message,
             "slack.message.unpin": self._unpin_message,
             "slack.bookmark.add": self._add_bookmark,
+            "slack.channel.create": self._create_channel,
+            "slack.channel.rename": self._rename_channel,
+            "slack.channel.set_topic": self._set_channel_topic,
+            "slack.channel.archive": self._archive_channel,
+            "slack.channel.invite": self._invite_to_channel,
             "slack.file.upload": self._upload_file,
         }
         handler = routes.get(capability_id)
@@ -551,6 +593,97 @@ class SlackActionExecutor:
             "bookmark_id": bookmark_id,
             "title": title,
         }
+
+    def _create_channel(self, payload, context):
+        data = self._api("conversations.create", context, json={
+            "name": _required_str(payload, "name"),
+            "is_private": bool(payload.get("is_private", False)),
+        })
+        channel = data.get("channel") if isinstance(
+            data.get("channel"), dict
+        ) else {}
+        if not channel.get("id"):
+            raise SlackAPIError("conversations.create", "missing_channel_id")
+        return self._channel_receipt(
+            "slack.channel.create", channel["id"], context,
+            {"name": channel.get("name") or payload["name"]},
+        )
+
+    def _rename_channel(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        data = self._api("conversations.rename", context, json={
+            "channel": channel_id, "name": _required_str(payload, "name"),
+        })
+        channel = data.get("channel") if isinstance(
+            data.get("channel"), dict
+        ) else {}
+        return self._channel_receipt(
+            "slack.channel.rename", channel_id, context,
+            {"name": channel.get("name") or payload["name"]},
+        )
+
+    def _set_channel_topic(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        topic = payload.get("topic")
+        if not isinstance(topic, str):
+            raise SlackAPIError(
+                "conversations.setTopic", "invalid_topic", "validation"
+            )
+        self._api("conversations.setTopic", context, json={
+            "channel": channel_id, "topic": topic,
+        })
+        return self._channel_receipt(
+            "slack.channel.set_topic", channel_id, context, {"topic": topic},
+        )
+
+    def _archive_channel(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        try:
+            self._api("conversations.archive", context, json={
+                "channel": channel_id,
+            })
+        except SlackAPIError as exc:
+            # Already archived is the state the caller asked for.
+            if exc.code != "already_archived":
+                raise
+        return self._channel_receipt(
+            "slack.channel.archive", channel_id, context, {},
+        )
+
+    def _invite_to_channel(self, payload, context):
+        channel_id = _required_str(payload, "channel_id")
+        user_ids = payload.get("user_ids")
+        if not isinstance(user_ids, list) or not all(
+            isinstance(item, str) and item for item in user_ids
+        ) or not user_ids:
+            raise SlackAPIError(
+                "conversations.invite", "invalid_user_ids", "validation"
+            )
+        try:
+            self._api("conversations.invite", context, json={
+                "channel": channel_id, "users": ",".join(user_ids),
+            })
+        except SlackAPIError as exc:
+            # Everyone asked for is already in the channel, which is the
+            # requested state; anything else is a real refusal.
+            if exc.code != "already_in_channel":
+                raise
+        return self._channel_receipt(
+            "slack.channel.invite", channel_id, context,
+            {"invited": len(user_ids)},
+        )
+
+    @staticmethod
+    def _channel_receipt(capability_id, channel_id, context, extra):
+        receipt = {
+            "provider": "slack",
+            "capability_id": capability_id,
+            "provider_id": channel_id,
+            "team_id": context.get("team_id"),
+            "channel_id": channel_id,
+        }
+        receipt.update(extra)
+        return receipt
 
     def _upload_file(self, payload, context):
         channel_id = _required_str(payload, "channel_id")

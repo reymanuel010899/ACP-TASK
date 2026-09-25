@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timezone
 
 
 def _ratio(numerator, denominator):
@@ -135,6 +136,16 @@ class WorkflowRepository(object):
                 approved_at INTEGER NOT NULL,
                 expires_at INTEGER,
                 authorization_mode TEXT NOT NULL DEFAULT 'explicit_write',
+                FOREIGN KEY(workflow_run_id, workflow_revision_id, tenant_id)
+                    REFERENCES workflow_revisions(workflow_run_id, workflow_revision_id, tenant_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_campaign_bindings (
+                workflow_revision_id TEXT PRIMARY KEY
+                    REFERENCES workflow_revisions(workflow_revision_id),
+                workflow_run_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                campaign_id TEXT NOT NULL,
+                envelope_hash TEXT NOT NULL,
                 FOREIGN KEY(workflow_run_id, workflow_revision_id, tenant_id)
                     REFERENCES workflow_revisions(workflow_run_id, workflow_revision_id, tenant_id)
             );
@@ -439,6 +450,9 @@ class WorkflowRepository(object):
             from agents.orchestrator.workflow_content_crypto import WorkflowContentCrypto
             from libs.aws_kms import AWSKMSClient
             crypto = WorkflowContentCrypto(AWSKMSClient(), key_id, service_identity)
+        if os.environ.get("DATABASE_URL"):
+            from libs.db import Database
+            return PostgresWorkflowRepository(Database(), content_crypto=crypto)
         return cls(database_path, content_crypto=crypto)
 
     @staticmethod
@@ -488,7 +502,7 @@ class WorkflowRepository(object):
     def _decode_conversation_content(self, raw, tenant_id, conversation_id, field, default):
         if raw is None:
             return default
-        stored = json.loads(raw)
+        stored = json.loads(raw) if isinstance(raw, str) else raw
         if self.content_crypto is None:
             return stored
         return self.content_crypto.open(
@@ -752,6 +766,50 @@ class WorkflowRepository(object):
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def record_campaign_authorization(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash,
+        campaign_id, envelope_hash, authorized_by, now_ts,
+        envelope_expires_at,
+    ):
+        """Bind one short write revision to an already-authorized envelope."""
+        if int(envelope_expires_at) <= int(now_ts):
+            raise ValueError("campaign envelope is expired")
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._connection.execute(
+                    """INSERT INTO workflow_approvals(
+                        workflow_revision_id, workflow_run_id, tenant_id,
+                        plan_graph_hash, approved_by, approved_at, expires_at,
+                        authorization_mode
+                    ) SELECT workflow_revision_id, workflow_run_id, tenant_id,
+                             plan_graph_hash, ?, ?, ?, 'campaign_envelope'
+                      FROM workflow_revisions
+                      WHERE workflow_revision_id = ? AND workflow_run_id = ?
+                        AND tenant_id = ? AND plan_graph_hash = ? AND status = 'draft'""",
+                    (authorized_by, int(now_ts), int(envelope_expires_at),
+                     revision_id, workflow_run_id, tenant_id, graph_hash),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("campaign revision authorization binding changed")
+                self._connection.execute(
+                    """INSERT INTO workflow_campaign_bindings(
+                        workflow_revision_id,workflow_run_id,tenant_id,
+                        campaign_id,envelope_hash
+                    ) VALUES(?,?,?,?,?)""",
+                    (revision_id, workflow_run_id, tenant_id, campaign_id,
+                     envelope_hash),
+                )
+                self._connection.execute(
+                    "UPDATE workflow_revisions SET status='authorized' "
+                    "WHERE workflow_revision_id=?", (revision_id,),
+                )
+                self._connection.execute("COMMIT")
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+        return True
+
     def is_revision_approved(
         self, workflow_run_id, revision_id, tenant_id, graph_hash, now_ts=None
     ):
@@ -823,7 +881,7 @@ class WorkflowRepository(object):
         mode = row["authorization_mode"]
         return mode == "explicit_write" or (
             mode == "requested_read" and effect == "read"
-        )
+        ) or (mode == "campaign_envelope" and effect == "write")
 
     def finish_claim_lease(self, claim, tenant_id, now_ts, consumed):
         """Close the one-use scheduler lease for exactly this claimed attempt."""
@@ -3257,3 +3315,1515 @@ class WorkflowRepository(object):
     def close(self):
         with self._lock:
             self._connection.close()
+
+
+class PostgresWorkflowRepository(WorkflowRepository):
+    """PostgreSQL workflow runtime with multi-worker claim semantics."""
+
+    def __init__(self, db, content_crypto=None):
+        self.db = db
+        self.content_crypto = content_crypto
+
+    def close(self):
+        return None
+
+    def create_run(self, tenant_id, user_principal_id, goal_hash, now_ts):
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        run_id = "workflow:%s" % uuid.uuid4().hex
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                insert into orchestrator.workflow_runs(
+                    workflow_run_id, tenant_id, user_principal_id, goal_hash,
+                    status, created_at, updated_at
+                ) values (%s, %s, %s, %s, 'draft', %s, %s)
+                """,
+                (run_id, tenant_id, user_principal_id, goal_hash,
+                 _pg_utc(now_ts), _pg_utc(now_ts)),
+            )
+        return self.get_run(run_id, tenant_id)
+
+    def get_run(self, workflow_run_id, tenant_id):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(r) from orchestrator.workflow_runs r
+                where workflow_run_id = %s and tenant_id = %s
+                """,
+                (workflow_run_id, tenant_id),
+            ).fetchone()
+        return _pg_record(row[0]) if row else None
+
+    def get_run_for_principal(self, workflow_run_id, principal_id):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(r) from orchestrator.workflow_runs r
+                where workflow_run_id = %s and user_principal_id = %s
+                """,
+                (workflow_run_id, principal_id),
+            ).fetchone()
+        return _pg_record(row[0]) if row else None
+
+    def create_revision(
+        self, workflow_run_id, tenant_id, plan_graph_hash, steps, now_ts,
+        content_ttl_seconds=WorkflowRepository.DEFAULT_CONTENT_TTL_SECONDS,
+    ):
+        revision_id = "revision:%s" % uuid.uuid4().hex
+        snapshot_hash = hashlib.sha256(json.dumps(
+            [
+                (step["capability_id"], step["capability_version"],
+                 step["descriptor_snapshot_hash"])
+                for step in steps
+            ], sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        with self.db.transaction() as conn:
+            run = conn.execute(
+                """
+                select 1 from orchestrator.workflow_runs
+                where workflow_run_id = %s and tenant_id = %s
+                for update
+                """,
+                (workflow_run_id, tenant_id),
+            ).fetchone()
+            if run is None:
+                raise ValueError("workflow run not found")
+            number = conn.execute(
+                """
+                select coalesce(max(revision_number), 0) + 1
+                from orchestrator.workflow_revisions
+                where workflow_run_id = %s
+                """,
+                (workflow_run_id,),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                update orchestrator.workflow_revisions set status = 'superseded'
+                where workflow_run_id = %s
+                  and status in ('draft','awaiting_approval','approved','authorized')
+                """,
+                (workflow_run_id,),
+            )
+            conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'cancelled',
+                    terminal_reason = 'superseded by a new revision'
+                where workflow_run_id = %s
+                  and execution_status in ('queued','paused_by_policy')
+                """,
+                (workflow_run_id,),
+            )
+            conn.execute(
+                """
+                insert into orchestrator.workflow_revisions(
+                    workflow_revision_id, workflow_run_id, tenant_id,
+                    revision_number, plan_graph_hash,
+                    capability_snapshot_hash, status, created_at
+                ) values (%s, %s, %s, %s, %s, %s, 'draft', %s)
+                """,
+                (revision_id, workflow_run_id, tenant_id, number,
+                 plan_graph_hash, snapshot_hash, _pg_utc(now_ts)),
+            )
+            for ordinal, step in enumerate(steps):
+                conn.execute(
+                    """
+                    insert into orchestrator.workflow_steps(
+                        workflow_revision_id, step_id, workflow_run_id,
+                        tenant_id, capability_id, capability_version,
+                        connection_id, descriptor_snapshot_hash, input_hash,
+                        input_json, dependency_ids, effect, execution_status,
+                        verification_status, credential_version,
+                        content_expires_at
+                    ) values (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                        %s::jsonb, %s, 'queued', %s, %s, %s
+                    )
+                    """,
+                    (
+                        revision_id, step["step_id"], workflow_run_id,
+                        tenant_id, step["capability_id"],
+                        step["capability_version"], step.get("connection_id"),
+                        step["descriptor_snapshot_hash"], step["input_hash"],
+                        self._pg_encode(step.get("input", {}), tenant_id,
+                                        revision_id, step["step_id"], "input"),
+                        json.dumps(step.get("depends_on", [])), step["effect"],
+                        "pending" if step["effect"] == "write" else "not_required",
+                        int(step.get("credential_version") or 0),
+                        _pg_utc(int(now_ts) + int(content_ttl_seconds)),
+                    ),
+                )
+            conn.execute(
+                """
+                update orchestrator.workflow_runs
+                set current_revision_id = %s, updated_at = %s
+                where workflow_run_id = %s and tenant_id = %s
+                """,
+                (revision_id, _pg_utc(now_ts), workflow_run_id, tenant_id),
+            )
+        return self.get_revision(workflow_run_id, revision_id, tenant_id)
+
+    def get_revision(self, workflow_run_id, revision_id, tenant_id):
+        with self.db.connection() as conn:
+            revision = conn.execute(
+                """
+                select to_jsonb(r) from orchestrator.workflow_revisions r
+                where workflow_run_id = %s and workflow_revision_id = %s
+                  and tenant_id = %s
+                """,
+                (workflow_run_id, revision_id, tenant_id),
+            ).fetchone()
+            if revision is None:
+                return None
+            rows = conn.execute(
+                """
+                select to_jsonb(s) from orchestrator.workflow_steps s
+                where workflow_revision_id = %s and tenant_id = %s
+                order by step_id
+                """,
+                (revision_id, tenant_id),
+            ).fetchall()
+        result = _pg_record(revision[0])
+        result["steps"] = [self._pg_step(row[0]) for row in rows]
+        return result
+
+    def get_revision_by_id(self, revision_id, tenant_id):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select workflow_run_id from orchestrator.workflow_revisions
+                where workflow_revision_id = %s and tenant_id = %s
+                """,
+                (revision_id, tenant_id),
+            ).fetchone()
+        return self.get_revision(row[0], revision_id, tenant_id) if row else None
+
+    def record_approval(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash,
+        approved_by, now_ts, ttl_seconds=900,
+    ):
+        return self._authorize(
+            workflow_run_id, revision_id, tenant_id, graph_hash, approved_by,
+            now_ts, int(now_ts) + int(ttl_seconds), "explicit_write",
+            "approved",
+        )
+
+    def authorize_requested_read(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash,
+        requested_by, now_ts, ttl_seconds=900,
+    ):
+        with self.db.connection() as conn:
+            effects = conn.execute(
+                """
+                select distinct effect from orchestrator.workflow_steps
+                where workflow_run_id = %s and workflow_revision_id = %s
+                  and tenant_id = %s
+                """,
+                (workflow_run_id, revision_id, tenant_id),
+            ).fetchall()
+        if not effects or any(row[0] != "read" for row in effects):
+            raise ValueError(
+                "requested_read authorization requires a read-only revision"
+            )
+        return self._authorize(
+            workflow_run_id, revision_id, tenant_id, graph_hash, requested_by,
+            now_ts, int(now_ts) + int(ttl_seconds), "requested_read",
+            "authorized",
+        )
+
+    def _authorize(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, principal_id,
+        now_ts, expires_at, mode, revision_status,
+    ):
+        effects_hash = hashlib.sha256((graph_hash + ":" + mode).encode()).hexdigest()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                insert into orchestrator.workflow_approvals(
+                    workflow_revision_id, workflow_run_id, tenant_id,
+                    plan_graph_hash, approved_effects_hash, approved_by,
+                    approved_at, expires_at, authorization_mode
+                ) select workflow_revision_id, workflow_run_id, tenant_id,
+                         plan_graph_hash, %s, %s, %s, %s, %s
+                  from orchestrator.workflow_revisions
+                 where workflow_revision_id = %s and workflow_run_id = %s
+                   and tenant_id = %s and plan_graph_hash = %s
+                   and status = 'draft'
+                returning workflow_revision_id
+                """,
+                (effects_hash, principal_id, _pg_utc(now_ts),
+                 _pg_utc(expires_at), mode, revision_id, workflow_run_id,
+                 tenant_id, graph_hash),
+            ).fetchone()
+            if row is None:
+                raise ValueError("revision approval binding changed")
+            conn.execute(
+                """
+                update orchestrator.workflow_revisions set status = %s
+                where workflow_revision_id = %s and tenant_id = %s
+                """,
+                (revision_status, revision_id, tenant_id),
+            )
+        return True
+
+    def is_revision_approved(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, now_ts=None
+    ):
+        return self.revision_authorization_mode(
+            workflow_run_id, revision_id, tenant_id, graph_hash, now_ts
+        ) == "explicit_write"
+
+    def revision_authorization_mode(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, now_ts=None
+    ):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select authorization_mode, expires_at
+                from orchestrator.workflow_approvals
+                where workflow_run_id = %s and workflow_revision_id = %s
+                  and tenant_id = %s and plan_graph_hash = %s
+                """,
+                (workflow_run_id, revision_id, tenant_id, graph_hash),
+            ).fetchone()
+        if row is None or (
+            now_ts is not None and row[1] < _pg_utc(now_ts)
+        ):
+            return None
+        return row[0]
+
+    def is_step_authorized(
+        self, workflow_run_id, revision_id, tenant_id, graph_hash, effect,
+        now_ts=None,
+    ):
+        mode = self.revision_authorization_mode(
+            workflow_run_id, revision_id, tenant_id, graph_hash, now_ts
+        )
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select r.status, w.current_revision_id
+                from orchestrator.workflow_revisions r
+                join orchestrator.workflow_runs w
+                  on w.workflow_run_id = r.workflow_run_id
+                 and w.tenant_id = r.tenant_id
+                where r.workflow_revision_id = %s and r.tenant_id = %s
+                """,
+                (revision_id, tenant_id),
+            ).fetchone()
+        if row is None or row[1] != revision_id or row[0] not in (
+            "approved", "authorized", "executing", "in_progress", "completed"
+        ):
+            return False
+        return mode == "explicit_write" or (
+            mode == "requested_read" and effect == "read"
+        ) or (mode == "campaign_envelope" and effect == "write")
+
+    def claim_ready_step(
+        self, workflow_run_id, revision_id, tenant_id, worker_id, now_ts,
+        lease_ttl_seconds, max_attempts=5,
+    ):
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'failed',
+                    terminal_reason = 'maximum attempts exceeded'
+                where workflow_run_id = %s and workflow_revision_id = %s
+                  and tenant_id = %s and execution_status = 'queued'
+                  and (attempt - uncounted_attempts) >= %s
+                """,
+                (workflow_run_id, revision_id, tenant_id, int(max_attempts)),
+            )
+            selected = conn.execute(
+                """
+                select s.step_id, s.attempt, s.connection_id,
+                       s.descriptor_snapshot_hash
+                from orchestrator.workflow_steps s
+                where s.workflow_run_id = %s and s.workflow_revision_id = %s
+                  and s.tenant_id = %s and s.execution_status = 'queued'
+                  and (s.retry_at is null or s.retry_at <= %s)
+                  and not exists (
+                      select 1
+                      from jsonb_array_elements_text(s.dependency_ids) dep
+                      left join orchestrator.workflow_steps parent
+                        on parent.workflow_revision_id = s.workflow_revision_id
+                       and parent.step_id = dep.value
+                       and parent.tenant_id = s.tenant_id
+                      where parent.execution_status is distinct from 'completed'
+                  )
+                order by s.step_id
+                for update skip locked
+                limit 1
+                """,
+                (workflow_run_id, revision_id, tenant_id, _pg_utc(now_ts)),
+            ).fetchone()
+            if selected is None:
+                return None
+            attempt = selected[1] + 1
+            updated = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'running', attempt = %s,
+                    claimed_by = %s, claimed_at = %s, retry_at = null
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and execution_status = 'queued'
+                returning step_id
+                """,
+                (attempt, worker_id, _pg_utc(now_ts), revision_id,
+                 selected[0], tenant_id),
+            ).fetchone()
+            if updated is None:
+                return None
+            lease = secrets.token_urlsafe(32)
+            conn.execute(
+                """
+                insert into orchestrator.workflow_leases(
+                    lease_hash, workflow_revision_id, step_id, attempt,
+                    tenant_id, worker_id, connection_id,
+                    descriptor_snapshot_hash, expires_at
+                ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (hashlib.sha256(lease.encode()).hexdigest(), revision_id,
+                 selected[0], attempt, tenant_id, worker_id, selected[2],
+                 selected[3], _pg_utc(int(now_ts) + int(lease_ttl_seconds))),
+            )
+        return {"lease": lease, "step_id": selected[0], "attempt": attempt,
+                "workflow_revision_id": revision_id}
+
+    def finish_claim_lease(self, claim, tenant_id, now_ts, consumed):
+        if not claim or not claim.get("lease"):
+            return False
+        field = "consumed_at" if consumed else "revoked_at"
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_leases set %s = %%s
+                where lease_hash = %%s and workflow_revision_id = %%s
+                  and step_id = %%s and attempt = %%s and tenant_id = %%s
+                  and consumed_at is null and revoked_at is null
+                """ % field,
+                (_pg_utc(now_ts), hashlib.sha256(claim["lease"].encode()).hexdigest(),
+                 claim["workflow_revision_id"], claim["step_id"],
+                 int(claim["attempt"]), tenant_id),
+            )
+        return cursor.rowcount == 1
+
+    def persist_completion(
+        self, revision_id, step_id, tenant_id, attempt, receipt, attestation,
+        now_ts, output=None,
+    ):
+        receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        receipt_hash = hashlib.sha256(receipt_json.encode()).hexdigest()
+        receipt_id = "receipt:%s" % hashlib.sha256(
+            ("%s\0%s\0%s\0%s" % (
+                revision_id, step_id, int(attempt), receipt_json
+            )).encode()
+        ).hexdigest()
+        attestation_id = (attestation or {}).get("attestation_id")
+        with self.db.transaction() as conn:
+            step = conn.execute(
+                """
+                select effect, connection_id, descriptor_snapshot_hash,
+                       input_hash, workflow_run_id
+                from orchestrator.workflow_steps
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s for update
+                """,
+                (revision_id, step_id, tenant_id),
+            ).fetchone()
+            if step is None:
+                raise ValueError("workflow step not found")
+            if step[0] == "write" and not attestation_id:
+                raise ValueError("attestation_id is required for writes")
+            verification = "pending" if step[0] == "write" else "not_required"
+            updated = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'completed', verification_status = %s,
+                    terminal_reason = null, output_json = %s::jsonb
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and execution_status in ('running','execution_unknown')
+                returning step_id
+                """,
+                (verification, self._pg_encode(output or {}, tenant_id,
+                 revision_id, step_id, "output"), revision_id, step_id,
+                 tenant_id, int(attempt)),
+            ).fetchone()
+            if updated is None:
+                raise ValueError("workflow step completion binding changed")
+            conn.execute(
+                """
+                insert into orchestrator.workflow_receipts(
+                    receipt_id, workflow_revision_id, step_id, attempt,
+                    tenant_id, connection_id, descriptor_snapshot_hash,
+                    approved_input_hash, provider_identifiers, receipt_hash,
+                    receipt_json, created_at
+                ) values (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                    %s::jsonb, %s
+                )
+                """,
+                (receipt_id, revision_id, step_id, int(attempt), tenant_id,
+                 step[1], step[2], step[3], receipt_json, receipt_hash,
+                 receipt_json, _pg_utc(now_ts)),
+            )
+            if attestation_id:
+                attestation_json = json.dumps(
+                    attestation, sort_keys=True, separators=(",", ":")
+                )
+                conn.execute(
+                    """
+                    insert into orchestrator.workflow_attestations(
+                        attestation_id, receipt_id, workflow_revision_id,
+                        step_id, tenant_id, attestation_hash,
+                        verification_status, attestation_json, created_at
+                    ) values (%s, %s, %s, %s, %s, %s, 'pending', %s::jsonb, %s)
+                    """,
+                    (attestation_id, receipt_id, revision_id, step_id,
+                     tenant_id, hashlib.sha256(attestation_json.encode()).hexdigest(),
+                     attestation_json, _pg_utc(now_ts)),
+                )
+            conn.execute(
+                """
+                update orchestrator.workflow_leases set consumed_at = %s
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and consumed_at is null and revoked_at is null
+                """,
+                (_pg_utc(now_ts), revision_id, step_id, tenant_id, int(attempt)),
+            )
+            remaining = conn.execute(
+                """
+                select 1 from orchestrator.workflow_steps
+                where workflow_revision_id = %s and tenant_id = %s
+                  and execution_status not in ('completed','cancelled','failed')
+                limit 1
+                """,
+                (revision_id, tenant_id),
+            ).fetchone()
+            if remaining is None:
+                conn.execute(
+                    """
+                    update orchestrator.workflow_revisions set status = 'completed'
+                    where workflow_revision_id = %s and tenant_id = %s
+                    """,
+                    (revision_id, tenant_id),
+                )
+                conn.execute(
+                    """
+                    update orchestrator.workflow_runs set status = 'completed',
+                        updated_at = %s where workflow_run_id = %s
+                        and tenant_id = %s
+                    """,
+                    (_pg_utc(now_ts), step[4], tenant_id),
+                )
+        return True
+
+    def get_step_receipt(self, revision_id, step_id, tenant_id):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select receipt_json from orchestrator.workflow_receipts
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s order by attempt desc limit 1
+                """,
+                (revision_id, step_id, tenant_id),
+            ).fetchone()
+        return row[0] if row else None
+
+    def recover_expired_claims(self, now_ts):
+        recovered = {"queued": 0, "unknown": 0}
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """
+                select l.lease_hash, l.workflow_revision_id, l.step_id,
+                       l.tenant_id, s.effect
+                from orchestrator.workflow_leases l
+                join orchestrator.workflow_steps s
+                  on s.workflow_revision_id = l.workflow_revision_id
+                 and s.step_id = l.step_id and s.tenant_id = l.tenant_id
+                where l.expires_at < %s and l.consumed_at is null
+                  and l.revoked_at is null and s.execution_status = 'running'
+                for update of l, s skip locked
+                """,
+                (_pg_utc(now_ts),),
+            ).fetchall()
+            for lease_hash, revision_id, step_id, tenant_id, effect in rows:
+                status = "execution_unknown" if effect == "write" else "queued"
+                conn.execute(
+                    """
+                    update orchestrator.workflow_steps
+                    set execution_status = %s, claimed_by = null,
+                        claimed_at = null, terminal_reason = 'worker lease expired'
+                    where workflow_revision_id = %s and step_id = %s
+                      and tenant_id = %s and execution_status = 'running'
+                    """,
+                    (status, revision_id, step_id, tenant_id),
+                )
+                conn.execute(
+                    "update orchestrator.workflow_leases set revoked_at = %s "
+                    "where lease_hash = %s",
+                    (_pg_utc(now_ts), lease_hash),
+                )
+                recovered["unknown" if effect == "write" else "queued"] += 1
+        return recovered
+
+    def release_for_retry(self, revision_id, step_id, tenant_id, reason, retry_at):
+        return self._step_transition(
+            revision_id, step_id, tenant_id, "queued", reason,
+            retry_at=retry_at,
+        )
+
+    def release_without_consuming_attempt(
+        self, revision_id, step_id, tenant_id, reason, retry_at, attempt
+    ):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'queued', terminal_reason = %s,
+                    claimed_by = null, claimed_at = null, retry_at = %s,
+                    uncounted_attempts = uncounted_attempts + 1
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and execution_status = 'running'
+                """,
+                (reason, _pg_utc(retry_at), revision_id, step_id, tenant_id,
+                 int(attempt)),
+            )
+        return cursor.rowcount == 1
+
+    def mark_execution_unknown(self, revision_id, step_id, tenant_id, reason):
+        return self._step_transition(
+            revision_id, step_id, tenant_id, "execution_unknown", reason
+        )
+
+    def pause_by_policy(self, revision_id, step_id, tenant_id, reason):
+        return self._step_transition(
+            revision_id, step_id, tenant_id, "paused_by_policy", reason
+        )
+
+    def _step_transition(
+        self, revision_id, step_id, tenant_id, status, reason,
+        retry_at=None,
+    ):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = %s, terminal_reason = %s,
+                    claimed_by = null, claimed_at = null, retry_at = %s
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s
+                """,
+                (status, reason, _pg_utc(retry_at) if retry_at else None,
+                 revision_id, step_id, tenant_id),
+            )
+        return cursor.rowcount == 1
+
+    def resume_policy_paused(self):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = 'queued', terminal_reason = null
+                where execution_status = 'paused_by_policy'
+                  and (terminal_reason in (
+                      'dispatch policy disabled',
+                      'capability rollout is disabled'
+                  ) or terminal_reason like 'control_plane:%')
+                """
+            )
+        return cursor.rowcount
+
+    def list_unresolved_write_steps(self, now_ts, limit=50):
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                """
+                select s.workflow_run_id, s.workflow_revision_id, s.step_id,
+                       s.tenant_id, s.attempt, s.capability_id,
+                       s.connection_id, s.input_hash, s.terminal_reason,
+                       s.reconcile_attempts, r.plan_graph_hash
+                from orchestrator.workflow_steps s
+                join orchestrator.workflow_revisions r
+                  on r.workflow_revision_id = s.workflow_revision_id
+                 and r.tenant_id = s.tenant_id
+                where s.execution_status = 'execution_unknown'
+                  and s.effect = 'write'
+                  and (s.reconcile_after is null or s.reconcile_after <= %s)
+                order by s.claimed_at nulls first, s.step_id limit %s
+                """,
+                (_pg_utc(now_ts), int(limit)),
+            ).fetchall()
+        keys = (
+            "workflow_run_id", "workflow_revision_id", "step_id",
+            "tenant_id", "attempt", "capability_id", "connection_id",
+            "input_hash", "terminal_reason", "reconcile_attempts",
+            "plan_graph_hash",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def claim_unresolved_write_step(
+        self, revision_id, step_id, tenant_id, attempt, worker_id, now_ts,
+        visibility_seconds=60,
+    ):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set claimed_by = %s, reconcile_after = %s,
+                    reconcile_attempts = reconcile_attempts + 1
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and execution_status = 'execution_unknown'
+                  and (reconcile_after is null or reconcile_after <= %s)
+                """,
+                (worker_id, _pg_utc(int(now_ts) + int(visibility_seconds)),
+                 revision_id, step_id, tenant_id, int(attempt),
+                 _pg_utc(now_ts)),
+            )
+        return cursor.rowcount == 1
+
+    def defer_reconciliation(
+        self, revision_id, step_id, tenant_id, attempt, reason, retry_at
+    ):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set terminal_reason = %s, claimed_by = null,
+                    reconcile_after = %s
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and execution_status = 'execution_unknown'
+                """,
+                (reason, _pg_utc(retry_at), revision_id, step_id, tenant_id,
+                 int(attempt)),
+            )
+        return cursor.rowcount == 1
+
+    def apply_reconciliation(
+        self, revision_id, step_id, tenant_id, attempt, result
+    ):
+        status = result.get("execution_status")
+        if status not in {"completed", "queued", "execution_unknown"}:
+            raise ValueError("invalid reconciliation transition")
+        if status == "completed":
+            receipt = result.get("receipt")
+            attestation = result.get("attestation")
+            if not isinstance(receipt, dict) or not isinstance(attestation, dict):
+                raise ValueError(
+                    "reconciled completion requires a receipt and signed attestation"
+                )
+            return bool(self.persist_completion(
+                revision_id, step_id, tenant_id, attempt, receipt,
+                attestation, result.get("reconciled_at", 0),
+                output=result.get("output", receipt),
+            ))
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set execution_status = %s, verification_status = %s,
+                    claimed_by = null, claimed_at = null
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and attempt = %s
+                  and execution_status = 'execution_unknown'
+                """,
+                (status, result.get("verification_status", "pending"),
+                 revision_id, step_id, tenant_id, int(attempt)),
+            )
+        return cursor.rowcount == 1
+
+    def set_verification_status(
+        self, revision_id, step_id, tenant_id, status
+    ):
+        if status not in ("pending", "verified", "inconclusive", "failed"):
+            raise ValueError("invalid verification status")
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps set verification_status = %s
+                where workflow_revision_id = %s and step_id = %s
+                  and tenant_id = %s and execution_status = 'completed'
+                """,
+                (status, revision_id, step_id, tenant_id),
+            )
+        return cursor.rowcount == 1
+
+    def purge_expired_content(self, now_ts):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_steps
+                set input_json = '{}'::jsonb, output_json = null
+                where content_expires_at is not null and content_expires_at < %s
+                  and execution_status in ('completed','cancelled','failed')
+                """,
+                (_pg_utc(now_ts),),
+            )
+        return cursor.rowcount
+
+    def create_conversation(
+        self, tenant_id, principal_id, now_ts, ttl_seconds=180,
+        conversation_id=None, locale=None,
+    ):
+        if not tenant_id or not principal_id:
+            raise ValueError("tenant_id and principal_id are required")
+        conversation_id = conversation_id or "conversation:%s" % uuid.uuid4().hex
+        state = {"locale": locale} if locale else {}
+        expires_at = int(now_ts) + int(ttl_seconds)
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                insert into orchestrator.concierge_conversations(
+                    conversation_id, tenant_id, principal_id, status, state_json,
+                    created_at, updated_at, expires_at, content_expires_at
+                ) values (%s, %s, %s, 'interpreting', %s::jsonb,
+                          %s, %s, %s, %s)
+                """,
+                (conversation_id, tenant_id, principal_id,
+                 self._encode_conversation_content(
+                     state, tenant_id, conversation_id, "state"
+                 ), _pg_utc(now_ts), _pg_utc(now_ts), _pg_utc(expires_at),
+                 _pg_utc(expires_at)),
+            )
+        return self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+
+    def get_conversation(
+        self, conversation_id, tenant_id, principal_id, now_ts,
+        include_terminal=False,
+    ):
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(c) from orchestrator.concierge_conversations c
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s
+                for update
+                """,
+                (conversation_id, tenant_id, principal_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conversation = self._pg_conversation(row[0])
+            if (
+                conversation["status"] not in ("closed", "expired")
+                and int(now_ts) > conversation["expires_at"]
+            ):
+                conn.execute(
+                    """
+                    update orchestrator.concierge_conversations
+                    set status = 'expired', state_json = %s::jsonb,
+                        presentation_json = null, closed_at = %s, updated_at = %s
+                    where conversation_id = %s and tenant_id = %s
+                      and principal_id = %s
+                    """,
+                    (self._encode_conversation_content(
+                        {}, tenant_id, conversation_id, "state"
+                    ), _pg_utc(now_ts), _pg_utc(now_ts), conversation_id,
+                     tenant_id, principal_id),
+                )
+                row = conn.execute(
+                    """
+                    select to_jsonb(c)
+                    from orchestrator.concierge_conversations c
+                    where conversation_id = %s and tenant_id = %s
+                      and principal_id = %s
+                    """,
+                    (conversation_id, tenant_id, principal_id),
+                ).fetchone()
+                conversation = self._pg_conversation(row[0])
+        if conversation["status"] in ("closed", "expired") and not include_terminal:
+            return None
+        return conversation
+
+    def _pg_conversation(self, row):
+        record = _pg_record(row)
+        result = {
+            key: record.get(key) for key in (
+                "conversation_id", "tenant_id", "principal_id", "status",
+                "state_version", "workflow_run_id", "workflow_revision_id",
+                "created_at", "updated_at", "expires_at", "closed_at",
+                "presentation_hash",
+            )
+        }
+        result["state_version"] = int(result["state_version"])
+        for key in ("created_at", "updated_at", "expires_at", "closed_at"):
+            result[key] = _pg_epoch(result[key])
+        result.update(self._decode_conversation_content(
+            record.get("state_json"), record["tenant_id"],
+            record["conversation_id"], "state", {},
+        ))
+        result["presentation"] = self._decode_conversation_content(
+            record.get("presentation_json"), record["tenant_id"],
+            record["conversation_id"], "presentation", None,
+        )
+        return result
+
+    def update_conversation(
+        self, conversation_id, tenant_id, principal_id, changes, now_ts,
+        ttl_seconds=180, expected_version=None,
+    ):
+        allowed = set(self.CONVERSATION_STATE_FIELDS) | {
+            "status", "workflow_run_id", "workflow_revision_id",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError("unsupported conversation fields: %s" % sorted(unknown))
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(c) from orchestrator.concierge_conversations c
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and status not in ('closed','expired')
+                  and expires_at >= %s
+                for update
+                """,
+                (conversation_id, tenant_id, principal_id, _pg_utc(now_ts)),
+            ).fetchone()
+            if row is None:
+                raise KeyError("conversation unavailable")
+            current = self._pg_conversation(row[0])
+            version = int(current["state_version"])
+            if expected_version is not None and version != int(expected_version):
+                raise RuntimeError("conversation version conflict")
+            state = {
+                key: current[key] for key in self.CONVERSATION_STATE_FIELDS
+                if current.get(key) is not None
+            }
+            for key, value in changes.items():
+                if key not in ("status", "workflow_run_id", "workflow_revision_id"):
+                    if value is None:
+                        state.pop(key, None)
+                    else:
+                        state[key] = value
+            status = changes.get("status", current["status"])
+            if status not in self.CONVERSATION_STATUSES:
+                raise ValueError("invalid conversation status")
+            cursor = conn.execute(
+                """
+                update orchestrator.concierge_conversations
+                set status = %s, state_json = %s::jsonb,
+                    workflow_run_id = %s, workflow_revision_id = %s,
+                    updated_at = %s, expires_at = %s, content_expires_at = %s,
+                    state_version = state_version + 1
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and state_version = %s
+                """,
+                (status, self._encode_conversation_content(
+                    state, tenant_id, conversation_id, "state"
+                ), changes.get("workflow_run_id", current["workflow_run_id"]),
+                 changes.get(
+                     "workflow_revision_id", current["workflow_revision_id"]
+                 ), _pg_utc(now_ts),
+                 _pg_utc(int(now_ts) + int(ttl_seconds)),
+                 _pg_utc(int(now_ts) + int(ttl_seconds)), conversation_id,
+                 tenant_id, principal_id, version),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("conversation version conflict")
+        return self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+
+    def begin_conversation_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, request, now_ts, content_ttl_seconds=180,
+    ):
+        if not client_turn_id or not isinstance(request, dict):
+            raise ValueError("client_turn_id and request object are required")
+        request_raw = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        request_hash = hashlib.sha256(request_raw.encode("utf-8")).hexdigest()
+        with self.db.transaction() as conn:
+            current_row = conn.execute(
+                """
+                select to_jsonb(c) from orchestrator.concierge_conversations c
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and status not in ('closed','expired')
+                  and expires_at >= %s for update
+                """,
+                (conversation_id, tenant_id, principal_id, _pg_utc(now_ts)),
+            ).fetchone()
+            if current_row is None:
+                raise KeyError("conversation unavailable")
+            current = self._pg_conversation(current_row[0])
+            prior = conn.execute(
+                """
+                select to_jsonb(t) from orchestrator.concierge_turns t
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and client_turn_id = %s
+                """,
+                (conversation_id, tenant_id, principal_id, client_turn_id),
+            ).fetchone()
+            if prior is not None:
+                turn = _pg_record(prior[0])
+                if turn["request_hash"] != request_hash:
+                    raise ValueError("client turn id was used for a different request")
+                return self._pg_conversation_turn_result(turn, current, True)
+            if int(current["state_version"]) != int(expected_version):
+                raise RuntimeError("conversation version conflict")
+            turn_version = conn.execute(
+                """
+                select coalesce(max(turn_version), 0) + 1
+                from orchestrator.concierge_turns
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s
+                """,
+                (conversation_id, tenant_id, principal_id),
+            ).fetchone()[0]
+            row = conn.execute(
+                """
+                insert into orchestrator.concierge_turns(
+                    conversation_id, tenant_id, principal_id, client_turn_id,
+                    turn_version, base_state_version, request_hash, request_json,
+                    status, content_expires_at, created_at
+                ) values (%s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                          'started', %s, %s)
+                returning to_jsonb(concierge_turns)
+                """,
+                (conversation_id, tenant_id, principal_id, client_turn_id,
+                 int(turn_version), int(expected_version), request_hash,
+                 self._encode_conversation_content(
+                     request, tenant_id, conversation_id,
+                     "turn:%s:request" % client_turn_id,
+                 ), _pg_utc(int(now_ts) + int(content_ttl_seconds)),
+                 _pg_utc(now_ts)),
+            ).fetchone()
+        return self._pg_conversation_turn_result(
+            _pg_record(row[0]), current, False
+        )
+
+    def commit_conversation_turn(
+        self, conversation_id, tenant_id, principal_id, client_turn_id,
+        expected_version, changes, response, now_ts, ttl_seconds=180,
+    ):
+        if not isinstance(changes, dict) or not isinstance(response, dict):
+            raise ValueError("turn changes and response must be objects")
+        allowed = set(self.CONVERSATION_STATE_FIELDS) | {
+            "status", "workflow_run_id", "workflow_revision_id",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError("unsupported conversation fields: %s" % sorted(unknown))
+        with self.db.transaction() as conn:
+            turn_row = conn.execute(
+                """
+                select to_jsonb(t) from orchestrator.concierge_turns t
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and client_turn_id = %s for update
+                """,
+                (conversation_id, tenant_id, principal_id, client_turn_id),
+            ).fetchone()
+            current_row = conn.execute(
+                """
+                select to_jsonb(c) from orchestrator.concierge_conversations c
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s for update
+                """,
+                (conversation_id, tenant_id, principal_id),
+            ).fetchone()
+            if turn_row is None:
+                raise KeyError("conversation turn unavailable")
+            if current_row is None:
+                raise KeyError("conversation unavailable")
+            turn = _pg_record(turn_row[0])
+            current = self._pg_conversation(current_row[0])
+            if turn["status"] == "committed":
+                return self._pg_conversation_turn_result(turn, current, True)
+            if (
+                turn["status"] != "started"
+                or int(turn["base_state_version"]) != int(expected_version)
+                or int(current["state_version"]) != int(expected_version)
+            ):
+                if turn["status"] == "started":
+                    conn.execute(
+                        """
+                        update orchestrator.concierge_turns set status = 'conflicted'
+                        where conversation_id = %s and tenant_id = %s
+                          and principal_id = %s and client_turn_id = %s
+                        """,
+                        (conversation_id, tenant_id, principal_id, client_turn_id),
+                    )
+                raise RuntimeError("conversation version conflict")
+            state = {
+                key: current[key] for key in self.CONVERSATION_STATE_FIELDS
+                if current.get(key) is not None
+            }
+            for key, value in changes.items():
+                if key not in ("status", "workflow_run_id", "workflow_revision_id"):
+                    if value is None:
+                        state.pop(key, None)
+                    else:
+                        state[key] = value
+            if state.get("blocking_need") is not None and not isinstance(
+                state["blocking_need"], dict
+            ):
+                raise ValueError("blocking_need must be one object")
+            status = changes.get("status", current["status"])
+            if status not in self.CONVERSATION_STATUSES:
+                raise ValueError("invalid conversation status")
+            updated = conn.execute(
+                """
+                update orchestrator.concierge_conversations
+                set status = %s, state_json = %s::jsonb,
+                    workflow_run_id = %s, workflow_revision_id = %s,
+                    updated_at = %s, expires_at = %s, content_expires_at = %s,
+                    state_version = state_version + 1
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and state_version = %s
+                """,
+                (status, self._encode_conversation_content(
+                    state, tenant_id, conversation_id, "state"
+                ), changes.get("workflow_run_id", current["workflow_run_id"]),
+                 changes.get(
+                     "workflow_revision_id", current["workflow_revision_id"]
+                 ), _pg_utc(now_ts),
+                 _pg_utc(int(now_ts) + int(ttl_seconds)),
+                 _pg_utc(int(now_ts) + int(ttl_seconds)), conversation_id,
+                 tenant_id, principal_id, int(expected_version)),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("conversation version conflict")
+            response_raw = json.dumps(
+                response, sort_keys=True, separators=(",", ":")
+            )
+            response_hash = hashlib.sha256(
+                response_raw.encode("utf-8")
+            ).hexdigest()
+            row = conn.execute(
+                """
+                update orchestrator.concierge_turns
+                set status = 'committed', response_hash = %s,
+                    response_json = %s::jsonb, committed_at = %s
+                where conversation_id = %s and tenant_id = %s
+                  and principal_id = %s and client_turn_id = %s
+                  and status = 'started'
+                returning to_jsonb(concierge_turns)
+                """,
+                (response_hash, self._encode_conversation_content(
+                    response, tenant_id, conversation_id,
+                    "turn:%s:response" % client_turn_id,
+                ), _pg_utc(now_ts), conversation_id, tenant_id, principal_id,
+                 client_turn_id),
+            ).fetchone()
+        updated_conversation = self.get_conversation(
+            conversation_id, tenant_id, principal_id, now_ts
+        )
+        return self._pg_conversation_turn_result(
+            _pg_record(row[0]), updated_conversation, False
+        )
+
+    def _pg_conversation_turn_result(self, row, conversation, duplicate):
+        response = self._decode_conversation_content(
+            row.get("response_json"), row["tenant_id"], row["conversation_id"],
+            "turn:%s:response" % row["client_turn_id"], None,
+        )
+        return {
+            "turn": {
+                "client_turn_id": row["client_turn_id"],
+                "turn_version": int(row["turn_version"]),
+                "base_state_version": int(row["base_state_version"]),
+                "status": row["status"], "request_hash": row["request_hash"],
+                "response_hash": row.get("response_hash"),
+            },
+            "conversation": conversation, "response": response,
+            "duplicate": bool(duplicate),
+        }
+
+    def append_outbox_event(
+        self, tenant_id, aggregate_type, aggregate_id, event_type, payload,
+        dedupe_key, now_ts, max_attempts=5, available_at=None,
+    ):
+        """Append one ordered event, idempotently, across many producers."""
+        if not all((tenant_id, aggregate_type, aggregate_id, event_type, dedupe_key)):
+            raise ValueError(
+                "outbox tenant, aggregate, event type and dedupe key are required"
+            )
+        payload_raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        with self.db.transaction() as conn:
+            prior = conn.execute(
+                """
+                select to_jsonb(o) from orchestrator.workflow_outbox o
+                where tenant_id = %s and dedupe_key = %s
+                """,
+                (tenant_id, dedupe_key),
+            ).fetchone()
+            if prior is not None:
+                event = self._pg_outbox_event(prior[0])
+                if (
+                    event["aggregate_type"] != aggregate_type
+                    or event["aggregate_id"] != aggregate_id
+                    or event["event_type"] != event_type
+                    or event["payload"] != payload
+                ):
+                    raise ValueError(
+                        "outbox dedupe key was reused for another event"
+                    )
+                return event
+            # PostgreSQL has no portable MAX()+1 primitive. A transaction-scoped
+            # advisory lock gives each tenant aggregate one cheap serial lane.
+            conn.execute(
+                "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("%s\x1f%s\x1f%s" % (
+                    tenant_id, aggregate_type, aggregate_id
+                ),),
+            )
+            version = conn.execute(
+                """
+                select coalesce(max(aggregate_version), 0) + 1
+                from orchestrator.workflow_outbox
+                where tenant_id = %s and aggregate_type = %s
+                  and aggregate_id = %s
+                """,
+                (tenant_id, aggregate_type, aggregate_id),
+            ).fetchone()[0]
+            event_id = "outbox:%s" % uuid.uuid4().hex
+            row = conn.execute(
+                """
+                insert into orchestrator.workflow_outbox(
+                    event_id, tenant_id, aggregate_type, aggregate_id,
+                    aggregate_version, event_type, payload_json, dedupe_key,
+                    max_attempts, available_at, created_at
+                ) values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+                returning to_jsonb(workflow_outbox)
+                """,
+                (event_id, tenant_id, aggregate_type, aggregate_id,
+                 int(version), event_type, payload_raw, dedupe_key,
+                 int(max_attempts), _pg_utc(
+                     now_ts if available_at is None else available_at
+                 ), _pg_utc(now_ts)),
+            ).fetchone()
+        return self._pg_outbox_event(row[0])
+
+    @staticmethod
+    def _pg_outbox_event(row):
+        result = _pg_record(row)
+        result["payload"] = result.pop("payload_json")
+        return result
+
+    def get_outbox_event(self, event_id, tenant_id):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(o) from orchestrator.workflow_outbox o
+                where event_id = %s and tenant_id = %s
+                """,
+                (event_id, tenant_id),
+            ).fetchone()
+        return self._pg_outbox_event(row[0]) if row else None
+
+    def count_outbox_events(self, tenant_id, dedupe_key):
+        with self.db.connection() as conn:
+            return int(conn.execute(
+                """
+                select count(*) from orchestrator.workflow_outbox
+                where tenant_id = %s and dedupe_key = %s
+                """,
+                (tenant_id, dedupe_key),
+            ).fetchone()[0])
+
+    def claim_outbox_event(
+        self, worker_id, now_ts, visibility_timeout=30, tenant_id=None,
+    ):
+        """Claim one visible event without overtaking its aggregate."""
+        tenant_sql = "and o.tenant_id = %s" if tenant_id else ""
+        params = [_pg_utc(now_ts), _pg_utc(now_ts)]
+        if tenant_id:
+            params.append(tenant_id)
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                select o.event_id, o.tenant_id
+                from orchestrator.workflow_outbox o
+                where ((o.status = 'pending' and o.available_at <= %s)
+                    or (o.status = 'claimed' and o.claim_expires_at <= %s))
+                %s
+                  and not exists (
+                    select 1 from orchestrator.workflow_outbox earlier
+                    where earlier.tenant_id = o.tenant_id
+                      and earlier.aggregate_type = o.aggregate_type
+                      and earlier.aggregate_id = o.aggregate_id
+                      and earlier.aggregate_version < o.aggregate_version
+                      and earlier.status != 'completed'
+                  )
+                order by o.created_at, o.event_id
+                for update skip locked
+                limit 1
+                """ % ("%s", "%s", tenant_sql),
+                tuple(params),
+            ).fetchone()
+            if row is None:
+                return None
+            claimed = conn.execute(
+                """
+                update orchestrator.workflow_outbox
+                set status = 'claimed', claimed_by = %s,
+                    claim_expires_at = %s, attempts = attempts + 1
+                where event_id = %s and tenant_id = %s
+                returning to_jsonb(workflow_outbox)
+                """,
+                (worker_id, _pg_utc(int(now_ts) + int(visibility_timeout)),
+                 row[0], row[1]),
+            ).fetchone()
+        return self._pg_outbox_event(claimed[0])
+
+    def complete_outbox_event(self, event_id, tenant_id, worker_id, now_ts):
+        with self.db.transaction() as conn:
+            current = conn.execute(
+                """
+                select status, claimed_by from orchestrator.workflow_outbox
+                where event_id = %s and tenant_id = %s
+                """,
+                (event_id, tenant_id),
+            ).fetchone()
+            if current is None:
+                return False
+            if current[0] == "completed":
+                return True
+            cursor = conn.execute(
+                """
+                update orchestrator.workflow_outbox
+                set status = 'completed', completed_at = %s,
+                    claimed_by = null, claim_expires_at = null
+                where event_id = %s and tenant_id = %s
+                  and status = 'claimed' and claimed_by = %s
+                """,
+                (_pg_utc(now_ts), event_id, tenant_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def fail_outbox_event(
+        self, event_id, tenant_id, worker_id, now_ts, error, retry_delay,
+    ):
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """
+                select attempts, max_attempts
+                from orchestrator.workflow_outbox
+                where event_id = %s and tenant_id = %s
+                  and status = 'claimed' and claimed_by = %s
+                for update
+                """,
+                (event_id, tenant_id, worker_id),
+            ).fetchone()
+            if row is None:
+                return False
+            dead = int(row[0]) >= int(row[1])
+            conn.execute(
+                """
+                update orchestrator.workflow_outbox
+                set status = %s, available_at = %s, claimed_by = null,
+                    claim_expires_at = null, last_error = %s,
+                    dead_lettered_at = %s
+                where event_id = %s and tenant_id = %s
+                """,
+                ("dead_letter" if dead else "pending",
+                 _pg_utc(int(now_ts) + int(retry_delay)), str(error)[:1000],
+                 _pg_utc(now_ts) if dead else None, event_id, tenant_id),
+            )
+        return "dead_letter" if dead else "retry"
+
+    def get_projection_watermark(
+        self, tenant_id, aggregate_type, aggregate_id,
+        projection_name="conversation",
+    ):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select to_jsonb(w) from orchestrator.projection_watermarks w
+                where tenant_id = %s and projection_name = %s
+                  and aggregate_type = %s and aggregate_id = %s
+                """,
+                (tenant_id, projection_name, aggregate_type, aggregate_id),
+            ).fetchone()
+        return _pg_record(row[0]) if row else None
+
+    def advance_projection_watermark(
+        self, tenant_id, aggregate_type, aggregate_id, projected_version,
+        event_id, now_ts, projection_name="conversation",
+    ):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                insert into orchestrator.projection_watermarks(
+                    tenant_id, projection_name, aggregate_type, aggregate_id,
+                    projected_version, last_event_id, updated_at
+                ) values (%s, %s, %s, %s, %s, %s, %s)
+                on conflict (tenant_id, projection_name, aggregate_type, aggregate_id)
+                do update set projected_version = excluded.projected_version,
+                              last_event_id = excluded.last_event_id,
+                              updated_at = excluded.updated_at
+                where orchestrator.projection_watermarks.projected_version
+                      < excluded.projected_version
+                """,
+                (tenant_id, projection_name, aggregate_type, aggregate_id,
+                 int(projected_version), event_id, _pg_utc(now_ts)),
+            )
+        return cursor.rowcount == 1
+
+    def purge_completed_outbox(self, tenant_id, completed_before):
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                delete from orchestrator.workflow_outbox
+                where tenant_id = %s and status = 'completed'
+                  and completed_at < %s
+                """,
+                (tenant_id, _pg_utc(completed_before)),
+            )
+        return cursor.rowcount
+
+    def enqueue_workflow_conversation_outcome(
+        self, revision_id, tenant_id, outcome, now_ts,
+    ):
+        with self.db.connection() as conn:
+            row = conn.execute(
+                """
+                select conversation_id
+                from orchestrator.concierge_conversations
+                where workflow_revision_id = %s and tenant_id = %s
+                  and status not in ('closed', 'expired')
+                """,
+                (revision_id, tenant_id),
+            ).fetchone()
+        if row is None:
+            return None
+        status = str((outcome or {}).get("status") or "unknown")
+        return self.append_outbox_event(
+            tenant_id, "conversation", row[0], "workflow.outcome",
+            {"revision_id": revision_id, "outcome": outcome},
+            "revision:%s:%s" % (revision_id, status), now_ts,
+        )
+
+    def recover_unprojected_conversation_outcomes(self, now_ts):
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                """
+                select c.workflow_revision_id, c.tenant_id
+                from orchestrator.concierge_conversations c
+                join orchestrator.workflow_revisions r
+                  on r.workflow_revision_id = c.workflow_revision_id
+                 and r.tenant_id = c.tenant_id
+                where c.status not in ('closed','expired','succeeded','ready')
+                  and r.status = 'completed'
+                """
+            ).fetchall()
+        created = 0
+        for revision_id, tenant_id in rows:
+            if self.enqueue_workflow_conversation_outcome(
+                revision_id, tenant_id, {"status": "complete"}, now_ts
+            ) is not None:
+                created += 1
+        return created
+
+    def list_approved_revisions(self, limit=100):
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                """
+                select r.workflow_run_id, r.workflow_revision_id, r.tenant_id
+                from orchestrator.workflow_revisions r
+                where r.status in ('approved','authorized') and exists (
+                    select 1 from orchestrator.workflow_steps s
+                    where s.workflow_revision_id = r.workflow_revision_id
+                      and s.tenant_id = r.tenant_id
+                      and s.execution_status = 'queued'
+                ) order by r.created_at, r.workflow_revision_id limit %s
+                """,
+                (int(limit),),
+            ).fetchall()
+        keys = ("workflow_run_id", "workflow_revision_id", "tenant_id")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def list_runnable_revisions(self, limit=100):
+        """The worker's queue scan, joined to how each revision was authorized.
+
+        Overridden here for the same reason ``list_approved_revisions`` is:
+        the inherited implementation is the SQLite one, and it reaches for
+        ``self._lock``/``self._connection``, which this subclass never
+        builds. Without the override the worker raises ``AttributeError`` on
+        its first poll and never starts.
+        """
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                """
+                select r.workflow_run_id, r.workflow_revision_id, r.tenant_id,
+                       a.authorization_mode
+                from orchestrator.workflow_revisions r
+                join orchestrator.workflow_approvals a
+                  on a.workflow_revision_id = r.workflow_revision_id
+                 and a.workflow_run_id = r.workflow_run_id
+                 and a.tenant_id = r.tenant_id
+                where r.status in ('approved','authorized') and exists (
+                    select 1 from orchestrator.workflow_steps s
+                    where s.workflow_revision_id = r.workflow_revision_id
+                      and s.tenant_id = r.tenant_id
+                      and s.execution_status = 'queued'
+                ) order by r.created_at, r.workflow_revision_id limit %s
+                """,
+                (int(limit),),
+            ).fetchall()
+        keys = (
+            "workflow_run_id", "workflow_revision_id", "tenant_id",
+            "authorization_mode",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def _pg_step(self, row):
+        result = _pg_record(row)
+        result["depends_on"] = list(result.pop("dependency_ids") or [])
+        result["input"] = self._pg_decode(
+            result.pop("input_json"), result["tenant_id"],
+            result["workflow_revision_id"], result["step_id"], "input", {},
+        )
+        result["output"] = self._pg_decode(
+            result.pop("output_json"), result["tenant_id"],
+            result["workflow_revision_id"], result["step_id"], "output", {},
+        )
+        return result
+
+    def _pg_encode(self, value, tenant_id, revision_id, step_id, field):
+        if self.content_crypto is None:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return json.dumps(self.content_crypto.seal(
+            value, self._content_context(tenant_id, revision_id, step_id, field)
+        ), sort_keys=True, separators=(",", ":"))
+
+    def _pg_decode(self, raw, tenant_id, revision_id, step_id, field, default):
+        if raw is None:
+            return default
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        if self.content_crypto is None:
+            return value
+        return self.content_crypto.open(
+            value, self._content_context(tenant_id, revision_id, step_id, field)
+        )
+
+
+def _pg_utc(value):
+    return datetime.fromtimestamp(int(value), tz=timezone.utc)
+
+
+def _pg_epoch(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, str):
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return int(value)
+
+
+def _pg_record(row):
+    if row is None:
+        return None
+    result = dict(row)
+    for key, value in tuple(result.items()):
+        if isinstance(value, datetime):
+            result[key] = int(value.timestamp())
+    return result

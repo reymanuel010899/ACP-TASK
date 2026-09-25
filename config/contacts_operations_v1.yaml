@@ -1,0 +1,837 @@
+{
+  "manifest_version": "contacts.operations.v1",
+  "provider": "contacts",
+  "operations": [
+    {
+      "operation_id": "contacts.search",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "buscar contacto",
+        "busca a",
+        "find contact",
+        "search contacts",
+        "look up contact"
+      ],
+      "slots": [
+        {
+          "name": "query",
+          "entity_kind": "scalar.text",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "entity_kind": "scalar.integer",
+          "required": false
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "search_contacts",
+          "capability_id": "contacts.search",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "query": "query",
+            "limit": "limit"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_directory_reads",
+      "prerequisites": [
+        "tenant_context",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "clarify_who_you_mean",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_candidates",
+        "label": "Contactos encontrados"
+      }
+    },
+    {
+      "operation_id": "contacts.resolve",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "quien es",
+        "a quien le escribo",
+        "resolve contact",
+        "who is",
+        "which contact"
+      ],
+      "slots": [
+        {
+          "name": "query",
+          "entity_kind": "scalar.text",
+          "required": true
+        },
+        {
+          "name": "channel",
+          "entity_kind": "scalar.channel",
+          "required": false
+        },
+        {
+          "name": "purpose",
+          "entity_kind": "scalar.purpose",
+          "required": false
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "resolve_contact",
+          "capability_id": "contacts.resolve",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "query": "query",
+            "channel": "channel",
+            "purpose": "purpose"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_directory_reads",
+      "prerequisites": [
+        "tenant_context",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "clarify_who_you_mean",
+        "ambiguous": "offer_candidate_disambiguation",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_candidates",
+        "label": "Candidatos"
+      }
+    },
+    {
+      "operation_id": "contacts.get",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "ficha del contacto",
+        "ver contacto",
+        "show contact",
+        "contact details"
+      ],
+      "slots": [
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "get_contact",
+          "capability_id": "contacts.get",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "contact_id": "contact.id"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_directory_reads",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_candidates",
+        "label": "Contacto"
+      }
+    },
+    {
+      "operation_id": "contacts.tree.read",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "ver el arbol",
+        "listar sucursales",
+        "show branches",
+        "browse directory"
+      ],
+      "slots": [
+        {
+          "name": "branch",
+          "entity_kind": "contacts.branch",
+          "required": false
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_tree",
+          "capability_id": "contacts.tree.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "branch_id": "branch.id"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_directory_reads",
+      "prerequisites": [
+        "tenant_context",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_tree",
+        "label": "Estructura de contactos"
+      }
+    },
+    {
+      "operation_id": "contacts.list.members",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "quien esta en la lista",
+        "miembros de la lista",
+        "list members",
+        "who is in the list"
+      ],
+      "slots": [
+        {
+          "name": "list",
+          "entity_kind": "contacts.list",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_list_members",
+          "capability_id": "contacts.list.members",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "list_id": "list.id"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_grouping_reads",
+      "prerequisites": [
+        "tenant_context",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "clarify_which_list",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_candidates",
+        "label": "Miembros de la lista"
+      }
+    },
+    {
+      "operation_id": "contacts.consent.read",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "tiene consentimiento",
+        "estado de consentimiento",
+        "consent status",
+        "may we contact"
+      ],
+      "slots": [
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        },
+        {
+          "name": "channel",
+          "entity_kind": "scalar.channel",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_consent",
+          "capability_id": "contacts.consent.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "contact_id": "contact.id",
+            "channel": "channel"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_consent_reads",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "consent_axes",
+        "label": "Consentimiento, supresión y usabilidad"
+      }
+    },
+    {
+      "operation_id": "contacts.activity.read",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "historial del contacto",
+        "ultima vez que hablamos",
+        "contact activity",
+        "last contacted"
+      ],
+      "slots": [
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "entity_kind": "scalar.integer",
+          "required": false
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "read_activity",
+          "capability_id": "contacts.activity.read",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "contact_id": "contact.id",
+            "limit": "limit"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_activity_reads",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_view_permission"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "contact_activity",
+        "label": "Actividad del contacto"
+      }
+    },
+    {
+      "operation_id": "contacts.segment.preview",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": [
+        "cuanta gente entra en el segmento",
+        "vista previa del segmento",
+        "preview segment",
+        "audience preview"
+      ],
+      "slots": [
+        {
+          "name": "segment",
+          "entity_kind": "contacts.segment",
+          "required": true
+        },
+        {
+          "name": "channel",
+          "entity_kind": "scalar.channel",
+          "required": true
+        },
+        {
+          "name": "purpose",
+          "entity_kind": "scalar.purpose",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "preview_segment",
+          "capability_id": "contacts.segment.preview",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "segment_id": "segment.id",
+            "channel": "channel",
+            "purpose": "purpose"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_audience_preview",
+      "prerequisites": [
+        "tenant_context",
+        "branch_campaign_use_permission"
+      ],
+      "recovery": {
+        "missing_slot": "clarify_which_segment",
+        "unavailable": "explain_campaign_use_permission"
+      },
+      "presentation": {
+        "kind": "audience_preview",
+        "label": "Audiencia (redactada)"
+      }
+    },
+    {
+      "operation_id": "contacts.propose",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": [
+        "propon un contacto nuevo",
+        "agrega este contacto",
+        "propose a new contact",
+        "add this contact"
+      ],
+      "slots": [
+        {
+          "name": "display_name",
+          "entity_kind": "scalar.text",
+          "required": true
+        },
+        {
+          "name": "branch",
+          "entity_kind": "contacts.branch",
+          "required": true
+        },
+        {
+          "name": "channel",
+          "entity_kind": "scalar.channel",
+          "required": true
+        },
+        {
+          "name": "address_capture",
+          "entity_kind": "contacts.address_capture",
+          "required": true
+        },
+        {
+          "name": "note",
+          "entity_kind": "scalar.text",
+          "required": false
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "propose_contact",
+          "capability_id": "contacts.propose",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "display_name": "display_name",
+            "primary_branch_id": "branch.id",
+            "channel": "channel",
+            "address_capture_ref": "address_capture.ref",
+            "note": "note"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_proposals",
+      "prerequisites": [
+        "tenant_context",
+        "branch_edit_permission",
+        "server_captured_address",
+        "human_review_queue"
+      ],
+      "recovery": {
+        "missing_slot": "ask_for_the_number_in_the_users_own_words",
+        "unavailable": "explain_branch_permission",
+        "duplicate": "point_at_the_existing_proposal"
+      },
+      "presentation": {
+        "kind": "proposal_receipt",
+        "label": "Propuesta en revisión"
+      }
+    },
+    {
+      "operation_id": "contacts.update.propose",
+      "operation_kind": "capability",
+      "availability": "conditional",
+      "aliases": [
+        "propon un cambio",
+        "corrige el contacto",
+        "propose a change",
+        "correct this contact"
+      ],
+      "slots": [
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        },
+        {
+          "name": "record_version",
+          "entity_kind": "contacts.record_version",
+          "required": true
+        },
+        {
+          "name": "changes",
+          "entity_kind": "contacts.changes",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "propose_update",
+          "capability_id": "contacts.update.propose",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "contact_id": "contact.id",
+            "record_version": "record_version",
+            "changes": "changes"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_proposals",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_edit_permission",
+        "human_review_queue"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "stale_record": "re_resolve_and_propose_again",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "proposal_receipt",
+        "label": "Cambio propuesto"
+      }
+    },
+    {
+      "operation_id": "contacts.list.add",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "agregalo a la lista",
+        "meter en la lista",
+        "add to list",
+        "put on the list"
+      ],
+      "slots": [
+        {
+          "name": "list",
+          "entity_kind": "contacts.list",
+          "required": true
+        },
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "add_to_list",
+          "capability_id": "contacts.list.add",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "list_id": "list.id",
+            "contact_id": "contact.id"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_grouping_writes",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_edit_permission"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "grouping_receipt",
+        "label": "Añadido a la lista"
+      }
+    },
+    {
+      "operation_id": "contacts.tag.apply",
+      "operation_kind": "capability",
+      "availability": "supported",
+      "aliases": [
+        "ponle la etiqueta",
+        "etiquetar contacto",
+        "apply tag",
+        "tag this contact"
+      ],
+      "slots": [
+        {
+          "name": "tag",
+          "entity_kind": "contacts.tag",
+          "required": true
+        },
+        {
+          "name": "contact",
+          "entity_kind": "contacts.contact",
+          "required": true
+        }
+      ],
+      "capability_recipe": [
+        {
+          "step_id": "apply_tag",
+          "capability_id": "contacts.tag.apply",
+          "capability_version": "1.0.0",
+          "input_bindings": {
+            "tag_id": "tag.id",
+            "contact_id": "contact.id"
+          },
+          "depends_on": []
+        }
+      ],
+      "authority_profile": "account",
+      "family_flag": "contacts_grouping_writes",
+      "prerequisites": [
+        "tenant_context",
+        "resolved_contact",
+        "branch_edit_permission"
+      ],
+      "recovery": {
+        "missing_slot": "resolve_contact_first",
+        "unavailable": "explain_branch_permission"
+      },
+      "presentation": {
+        "kind": "grouping_receipt",
+        "label": "Etiqueta aplicada"
+      }
+    }
+  ],
+  "method_coverage": {
+    "supported": [
+      {
+        "method": "ContactsAccess.search",
+        "family": "contacts_directory_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactResolver.resolve",
+        "family": "contacts_directory_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsRepository.get_contact",
+        "family": "contacts_directory_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsRepository.children",
+        "family": "contacts_directory_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsAccess.list_members",
+        "family": "contacts_grouping_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsConsentRepository.axes",
+        "family": "contacts_consent_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsRepository.addresses",
+        "family": "contacts_activity_reads",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_view_permission"
+        ]
+      },
+      {
+        "method": "ContactsRepository.add_to_list",
+        "family": "contacts_grouping_writes",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_edit_permission"
+        ]
+      },
+      {
+        "method": "ContactsRepository.assign_tag",
+        "family": "contacts_grouping_writes",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_edit_permission"
+        ]
+      }
+    ],
+    "conditional": [
+      {
+        "method": "ContactsAccess.audience_preview",
+        "family": "contacts_audience_preview",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_campaign_use_permission"
+        ]
+      },
+      {
+        "method": "ProposalQueue.propose_contact",
+        "family": "contacts_proposals",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_edit_permission",
+          "server_captured_address",
+          "human_review_queue"
+        ]
+      },
+      {
+        "method": "ProposalQueue.propose_update",
+        "family": "contacts_proposals",
+        "state": "runtime",
+        "prerequisites": [
+          "tenant_context",
+          "branch_edit_permission",
+          "bound_record_version",
+          "human_review_queue"
+        ]
+      },
+      {
+        "method": "ContactsRepository.resolve_segment",
+        "family": "contacts_audience_preview",
+        "state": "planned",
+        "prerequisites": [
+          "tenant_context",
+          "branch_campaign_use_permission",
+          "cohort_snapshot_binding"
+        ]
+      },
+      {
+        "method": "ContactsRepository.record_contacted",
+        "family": "contacts_activity_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "dispatch_ledger"
+        ]
+      }
+    ],
+    "excluded": [
+      {
+        "method": "ContactsRepository.create_contact",
+        "family": "contacts_proposals",
+        "state": "dormant",
+        "prerequisites": [
+          "human_review_queue"
+        ],
+        "reason": "an agent proposes and a human decides, so the direct create has no agent-side capability"
+      },
+      {
+        "method": "ContactsRepository.add_address",
+        "family": "contacts_proposals",
+        "state": "dormant",
+        "prerequisites": [
+          "human_review_queue",
+          "address_activation"
+        ],
+        "reason": "an address written without a usability decision reads as proposed, and only a human may activate it"
+      },
+      {
+        "method": "ContactsConsentRepository.grant_consent",
+        "family": "contacts_consent_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "authorized_human_decision",
+          "consent_evidence"
+        ],
+        "reason": "granting consent is a permissive transition and takes a named human with named authority"
+      },
+      {
+        "method": "ContactsConsentRepository.activate_address",
+        "family": "contacts_proposals",
+        "state": "dormant",
+        "prerequisites": [
+          "authorized_human_decision"
+        ],
+        "reason": "activation is the human decision the proposal queue exists to collect"
+      },
+      {
+        "method": "ContactsConsentRepository.lift_suppression",
+        "family": "contacts_consent_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "administrator_decision"
+        ],
+        "reason": "un-suppressing takes an administrator and never an agent"
+      },
+      {
+        "method": "ContactsRepository.move_branch",
+        "family": "contacts_directory_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "administrator_decision"
+        ],
+        "reason": "moving a branch silently changes who every campaign below it reaches"
+      },
+      {
+        "method": "ContactsRepository.move_contact",
+        "family": "contacts_directory_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "administrator_decision"
+        ],
+        "reason": "relocating a person changes which principals may see and target them"
+      },
+      {
+        "method": "BranchPermissionsRepository.grant",
+        "family": "contacts_directory_reads",
+        "state": "dormant",
+        "prerequisites": [
+          "administrator_decision"
+        ],
+        "reason": "permission administration is not a conversational surface"
+      }
+    ]
+  }
+}

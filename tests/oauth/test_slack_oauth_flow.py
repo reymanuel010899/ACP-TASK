@@ -254,13 +254,48 @@ def test_state_is_one_use_and_wrong_session_stores_nothing(tmp_path):
     assert len(vault.records) == 1
 
 
-def test_configured_local_tenant_fallback_survives_principal_rotation(monkeypatch):
+def test_a_rotated_principal_no_longer_inherits_the_local_tenant(monkeypatch):
+    """The inverse of what this asserted until U5.
+
+    An unmapped principal used to fall back to `TESSERA_LOCAL_TENANT_ID`,
+    which on this service meant it could install a provider connection into
+    an account it was never granted, and list back every connection already
+    sitting there. Unmapped is now refused (KTD11).
+    """
+    from libs.tenancy import UnmappedPrincipalError
     from services.oauth.app import _configured_tenant_resolver
 
     monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
     monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
 
+    with pytest.raises(UnmappedPrincipalError):
+        _configured_tenant_resolver()("new-principal")
+
+
+def test_the_local_tenant_is_reached_by_being_mapped_like_any_other(monkeypatch):
+    from services.oauth.app import _configured_tenant_resolver
+
+    monkeypatch.setenv(
+        "TESSERA_PRINCIPAL_TENANTS_JSON", '{"new-principal": "org:local"}',
+    )
+    monkeypatch.delenv("TESSERA_LOCAL_TENANT_ID", raising=False)
+
     assert _configured_tenant_resolver()("new-principal") == "org:local"
+
+
+def test_an_unmapped_principal_gets_a_refusal_not_a_default_account(monkeypatch):
+    """The service turns the refusal into its existing no-tenant answer."""
+    from services.oauth.app import OAuthService, _configured_tenant_resolver
+
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+    service = OAuthService.__new__(OAuthService)
+    service.tenant_resolver = _configured_tenant_resolver()
+
+    assert service._tenant_id({"principal_id": "new-principal"}) is None
+    assert service._tenant_id(
+        {"principal_id": "new-principal", "tenant_id": "org:acme"},
+    ) == "org:acme"
 
 
 def _granted(service, scopes):

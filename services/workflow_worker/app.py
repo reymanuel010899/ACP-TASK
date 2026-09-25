@@ -5,7 +5,10 @@ import os
 import socket
 import time
 
-from agents.orchestrator.action_repository import ActionRepository
+from agents.orchestrator.action_repository import (
+    ActionRepository,
+    PostgresActionRepository,
+)
 from agents.orchestrator.brain import make_brain
 from agents.orchestrator.broker_client import ActionBrokerClient
 from agents.orchestrator.conversation_state import ConciergeConversationStore
@@ -14,13 +17,17 @@ from agents.orchestrator.policy import PolicyEvaluator
 from agents.orchestrator.reconciliation import WorkflowReconciler
 from agents.orchestrator.workflow_broker_dispatcher import WorkflowBrokerDispatcher
 from agents.orchestrator.workflow_executor import WorkflowExecutor
-from agents.orchestrator.workflow_repository import WorkflowRepository
-from services.oauth.repository import OAuthRepository
+from agents.orchestrator.workflow_repository import (
+    PostgresWorkflowRepository,
+    WorkflowRepository,
+)
+from services.oauth.repository import (
+    OAuthRepository,
+    PkceCipher,
+    PostgresOAuthRepository,
+)
 from libs.integrations.catalog import provider_definitions
-
-
-def _enabled():
-    return os.environ.get("TESSERA_DYNAMIC_EXECUTION_ENABLED", "false").lower() == "true"
+from libs.integrations.control_plane import build_tenant_control_plane
 
 
 class WorkflowWorker:
@@ -47,7 +54,13 @@ class WorkflowWorker:
             self.workflows.purge_expired_content(now)
         if hasattr(self.workflows, "recover_unprojected_conversation_outcomes"):
             self.workflows.recover_unprojected_conversation_outcomes(now)
-        if _enabled() and hasattr(self.workflows, "resume_policy_paused"):
+        # Unconditional now that the switches are per-tenant. Gating the
+        # resume on a process-wide flag meant work parked by a control-plane
+        # change stayed parked until someone restarted this process, which is
+        # precisely the property this unit removes. The repository still
+        # decides which pauses are resumable; a stop lifted at 09:00 drains on
+        # the next tick, and a pause that needs a replan stays put.
+        if hasattr(self.workflows, "resume_policy_paused"):
             self.workflows.resume_policy_paused()
         list_revisions = getattr(
             self.workflows, "list_runnable_revisions",
@@ -239,8 +252,21 @@ def build_worker():
         os.environ.get("WORKFLOW_DATABASE", "tessera-workflows.db"),
         os.environ.get("TESSERA_WORKFLOW_WORKER_IDENTITY", "service:workflow-worker"),
     )
-    actions = ActionRepository(os.environ.get("ACTION_DATABASE", "tessera-actions.db"))
-    connections = OAuthRepository(os.environ.get("OAUTH_DATABASE", "tessera-oauth.db"))
+    if isinstance(workflows, PostgresWorkflowRepository):
+        actions = PostgresActionRepository(workflows.db)
+        pkce_key = os.environ.get("OAUTH_TRANSACTION_ENCRYPTION_KEY")
+        if not pkce_key:
+            raise RuntimeError("OAUTH_TRANSACTION_ENCRYPTION_KEY is required")
+        connections = PostgresOAuthRepository(
+            workflows.db, PkceCipher(pkce_key)
+        )
+    else:
+        actions = ActionRepository(
+            os.environ.get("ACTION_DATABASE", "tessera-actions.db")
+        )
+        connections = OAuthRepository(
+            os.environ.get("OAUTH_DATABASE", "tessera-oauth.db")
+        )
     broker = ActionBrokerClient(
         os.environ["TESSERA_ACTION_BROKER_URL"],
         os.environ["TESSERA_ACTION_BROKER_INTERNAL_TOKEN"],
@@ -251,15 +277,35 @@ def build_worker():
     dispatcher = WorkflowBrokerDispatcher(
         actions, broker, connections, workflows,
         rollout_version=rollout_version,
+        # Which agent this worker acts as. The broker refuses a side-effecting
+        # dispatch whose agent has no trusted endpoint and cannot re-prove its
+        # identity, so a worker hardcoded to a principal the deployment never
+        # publishes can read but can never write. Deployments name the agent
+        # they actually run; the default keeps existing ones unchanged.
+        agent_principal_id=os.environ.get(
+            "TESSERA_WORKFLOW_AGENT_PRINCIPAL_ID", "agent:orchestrator"
+        ),
         policy_evaluator=PolicyEvaluator(
             provider_definitions(), rollout_version
         ),
     )
-    executor = WorkflowExecutor(workflows, dispatcher, policy=lambda _step: _enabled())
+    # One control plane, shared by the executor and the conversation
+    # resolver: two readers of two different sources is how a stop ends up
+    # half-applied.
+    control_plane = build_tenant_control_plane(
+        connections, provider_definitions()
+    )
+    # The step policy is now a per-tenant decision that carries its own
+    # reason, so a step parked by an emergency stop is distinguishable from
+    # one parked by a family disable, and both resume on the next tick after
+    # the administrator reverses them.
+    executor = WorkflowExecutor(
+        workflows, dispatcher, policy=control_plane.decide_step
+    )
     return WorkflowWorker(
         workflows, executor,
         conversation_resolver=_build_conversation_resolver(
-            workflows, connections, rollout_version
+            workflows, connections, rollout_version, control_plane
         ),
         reconciler=WorkflowReconciler(
             workflows, actions, reconcilers=_provider_reconcilers()
@@ -278,7 +324,9 @@ def _provider_reconcilers():
     return {}
 
 
-def _build_conversation_resolver(workflows, connections, rollout_version):
+def _build_conversation_resolver(
+    workflows, connections, rollout_version, control_plane,
+):
     """Own resolver continuation here so HTTP polling stays read-only."""
     return DynamicWorkflowService(
         make_brain(),
@@ -290,15 +338,9 @@ def _build_conversation_resolver(workflows, connections, rollout_version):
             "TESSERA_DYNAMIC_PLANNER_SHADOW", "true"
         ).lower() != "false",
         conversation_store=ConciergeConversationStore(workflows),
-        conversational_reads_enabled=os.environ.get(
-            "TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED", "false"
-        ).lower() == "true",
-        slack_writes_enabled=os.environ.get(
-            "TESSERA_SLACK_WRITES_ENABLED", "false"
-        ).lower() == "true",
-        slack_dms_enabled=os.environ.get(
-            "TESSERA_SLACK_DMS_ENABLED", "false"
-        ).lower() == "true",
+        # Which families this account holds is durable per-tenant state now,
+        # not three environment variables read once at boot.
+        control_plane=control_plane,
     )
 
 

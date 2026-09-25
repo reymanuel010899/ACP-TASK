@@ -22,6 +22,7 @@ import threading
 import pytest
 import requests
 
+from libs.db import bind_organization_id
 from registry.app import RegistryService, make_server
 from registry.index_store import IndexStore
 
@@ -49,7 +50,15 @@ def index():
 
 @pytest.fixture
 def service(index):
-    return RegistryService(index)
+    service = RegistryService(index)
+    bind_organization_id("org:test-registry")
+    identity = service.agent_index._repo._identity
+    if not identity.organization_exists("org:test-registry"):
+        identity.create_organization("org:test-registry", "Registry Test")
+    try:
+        yield service
+    finally:
+        bind_organization_id(None)
 
 
 def register_agent(service, principal_id, created_by="ed25519_user_alice",
@@ -86,6 +95,25 @@ class TestAgentRegistration:
         assert agent["agent_card"]["capabilities"] == [
             "aws.deploy", "terraform.apply",
         ]
+        with service.agent_index._repo._db.connection() as conn:
+            row = conn.execute(
+                "SELECT organization_id FROM registry.agent_ownership "
+                "WHERE principal_id = %s",
+                ("ed25519_agent_deploybot",),
+            ).fetchone()
+        assert row == ("org:test-registry",)
+
+    def test_registration_without_tenant_is_public_discovery_only(self, service):
+        bind_organization_id(None)
+        status, body = register_agent(service, "ed25519_agent_external")
+        assert status == 200, body
+
+        with service.agent_index._repo._db.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM registry.agent_ownership WHERE principal_id = %s",
+                ("ed25519_agent_external",),
+            ).fetchone()
+        assert row is None
 
     def test_register_duplicate_principal_is_409(self, service):
         """Scenario 2: same agent principal_id twice -> 409."""
@@ -294,7 +322,15 @@ class TestAgentCapabilitySearch:
 @pytest.fixture
 def http_registry():
     """HTTP registry server for testing."""
-    server = make_server(port=0)
+    service = RegistryService(IndexStore())
+    bind_organization_id("org:test-registry-http")
+    identity = service.agent_index._repo._identity
+    if not identity.organization_exists("org:test-registry-http"):
+        identity.create_organization(
+            "org:test-registry-http", "Registry HTTP Test"
+        )
+    bind_organization_id(None)
+    server = make_server(port=0, service=service)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base_url = "http://%s:%d" % server.server_address[:2]
@@ -315,6 +351,7 @@ def http_register_agent(base_url, principal_id, capabilities=None):
             "principal_id": principal_id,
             "created_by": "ed25519_user_alice",
         },
+        headers={"X-Organization-Id": "org:test-registry-http"},
         timeout=5,
     )
 

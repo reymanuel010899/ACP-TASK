@@ -38,19 +38,30 @@ declare
   role_name text;
 begin
   foreach role_name in array array[
+    'agenttrust_app',
     'registry_svc',
     'vault_svc',
     'audit_svc',
     'trust_svc',
-    'marketplace_svc'
+    'marketplace_svc',
+    'control_plane_svc',
+    'workflow_svc',
+    'action_broker_svc',
+    'communications_svc',
+    'operational_migration_svc'
   ]
   loop
     if not exists (select 1 from pg_catalog.pg_roles where rolname = role_name) then
       execute format(
-        'create role %I with login password %L noinherit nosuperuser nocreatedb nocreaterole',
+        'create role %I with login password %L noinherit nosuperuser nobypassrls nocreatedb nocreaterole',
         role_name, role_name || '_dev_password'
       );
     end if;
+    -- Reassert security attributes for pre-existing local/CI roles too.
+    execute format(
+      'alter role %I with noinherit nosuperuser nobypassrls nocreatedb nocreaterole',
+      role_name
+    );
   end loop;
 end
 $$;
@@ -125,7 +136,41 @@ begin
       -- migration's tables are covered by the three grants already above.
       ('identity',    'marketplace_svc', 'full'),
       ('catalog',     'marketplace_svc', 'full'),
-      ('trust',       'marketplace_svc', 'read')
+      ('trust',       'marketplace_svc', 'read'),
+
+      -- Operational-state convergence. These roles remain non-owner and
+      -- NO BYPASSRLS; schema grants cannot bypass the tenant policies.
+      ('identity',     'control_plane_svc', 'full'),
+      ('integrations', 'control_plane_svc', 'full'),
+      ('voice',        'control_plane_svc', 'full'),
+      ('vault',        'control_plane_svc', 'read'),
+
+      ('orchestrator', 'workflow_svc', 'full'),
+      ('identity',     'workflow_svc', 'read'),
+      ('catalog',      'workflow_svc', 'read'),
+      ('integrations', 'workflow_svc', 'read'),
+
+      ('orchestrator', 'action_broker_svc', 'full'),
+      ('identity',     'action_broker_svc', 'read'),
+      ('catalog',      'action_broker_svc', 'read'),
+      ('integrations', 'action_broker_svc', 'read'),
+      ('vault',        'action_broker_svc', 'read'),
+
+      ('campaign',     'communications_svc', 'full'),
+      ('billing',      'communications_svc', 'full'),
+      ('twilio',       'communications_svc', 'full'),
+      ('voice',        'communications_svc', 'full'),
+      ('identity',     'communications_svc', 'read'),
+      ('integrations', 'communications_svc', 'read'),
+
+      ('operational_migration', 'operational_migration_svc', 'full'),
+      ('identity',     'operational_migration_svc', 'read'),
+      ('integrations', 'operational_migration_svc', 'full'),
+      ('orchestrator', 'operational_migration_svc', 'full'),
+      ('campaign',     'operational_migration_svc', 'full'),
+      ('billing',      'operational_migration_svc', 'full'),
+      ('twilio',       'operational_migration_svc', 'full'),
+      ('voice',        'operational_migration_svc', 'full')
     ) as t(schema_name, role_name, access_level)
   loop
     select exists (

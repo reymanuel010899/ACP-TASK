@@ -3,7 +3,10 @@
 import time
 
 from agents.orchestrator.action_repository import canonical_payload_hash
-from libs.integrations.catalog import capability_retry_policy
+from libs.integrations.catalog import (
+    capability_reinforced,
+    capability_retry_policy,
+)
 from agents.orchestrator.workflow_executor import (
     AmbiguousStepError, CorrectableStepError, PausedStepError,
     RetryableStepError,
@@ -197,10 +200,21 @@ class WorkflowBrokerDispatcher:
                     workflow_revision_id=claim["workflow_revision_id"], step_id=step["step_id"],
                     plan_graph_hash=revision["plan_graph_hash"], connection_id=step["connection_id"],
                     attempt=claim["attempt"],
+                    # An approval names the identity that will act, and whether
+                    # the effect needs someone present to grant it.
+                    authority_profile=binding["authority_profile"],
+                    authority_profile_id=binding.get("authority_profile_id"),
+                    slack_subject_id=binding.get("slack_subject_id"),
+                    reinforced=capability_reinforced(step["capability_id"]),
+                    # The destination and the message body land in this row.
+                    # Without the account on it, a proposal id was the whole
+                    # of the authorisation to read, approve, or consume it.
+                    tenant_id=step["tenant_id"],
                 )
                 if not self.actions.decide(
                     proposal["proposal_id"], proposal["version"],
                     run["user_principal_id"], True, now,
+                    tenant_id=step["tenant_id"],
                 ):
                     raise PermissionError("exact action approval could not be materialized")
             except Exception as exc:
@@ -218,6 +232,12 @@ class WorkflowBrokerDispatcher:
                 step_id=step["step_id"], plan_graph_hash=revision["plan_graph_hash"],
                 connection_id=step["connection_id"], attempt=claim["attempt"],
                 now_ts=now,
+                tenant_id=step["tenant_id"],
+                # Part of the lease binding, so the acting identity cannot be
+                # swapped between approval and dispatch and still validate.
+                authority_profile=binding["authority_profile"],
+                authority_profile_id=binding.get("authority_profile_id"),
+                slack_subject_id=binding.get("slack_subject_id"),
             )
         except Exception as exc:
             raise _pre_dispatch_rejection(exc)

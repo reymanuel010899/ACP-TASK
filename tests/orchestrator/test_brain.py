@@ -518,6 +518,50 @@ def test_groq_slack_outage_uses_rule_fallback_for_common_request(monkeypatch):
     assert result.slots[0].value == "general"
 
 
+def test_groq_chat_retries_a_temporary_provider_failure(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+    calls = []
+
+    class Response:
+        def __init__(self, status):
+            self.status_code = status
+            self.headers = {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                error = requests.HTTPError("temporary outage")
+                error.response = self
+                raise error
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    def post(*_args, **_kwargs):
+        calls.append(True)
+        return Response(503 if len(calls) == 1 else 200)
+
+    monkeypatch.setattr("agents.orchestrator.brain.requests.post", post)
+    monkeypatch.setattr("agents.orchestrator.brain.time.sleep", lambda _delay: None)
+
+    assert brain._chat("system", "user", json_mode=True) == '{"ok": true}'
+    assert len(calls) == 2
+
+
+def test_groq_outage_does_not_blame_the_users_wording(monkeypatch):
+    brain = GroqBrain(api_key="test-key")
+    monkeypatch.setattr(
+        brain, "_chat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            requests.ConnectionError("offline")
+        ),
+    )
+
+    result = brain.understand("Envía un SMS a Prueba SMS diciendo hola")
+
+    assert "temporalmente" in result.missing_info[0]
+    assert "reformular" not in result.missing_info[0]
+
+
 def test_groq_model_blockers_are_reduced_to_one_precise_question(monkeypatch):
     brain = GroqBrain(api_key="test-key")
     payload = {

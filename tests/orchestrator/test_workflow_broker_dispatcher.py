@@ -207,7 +207,12 @@ def test_group_approval_materializes_one_exact_action_and_lease(tmp_path):
                          "execution_attestation": {"attestation_id": "att:1"}}
     result = WorkflowBrokerDispatcher(actions, Broker(), Connections(), workflows, clock=lambda: 5)(step, claim)
     assert result["receipt"]["message_ts"] == "1.2"
-    assert actions.get("proposal:%s:%s" % (revision["workflow_revision_id"], "send"))["status"] == "approved"
+    # The dispatcher stamps the step's account onto the proposal, and reading
+    # it back requires that account: the row holds the resolved destination
+    # and the message body, so a proposal id alone no longer opens it.
+    proposal_id = "proposal:%s:%s" % (revision["workflow_revision_id"], "send")
+    assert actions.get(proposal_id, tenant_id="org:1")["status"] == "approved"
+    assert actions.get(proposal_id, tenant_id="org:2") is None
 
 
 def test_dynamic_approval_rejects_a_changed_attempt(tmp_path):
@@ -490,3 +495,58 @@ def test_a_deterministic_refusal_is_correctable_whatever_the_retry_policy():
             403, {"error": "not_in_channel", "category": "membership"},
             "write", "idempotent",
         )
+
+
+def test_the_worker_dispatches_as_the_agent_the_deployment_publishes(monkeypatch):
+    """The broker refuses a write from an agent it cannot re-verify.
+
+    A worker pinned to a principal the deployment never publishes an endpoint
+    for can resolve and read, and then fails every write with "agent endpoint
+    is not trusted" — a configuration fault that looks like a policy pause.
+    """
+    import services.workflow_worker.app as worker_app
+
+    captured = {}
+
+    class _Dispatcher:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(worker_app, "WorkflowBrokerDispatcher", _Dispatcher)
+    monkeypatch.setattr(worker_app, "WorkflowRepository", _Unused)
+    monkeypatch.setattr(worker_app, "ActionRepository", _Unused)
+    monkeypatch.setattr(worker_app, "OAuthRepository", _Unused)
+    monkeypatch.setattr(worker_app, "ActionBrokerClient", _Unused)
+    monkeypatch.setattr(worker_app, "PolicyEvaluator", _Unused)
+    monkeypatch.setattr(worker_app, "WorkflowExecutor", _Unused)
+    monkeypatch.setattr(worker_app, "WorkflowReconciler", _Unused)
+    monkeypatch.setattr(worker_app, "build_tenant_control_plane", _Unused)
+    monkeypatch.setattr(
+        worker_app, "_build_conversation_resolver", lambda *a, **k: None
+    )
+    monkeypatch.setenv("TESSERA_ACTION_BROKER_URL", "http://broker.test")
+    monkeypatch.setenv("TESSERA_ACTION_BROKER_INTERNAL_TOKEN", "token")
+
+    monkeypatch.delenv("TESSERA_WORKFLOW_AGENT_PRINCIPAL_ID", raising=False)
+    worker_app.build_worker()
+    assert captured["agent_principal_id"] == "agent:orchestrator"
+
+    monkeypatch.setenv(
+        "TESSERA_WORKFLOW_AGENT_PRINCIPAL_ID", "agent:concierge-local"
+    )
+    worker_app.build_worker()
+    assert captured["agent_principal_id"] == "agent:concierge-local"
+
+
+class _Unused:
+    """Stands in for every collaborator this test does not exercise."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @classmethod
+    def from_environment(cls, *args, **kwargs):
+        return cls()
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None

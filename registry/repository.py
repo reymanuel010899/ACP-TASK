@@ -78,8 +78,9 @@ from typing import Dict, List, Optional
 import psycopg
 from psycopg.rows import dict_row
 
-from libs.db import Database
+from libs.db import Database, current_organization_id
 from libs.identity_repository import IdentityRepository
+from libs.repository_contract import normalize_tenant_id
 from libs.ulid import generate_ulid
 
 #: Service types the federation layer knows how to look up (RFC-0004) --
@@ -285,6 +286,10 @@ class RegistryRepository(object):
         signs requests under its own key AND declares capabilities), not a
         real identity collision.
         """
+        # Public network registration does not require a Tessera tenant.
+        # When a tenant is bound, ownership is recorded atomically; without
+        # one the card remains discovery-only and carries no admin authority.
+        organization_id = normalize_tenant_id(current_organization_id())
         self._ensure_principal(created_by, "user")
         existing = self._identity.get_principal(principal_id)
         if existing is None:
@@ -315,6 +320,17 @@ class RegistryRepository(object):
                 )
                 row = cur.fetchone()
             self._reindex_capabilities(conn, principal_id, capability_ids)
+            if organization_id is not None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO registry.agent_ownership
+                            (principal_id, organization_id,
+                             created_by_principal_id)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (principal_id, organization_id, created_by),
+                    )
         principal_row = self._identity.get_principal(principal_id)
         agent = {
             "principal_id": principal_id,

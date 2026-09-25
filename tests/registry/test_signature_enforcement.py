@@ -76,6 +76,7 @@ def signed_post(base_url, path, payload, principal_id, session, assertion,
         "POST", path, raw, now_ts=now_ts,
     )
     headers["Content-Type"] = "application/json"
+    headers["X-Organization-Id"] = "org:test-registry-suite"
     return requests.post(base_url + path, data=raw, headers=headers, timeout=5)
 
 
@@ -95,6 +96,7 @@ def test_flag_off_unsigned_agent_register_still_200():
                 "principal_id": "agent-plain",
                 "created_by": "user-plain",
             },
+            headers={"X-Organization-Id": "org:test-registry-suite"},
             timeout=5,
         )
         assert resp.status_code == 200, resp.text

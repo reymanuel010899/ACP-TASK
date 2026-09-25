@@ -34,6 +34,44 @@ import os
 
 import pytest
 
+
+def _isolate_test_database():
+    """Point the suite at its own database before anything opens a pool.
+
+    The cleanup fixtures below truncate shared tables ``cascade``. Run against
+    a development database that is also serving a live stack, that silently
+    destroys real state — most visibly the vault credentials behind every
+    connected integration, which reappear as "credential_unavailable" with
+    nothing to link them back to a test run. Whoever is running the suite is
+    rarely the person whose Slack connection just vanished.
+
+    So the suite gets its own database, derived from ``DATABASE_URL`` by
+    suffix. Set ``TESSERA_TEST_DATABASE_URL`` to name one explicitly, or
+    ``TESSERA_ALLOW_SHARED_TEST_DATABASE=1`` to keep the old behaviour where
+    a deployment genuinely has a disposable database under that name.
+    """
+    if os.environ.get("TESSERA_ALLOW_SHARED_TEST_DATABASE") == "1":
+        return
+    explicit = os.environ.get("TESSERA_TEST_DATABASE_URL")
+    if explicit:
+        os.environ["DATABASE_URL"] = explicit
+        return
+    from libs.db import DEFAULT_DATABASE_URL
+
+    dsn = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+    base, separator, tail = dsn.rpartition("/")
+    if not separator or not tail:
+        return
+    name, question, query = tail.partition("?")
+    if name.endswith("_test"):
+        return
+    os.environ["DATABASE_URL"] = "%s/%s_test%s%s" % (
+        base, name, question, query,
+    )
+
+
+_isolate_test_database()
+
 from libs.db import Database
 
 _original_init = Database.__init__

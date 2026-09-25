@@ -8,9 +8,10 @@
 // never orchestrates itself — it just shows the concierge's replies.
 
 import { useEffect, useRef, useState } from "react";
-import WorkflowPreviewCard, { type SlackDraft, type WorkflowPreview } from "@/components/concierge/WorkflowPreviewCard";
+import WorkflowPreviewCard, { isWorkflowPreview, type SlackDraft, type WorkflowHandle, type WorkflowPreview } from "@/components/concierge/WorkflowPreviewCard";
 import SlackEvidenceCard, { type SlackCitation } from "@/components/concierge/SlackEvidenceCard";
-import { WEB_SESSION_CSRF_STORAGE_KEY } from "@/lib/agentSession";
+import EffectGroupCard, { type EffectGroup } from "@/components/concierge/EffectGroupCard";
+import { readStoredCsrfToken } from "@/lib/agentSession";
 
 type Brain = "claude" | "groq" | "rule";
 type Reply = {
@@ -24,11 +25,22 @@ type Reply = {
   citations?: SlackCitation[];
   period?: { oldest?: string; latest?: string; label?: string };
   partial?: boolean;
+  partialReason?: string;
+  // The server-authoritative envelope (U7 slice A). The console renders these
+  // rather than inferring: it must never offer an action the server would
+  // refuse, nor present a lagging read model as settled state.
+  stateVersion?: number;
+  terminal?: boolean;
+  allowedActions?: string[];
+  projectionLag?: boolean;
+  effectGroup?: EffectGroup;
   draft?: { draftHash: string; destination: string; text: string; workflowId: string; revisionId: string; revision?: number };
   recovery?: { action?: string };
   evidence?: Record<string, unknown>;
   brain?: Brain;
-  workflow?: WorkflowPreview;
+  // A reviewable plan, or just a handle to a run already in flight — see
+  // `WorkflowHandle` in WorkflowPreviewCard.tsx.
+  workflow?: WorkflowPreview | WorkflowHandle;
 };
 type LogItem = { type: "user"; text: string } | { type: "concierge"; reply: Reply };
 
@@ -41,6 +53,39 @@ const EXAMPLES = [
 ];
 
 const POLLING_STATES = new Set(["interpreting", "resolving", "retrieving", "answering", "executing"]);
+
+function shouldPoll(reply: Reply) {
+  // `terminal` is the server saying nothing further can happen. Trust it over
+  // the status name, which the client would otherwise have to keep in step.
+  if (reply.terminal === true) return false;
+  if (reply.terminal === false && reply.state) return POLLING_STATES.has(reply.state);
+  return POLLING_STATES.has(reply.state ?? "");
+}
+
+function mergeReply(current: LogItem[], next: Reply): LogItem[] {
+  const copy = [...current];
+  const index = copy.findLastIndex((item) => item.type === "concierge");
+  if (index < 0) return copy;
+  const shown = (copy[index] as Extract<LogItem, { type: "concierge" }>).reply;
+  // Responses can arrive out of order. Painting an older snapshot over a
+  // newer one would walk the conversation backwards — show an approval the
+  // person already gave as still pending, for instance.
+  if (
+    typeof shown.stateVersion === "number"
+    && typeof next.stateVersion === "number"
+    && next.stateVersion < shown.stateVersion
+  ) return copy;
+  copy[index] = { type: "concierge", reply: next };
+  return copy;
+}
+
+function canApprove(reply: Reply) {
+  // Absent an explicit list the server has not spoken, so fall back to the
+  // presence of a draft rather than inventing permission.
+  return reply.allowedActions
+    ? reply.allowedActions.includes("approve")
+    : Boolean(reply.draft);
+}
 
 const STATUS_LABEL: Record<string, { text: string; cls: string }> = {
   verified: { text: "VERIFIED", cls: "bg-[color-mix(in_srgb,var(--ag-green)_18%,transparent)] text-[var(--ag-green)]" },
@@ -65,6 +110,7 @@ export default function ClientConsole() {
   const [brain, setBrain] = useState<Brain | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [supersededDrafts, setSupersededDrafts] = useState<Set<string>>(new Set());
+  const [decidingEffect, setDecidingEffect] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -74,8 +120,7 @@ export default function ClientConsole() {
   const latestReply = [...log].reverse().find((item): item is Extract<LogItem, { type: "concierge" }> => item.type === "concierge")?.reply;
 
   useEffect(() => {
-    const state = latestReply?.state ?? latestReply?.status;
-    if (!conversationId || !state || !POLLING_STATES.has(state)) return;
+    if (!conversationId || !latestReply || !shouldPoll(latestReply)) return;
     let active = true;
     async function poll() {
       try {
@@ -85,17 +130,33 @@ export default function ClientConsole() {
         if (!response.ok) return;
         const next = await response.json() as Reply;
         if (!active) return;
-        setLog((current) => {
-          const copy = [...current];
-          const index = copy.findLastIndex((item) => item.type === "concierge");
-          if (index >= 0) copy[index] = { type: "concierge", reply: next };
-          return copy;
-        });
+        setLog((current) => mergeReply(current, next));
       } catch { /* Preserve durable state and retry on the next interval. */ }
     }
     const timer = window.setInterval(() => void poll(), 1500);
     return () => { active = false; window.clearInterval(timer); };
-  }, [conversationId, latestReply?.state, latestReply?.status]);
+  }, [conversationId, latestReply, latestReply?.state, latestReply?.status, latestReply?.terminal]);
+
+  const decideEffect = async (effectId: string, decision: string) => {
+    if (!conversationId) return;
+    const csrf = readStoredCsrfToken();
+    if (!csrf) return;
+    setDecidingEffect(effectId);
+    try {
+      const response = await fetch(
+        `/api/client/conversations/${encodeURIComponent(conversationId)}/effects/${encodeURIComponent(effectId)}`,
+        {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+          body: JSON.stringify({ decision }),
+        },
+      );
+      if (!response.ok) return;
+      const next = await response.json() as Reply;
+      setLog((current) => mergeReply(current, next));
+    } catch { /* The server owns the decision; a failed hop decided nothing. */ }
+    finally { setDecidingEffect(null); }
+  };
 
   useEffect(() => {
     const target = scrollRef.current?.querySelector<HTMLElement>("[data-latest-concierge] button, [data-latest-concierge] a");
@@ -123,7 +184,7 @@ export default function ClientConsole() {
   }, [open, loading, log, conversationId]);
 
   async function closeUpstream(id: string) {
-    const csrf = sessionStorage.getItem(WEB_SESSION_CSRF_STORAGE_KEY);
+    const csrf = readStoredCsrfToken();
     if (!csrf) return;
     try {
       await fetch(`/api/client/conversations/${encodeURIComponent(id)}/close`, {
@@ -139,7 +200,7 @@ export default function ClientConsole() {
     setConversationId(null); setLog([]); setText(""); setBrain(null); setOpen(false);
   };
 
-  const send = async (value?: string) => {
+  const send = async (value?: string, selection?: CandidateSelection) => {
     const message = (value ?? text).trim();
     if (!message || loading) return;
     // Prior turns become conversation memory the concierge reasons over.
@@ -155,7 +216,11 @@ export default function ClientConsole() {
       const res = await fetch("/api/client/request", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, history, conversationId }),
+        // `message` is what the transcript shows a person said. `selection`
+        // is what the server binds. They are separate fields because they are
+        // separate facts, and collapsing them is how a display string ends up
+        // deciding a recipient.
+        body: JSON.stringify({ message, history, conversationId, selection }),
       });
       const reply = (await res.json()) as Reply;
       if (reply.brain) setBrain(reply.brain);
@@ -212,7 +277,7 @@ export default function ClientConsole() {
               </div>
             )}
             {log.map((item, i) => (
-              <MessageBubble key={i} item={item} latest={i === log.length - 1} send={send} setComposer={(value) => { setText(value); const hash = latestReply?.draft?.draftHash; if (hash) setSupersededDrafts(current => new Set(current).add(hash)); }} supersededDrafts={supersededDrafts} />
+              <MessageBubble key={i} item={item} latest={i === log.length - 1} send={send} setComposer={(value) => { setText(value); const hash = latestReply?.draft?.draftHash; if (hash) setSupersededDrafts(current => new Set(current).add(hash)); }} supersededDrafts={supersededDrafts} onDecideEffect={decideEffect} decidingEffect={decidingEffect} />
             ))}
             {loading && <div className="text-[11px] text-[var(--ag-text-muted)] italic self-start">el concierge está pensando…</div>}
           </div>
@@ -255,7 +320,7 @@ export default function ClientConsole() {
   );
 }
 
-function MessageBubble({ item, latest, send, setComposer, supersededDrafts }: { item: LogItem; latest: boolean; send: (value?: string) => Promise<void>; setComposer: (value: string) => void; supersededDrafts: Set<string> }) {
+function MessageBubble({ item, latest, send, setComposer, supersededDrafts, onDecideEffect, decidingEffect }: { item: LogItem; latest: boolean; send: (value?: string, selection?: CandidateSelection) => Promise<void>; setComposer: (value: string) => void; supersededDrafts: Set<string>; onDecideEffect: (effectId: string, decision: string) => void | Promise<void>; decidingEffect: string | null }) {
   if (item.type === "user") {
     return (
       <div className="flex flex-col items-end gap-[3px] self-end max-w-[85%]">
@@ -280,10 +345,12 @@ function MessageBubble({ item, latest, send, setComposer, supersededDrafts }: { 
       <div className="box-border p-[10px_12px] rounded-[12px_12px_12px_2px] bg-[var(--ag-card)] [border:1px_solid_var(--ag-card-border)] text-[12px] leading-[1.55] text-[var(--ag-text)] flex flex-col gap-[7px]">
         {badge && <span className={`box-border self-start px-[8px] py-[2px] rounded-full text-[9px] font-semibold tracking-wide ${badge.cls}`}>{badge.text}</span>}
         {(r.need?.question || r.reply || r.message) && <div>{r.need?.question ?? r.reply ?? r.message}</div>}
-        {r.need?.options?.length ? <div className="flex flex-wrap gap-2" role="group" aria-label={r.need.question}>{r.need.options.map((option, index) => <CandidateButton key={candidateKey(option, index)} option={option} index={index} onSelect={send} />)}</div> : null}
-        {r.answer ? <SlackEvidenceCard answer={r.answer} citations={r.citations ?? []} period={r.period} partial={r.partial} /> : null}
-        {draftWorkflow && slackDraft ? <WorkflowPreviewCard workflow={draftWorkflow} slackDraft={slackDraft} superseded={supersededDrafts.has(slackDraft.draftHash)} onEdit={setComposer} /> : null}
-        {r.workflow ? <WorkflowPreviewCard workflow={r.workflow} /> : null}
+        {r.need?.options?.length ? <div className="flex flex-wrap gap-2" role="group" aria-label={r.need.question}>{r.need.options.map((option, index) => <CandidateButton key={candidateKey(option, index)} option={option} index={index} field={r.need!.field} onSelect={send} />)}</div> : null}
+        {r.projectionLag ? <p role="status" className="text-[10px] text-[var(--ag-text-muted)]">Poniéndome al día: puede que aún no veas lo último.</p> : null}
+        {r.answer ? <SlackEvidenceCard answer={r.answer} citations={r.citations ?? []} period={r.period} partial={r.partial} partialReason={r.partialReason} /> : null}
+        {r.effectGroup ? <EffectGroupCard group={r.effectGroup} onDecide={onDecideEffect} busy={decidingEffect !== null} /> : null}
+        {draftWorkflow && slackDraft && canApprove(r) ? <WorkflowPreviewCard workflow={draftWorkflow} slackDraft={slackDraft} superseded={supersededDrafts.has(slackDraft.draftHash)} onEdit={setComposer} /> : null}
+        {r.workflow && isWorkflowPreview(r.workflow) ? <WorkflowPreviewCard workflow={r.workflow} /> : null}
         {status === "retryable_failure" && r.draft ? <p className="text-[11px] text-amber-300">El borrador se conserva. Corrige la conexión indicada y vuelve a intentarlo cuando Tessera lo permita.</p> : null}
         {status === "unknown_outcome" ? <p className="text-[11px] text-amber-300">Slack puede haber recibido el mensaje. Tessera está conciliando el resultado y no permitirá un reintento ciego.</p> : null}
         {status === "expired" ? <p className="text-[11px] text-[var(--ag-text-secondary)]">Esta conversación expiró. Tu próximo mensaje empezará sin destinos anteriores.</p> : null}
@@ -299,13 +366,41 @@ function candidateLabel(option: Record<string, unknown>, index: number) {
   return `${String(name ?? `Opción ${index + 1}`)}${handle}`;
 }
 
-function candidateKey(option: Record<string, unknown>, index: number) {
-  return String(option.id ?? option.connection_id ?? option.team_id ?? index);
+// KTD21. The identifier is what the server binds; the label is transcript
+// text. Re-resolving a display string against an entity graph is tolerable
+// for Slack, where a wrong answer fails at the provider — and unacceptable
+// once the resolved value decides who receives a paid message. Two people
+// named "Ana Pérez" render the same label and are different human beings.
+function candidateIdentifier(option: Record<string, unknown>): string | null {
+  const id = option.contact_id ?? option.id ?? option.connection_id ?? option.team_id;
+  return typeof id === "string" && id ? id : null;
 }
 
-function CandidateButton({ option, index, onSelect }: { option: Record<string, unknown>; index: number; onSelect: (value?: string) => Promise<void> }) {
+// The version of the record the identifier pointed at when it was offered. It
+// travels with the selection so an edit between offer and approval is a
+// mismatch the server can see rather than a silent substitution.
+function candidateVersion(option: Record<string, unknown>): string | undefined {
+  return typeof option.record_version === "string" ? option.record_version : undefined;
+}
+
+function candidateKey(option: Record<string, unknown>, index: number) {
+  return candidateIdentifier(option) ?? String(index);
+}
+
+export type CandidateSelection = { field: string; optionId: string; label: string; recordVersion?: string };
+
+function CandidateButton({ option, index, field, onSelect }: { option: Record<string, unknown>; index: number; field: string; onSelect: (value?: string, selection?: CandidateSelection) => Promise<void>; }) {
   const label = candidateLabel(option, index);
-  return <button type="button" onClick={() => void onSelect(label)} className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-[var(--ag-card-border)] px-2.5 py-2 text-left text-[11px] text-[var(--ag-text)] hover:border-[var(--ag-purple)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ag-purple)]">
+  const optionId = candidateIdentifier(option);
+  if (!optionId) {
+    // An option the server offered without an identifier cannot be selected,
+    // because there is nothing to bind. Shown, not hidden: a silently missing
+    // option reads as "that person is not in the directory".
+    return <span className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-dashed border-[var(--ag-card-border)] px-2.5 py-2 text-[11px] text-[var(--ag-text-muted)]" title="Esta opción llegó sin identificador y no se puede seleccionar.">
+      <span className="min-w-0 truncate">{label}</span>
+    </span>;
+  }
+  return <button type="button" onClick={() => void onSelect(label, { field, optionId, label, recordVersion: candidateVersion(option) })} className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-[var(--ag-card-border)] px-2.5 py-2 text-left text-[11px] text-[var(--ag-text)] hover:border-[var(--ag-purple)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ag-purple)]">
     {/* Slack avatar URLs are dynamic and cannot be declared in Next Image remotePatterns. */}
     {/* eslint-disable-next-line @next/next/no-img-element */}
     {typeof option.image_url === "string" ? <img src={option.image_url} alt="" className="h-7 w-7 shrink-0 rounded-full object-cover" /> : null}

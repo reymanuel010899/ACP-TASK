@@ -82,17 +82,15 @@ policy, and only a granted/denied boolean ever reaches the brain.
 ## 7. Conversational Slack
 
 The web Concierge supports bounded public-channel and thread reads, exact
-channel posts and thread replies, and one-to-one DMs. Start conservatively:
+channel posts and thread replies, and one-to-one DMs.
+
+Which families an account holds is durable per-tenant state, not configuration.
+Every family lands disabled, so a new account does nothing until an
+administrator turns something on from Integrations — and turning it back off
+takes effect on the next dispatch, with no restart and no deploy:
 
 ```bash
-TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED=true
-TESSERA_SLACK_WRITES_ENABLED=false
-TESSERA_SLACK_DMS_ENABLED=false
-TESSERA_SLACK_EXECUTION_ENABLED=false
-TESSERA_DYNAMIC_EXECUTION_ENABLED=true
 python -m web.concierge --port 8130
-
-TESSERA_DYNAMIC_EXECUTION_ENABLED=true \
 python -m services.workflow_worker.app
 ```
 
@@ -102,11 +100,20 @@ broker services must use their shared configured stores. Configure either
 full natural-language planning. With neither key, the deterministic RuleBrain
 supports the documented common Slack phrases and reports its limitation.
 
-Roll out in this order: reads, channel/thread writes, then DMs. Each flag is
-independent. `slack.channels.list` remains available when conversational reads
-are disabled. Provider execution additionally requires
-`TESSERA_SLACK_EXECUTION_ENABLED=true` and worker execution requires
-`TESSERA_DYNAMIC_EXECUTION_ENABLED=true`.
+Roll out in this order: reads, channel/thread writes, then DMs. Each family is
+independent — disabling one leaves the others dispatching. The same switches
+are enforced at the broker, not only in the orchestrator, so a disabled family
+or a stopped account cannot be worked around by any other caller.
+
+A family disable and an emergency stop both gate writes only. Reconciliation
+reads survive both, because an unknown outcome can only be resolved by reading
+the very API the disable removed; blocking that would strand the family's own
+in-flight effects permanently.
+
+`POST /oauth/control-plane` changes one switch for the caller's own account —
+`{"action": "emergency_stop" | "family" | "sender", ...}` — and `GET` on the
+same path returns current state plus dispatched, prevented, in-progress and
+uncertain counts. The tenant always comes from the session, never the body.
 
 Required bot scopes are `channels:read` for channel discovery,
 `channels:history` for public-channel reads, `chat:write` for posts/replies,

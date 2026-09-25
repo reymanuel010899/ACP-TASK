@@ -2,7 +2,9 @@
 
 
 def reconcile_unknown_action(repository, binding, provider_lookup, now_ts):
-    proposal = repository.get_by_idempotency_key(binding["idempotency_key"])
+    proposal = repository.get_by_idempotency_key(
+        binding["idempotency_key"], tenant_id=binding.get("tenant_id")
+    )
     if proposal is None or proposal.get("status") != "execution_unknown":
         return {"status": "not_unknown"}
     receipt = provider_lookup(binding)
@@ -146,5 +148,6 @@ class WorkflowReconciler(object):
         return self.actions.get_by_idempotency_key(
             "workflow:%s:%s:attempt:%s" % (
                 step["workflow_revision_id"], step["step_id"], step["attempt"]
-            )
+            ),
+            tenant_id=step.get("tenant_id"),
         )

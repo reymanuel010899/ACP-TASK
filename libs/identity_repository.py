@@ -129,6 +129,24 @@ class IdentityRepository(object):
                 )
                 return cur.fetchone()
 
+    def find_user_principals_by_display_name(self, display_name):
+        # type: (str) -> List[dict]
+        """Return active user principals with an exact display-name match."""
+        with self._db.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                      FROM identity.principals
+                     WHERE principal_type = 'user'
+                       AND status = 'active'
+                       AND display_name = %s
+                     ORDER BY created_at
+                    """,
+                    (display_name,),
+                )
+                return list(cur.fetchall())
+
     def principal_exists(self, principal_id):
         # type: (str) -> bool
         """Check if a principal exists."""
@@ -377,6 +395,17 @@ class IdentityRepository(object):
                         "WHERE organization_id = %s ORDER BY joined_at",
                         (organization_id,),
                     )
+                return cur.fetchall()
+
+    def organizations_for_principal(self, principal_id):
+        """Return every persisted organization membership for a principal."""
+        with self._db.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT * FROM identity.organization_members "
+                    "WHERE principal_id = %s ORDER BY joined_at",
+                    (principal_id,),
+                )
                 return cur.fetchall()
 
     def remove_member(self, organization_id, principal_id):

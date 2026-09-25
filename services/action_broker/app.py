@@ -37,6 +37,31 @@ _MAX_RECEIPT_DEPTH = 8
 _MAX_RECEIPT_ITEMS = 1_000
 _MAX_RECEIPT_SERIALIZED_BYTES = 64 * 1_024
 
+#: What a bare ``False`` from a dispatch gate means. Gates that know more than
+#: "no" return a decision carrying a reason instead, and that reason is what
+#: the caller parks the step under.
+DEFAULT_GATE_REASON = "capability rollout is disabled"
+
+
+def _gate_allows(gate):
+    """Whether a dispatch gate said yes, whatever shape it answered in.
+
+    A mapping is read by its ``allowed`` key rather than its truthiness: a
+    non-empty ``{"allowed": false}`` is truthy in Python, and a gate that
+    denies must never be mistaken for one that permits.
+    """
+    if isinstance(gate, Mapping):
+        return bool(gate.get("allowed", True))
+    return bool(gate)
+
+
+def _gate_reason(gate):
+    """The reason a dispatch gate refused, however the gate chose to say it."""
+    reason = getattr(gate, "reason", None)
+    if reason is None and isinstance(gate, Mapping):
+        reason = gate.get("reason")
+    return reason or DEFAULT_GATE_REASON
+
 
 def _safe_receipt(value):
     if is_dataclass(value):
@@ -143,6 +168,7 @@ class ActionBroker(object):
         dispatch_policy=None,
         policy_evaluator=None,
         connection_resolver=None,
+        live_eligibility=None,
     ):
         self.actions = action_repository
         self.sessions = session_repository
@@ -162,10 +188,13 @@ class ActionBroker(object):
         self.dispatch_policy = dispatch_policy or (lambda _binding: True)
         self.policy_evaluator = policy_evaluator
         self.connection_resolver = connection_resolver
+        self.live_eligibility = live_eligibility
 
     REINFORCED_FRESHNESS_SECONDS = 300
 
-    def _reinforced_step_up_failure(self, session_id, proposal_id, approved):
+    def _reinforced_step_up_failure(
+        self, session_id, proposal_id, approved, tenant_id=None,
+    ):
         """Refuse a reinforced approval from a session that went stale.
 
         A session left open all day is still a valid session, which is fine
@@ -175,7 +204,7 @@ class ActionBroker(object):
         """
         if not approved:
             return None
-        proposal = self.actions.get(proposal_id)
+        proposal = self.actions.get(proposal_id, tenant_id=tenant_id)
         if not isinstance(proposal, Mapping) or not proposal.get("reinforced"):
             return None
         if not hasattr(self.sessions, "authentication_attestation"):
@@ -208,8 +237,13 @@ class ActionBroker(object):
         approved = body.get("approved")
         if not isinstance(approved, bool):
             return 422, {"error": "approved must be boolean"}
+        # A human approving from a browser is bound to the account their
+        # session names. Without this the proposal id alone was the whole
+        # authorisation, on the one endpoint where the row being approved
+        # carries a destination and a message body.
+        tenant_id = current.get("tenant_id")
         stale = self._reinforced_step_up_failure(
-            session_id, proposal_id, approved,
+            session_id, proposal_id, approved, tenant_id=tenant_id,
         )
         if stale is not None:
             return stale
@@ -219,6 +253,7 @@ class ActionBroker(object):
             current["principal_id"],
             approved,
             self.clock(),
+            tenant_id=tenant_id,
         )
         if not changed:
             return 409, {"error": "proposal is expired, changed, or already decided"}
@@ -228,8 +263,18 @@ class ActionBroker(object):
         """Execute without ever returning the provider token to the caller."""
         if not self.actions.validate_lease(lease, binding, self.clock()):
             return 403, {"error": "missing, expired, or mismatched capability lease"}
-        if not self.dispatch_policy(binding):
-            return 403, {"error": "capability rollout is disabled"}
+        gate = self.dispatch_policy(binding)
+        if not _gate_allows(gate):
+            # The gate is enforced here, before anything else this method
+            # does, because the orchestrator is the thing an emergency stop
+            # stops: a stop honoured only there is bypassable by any other
+            # caller holding a lease. The reason travels back so the step
+            # parks with a name a later resume can recognise, instead of
+            # collapsing every control-plane denial into one opaque string.
+            return 403, {
+                "error": _gate_reason(gate),
+                "recovery": "contact_admin",
+            }
         capability_id = binding["capability_id"]
         runtime_binding = None
         if self.runtime_registry is not None:
@@ -281,10 +326,19 @@ class ActionBroker(object):
             ):
                 return 403, {"error": "agent identity could not be re-verified"}
             existing = self.actions.get_by_idempotency_key(
-                binding["idempotency_key"]
+                binding["idempotency_key"],
+                tenant_id=binding.get("tenant_id"),
             )
-            if not _binding_matches(existing, binding):
-                return 403, {"error": "action binding does not match proposal"}
+            mismatched = binding_mismatches(existing, binding)
+            if mismatched:
+                logger.warning(
+                    "action binding does not match proposal: %s",
+                    ", ".join(mismatched),
+                )
+                return 403, {
+                    "error": "action binding does not match proposal",
+                    "mismatched_fields": mismatched,
+                }
             if existing["status"] == "completed":
                 if existing.get("broker_response") is not None:
                     return 200, dict(existing["broker_response"])
@@ -311,6 +365,23 @@ class ActionBroker(object):
                 return 403, {
                     "error": "dynamic policy decision is stale or denied"
                 }
+        # Mutable per-recipient facts are deliberately evaluated after stable
+        # policy comparison and immediately before consuming authority. They
+        # never enter the binding decision hash: an opt-out is lawful drift,
+        # not tampering.
+        if side_effecting and self.live_eligibility is not None:
+            eligibility_input = dict(binding)
+            eligibility_input.update(payload)
+            eligibility_input["capability_id"] = capability_id
+            eligibility = self.live_eligibility.evaluate(eligibility_input)
+            if not eligibility.allowed:
+                body = {"error": eligibility.reason, "status": "prevented"}
+                if eligibility.deferred_until is not None:
+                    body.update({
+                        "status": "deferred",
+                        "deferred_until": eligibility.deferred_until,
+                    })
+                return 409, body
         if side_effecting:
             proposal = self.actions.consume_approval(binding, self.clock())
             if proposal is None:
@@ -383,6 +454,22 @@ class ActionBroker(object):
                         "authority_profile", "bot"
                     ),
                     "slack_subject_id": binding.get("slack_subject_id"),
+                    # Providers whose identity is an account rather than an
+                    # installation address that account on every call, so the
+                    # executor is handed it alongside the token it came sealed
+                    # with instead of re-deriving it from the binding.
+                    "provider_account_id": (
+                        getattr(authority, "account_id", None)
+                        or binding.get("provider_account_id")
+                    ),
+                    "account_id": (
+                        getattr(authority, "account_id", None)
+                        or binding.get("provider_account_id")
+                    ),
+                    "tenant_id": binding.get("tenant_id"),
+                    "effect_id": binding.get("step_id"),
+                    "dispatch_key": binding.get("idempotency_key"),
+                    "callback_token": payload.get("callback_token"),
                 }
                 if side_effecting:
                     if proposal is None or not self.actions.mark_dispatched(
@@ -523,9 +610,23 @@ def canonical_hash(payload):
     return canonical_payload_hash(payload)
 
 
-def _binding_matches(proposal, binding):
+def binding_mismatches(proposal, binding):
+    """Which bound fields disagree, by name.
+
+    Eight fields collapsed into one 403 told an operator nothing about which
+    of them moved, and the usual causes — a credential replaced by a
+    reconnect, a retry on a new attempt — are ordinary events with very
+    different answers. Names only: the values are the binding itself.
+    """
     if proposal is None:
-        return False
+        return ["proposal is unknown"]
+    return [
+        field for field in _binding_fields(proposal)
+        if proposal.get(field) != binding.get(field)
+    ]
+
+
+def _binding_fields(proposal):
     fields = (
         "proposal_id",
         "version",
@@ -541,7 +642,11 @@ def _binding_matches(proposal, binding):
             "workflow_revision_id", "step_id", "plan_graph_hash",
             "connection_id", "attempt",
         )
-    return all(proposal.get(field) == binding.get(field) for field in fields)
+    return fields
+
+
+def _binding_matches(proposal, binding):
+    return not binding_mismatches(proposal, binding)
 
 
 def oauth_connection_authorizer(repository, provider="google"):

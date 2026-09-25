@@ -23,9 +23,10 @@ class PolicyEvaluator(object):
 
     #: Dispatch compares a stored decision hash against a freshly computed one,
     #: so any change to what the evaluator considers must change this. Bumped
-    #: when the evaluator became provider-neutral: it now decides for any
-    #: registered provider's definitions, not Google's and Slack's alone.
-    VERSION = "policy-v2"
+    #: to v2 when the evaluator became provider-neutral, and to v3 when the
+    #: provider account a dispatch acts as entered the hash — a decision made
+    #: before that field existed cannot speak to which account it authorised.
+    VERSION = "policy-v3"
 
     def __init__(self, definitions, rollout_version, version=None):
         self.version = version or self.VERSION
@@ -58,6 +59,16 @@ class PolicyEvaluator(object):
             # acts as after the decision was made.
             "authority_profile_id": binding.get("authority_profile_id"),
             "slack_subject_id": binding.get("slack_subject_id"),
+            # Which provider account the effect leaves from. For an account
+            # authority this is the whole identity, so leaving it out would let
+            # an approved effect be redirected to a different account.
+            "provider_account_id": binding.get("provider_account_id"),
+            # Authority this particular effect needs beyond what its capability
+            # needs: the sending identity it leaves from, the destination it
+            # reaches, the template it uses. A capability descriptor cannot
+            # name these — they differ per effect — so the binding carries them
+            # and they are hashed with everything else.
+            "bound_scopes": sorted(set(binding.get("bound_scopes") or ())),
             "capability_id": capability_id,
             "capability_version": capability_version,
             "descriptor_snapshot_hash": binding.get(
@@ -116,6 +127,28 @@ class PolicyEvaluator(object):
             return "personal_authority_denied"
         return None
 
+    @staticmethod
+    def _account_authority_reason(binding, snapshot, live):
+        """An account-token dispatch must say which account it leaves from.
+
+        There is no consenting person to bind to, so the binding's proof of
+        identity is the provider account itself. It has to agree across the
+        binding, the snapshot the decision was made against, and live state,
+        or the effect could leave from an account nobody authorised. An
+        account that is not currently verified holds no authority at all,
+        which is the fail-closed state a provider outage lands in.
+        """
+        account_id = binding.get("provider_account_id")
+        if not account_id:
+            return "account_authority_unbound"
+        if account_id != snapshot.get("provider_account_id"):
+            return "account_authority_mismatch"
+        if account_id != live.get("provider_account_id"):
+            return "account_authority_mismatch"
+        if live.get("account_status") != "verified":
+            return "account_authority_unverified"
+        return None
+
     def _denial_reason(
         self, binding, snapshot, live, definition, profile,
         snapshot_profile, live_profile, effective_scopes, now_ts,
@@ -148,7 +181,7 @@ class PolicyEvaluator(object):
         # visible. This is the boundary the unit requires be explicit.
         if profile == "enterprise_admin":
             return "enterprise_authority_unavailable"
-        if profile not in ("bot", "user"):
+        if profile not in ("bot", "user", "account"):
             return "unsupported_authority_profile"
         # The descriptor decides which authority its executor needs. A search
         # answered with a bot token is a different answer, not a lesser one.
@@ -158,6 +191,10 @@ class PolicyEvaluator(object):
             personal = self._personal_authority_reason(binding)
             if personal is not None:
                 return personal
+        if profile == "account":
+            account = self._account_authority_reason(binding, snapshot, live)
+            if account is not None:
+                return account
         if snapshot.get("health") != "healthy" or live.get("status") != "connected":
             return "connection_unhealthy"
         if snapshot.get("rollout_version") != self.rollout_version:
@@ -191,6 +228,22 @@ class PolicyEvaluator(object):
             return "missing_required_scopes"
         if not definition.required_scopes.issubset(set(effective_scopes)):
             return "missing_required_scopes"
+        bound_scopes = set(binding.get("bound_scopes") or ())
+        if profile == "account" and definition.effect == "write" and not bound_scopes:
+            # An effect that leaves a provider account has to say which
+            # verified identity it leaves from. Nothing else in the binding
+            # says it, and a paid effect from an unnamed sender is exactly the
+            # thing that must not reach a provider.
+            return "bound_authority_missing"
+        if not bound_scopes.issubset(snapshot_scopes) or not bound_scopes.issubset(
+            set(effective_scopes)
+        ):
+            # Distinct from a missing capability scope: the capability is still
+            # granted, but the specific sender, destination or template this
+            # effect was bound to is no longer authority the account holds.
+            # This is the path a disabled sender takes, and it stops only the
+            # effects bound to that sender.
+            return "missing_bound_authority"
         if binding.get("slack_connect") is not False:
             return "slack_connect_denied"
         if binding.get("data_egress") is not False:

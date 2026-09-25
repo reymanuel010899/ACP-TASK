@@ -1,7 +1,8 @@
 ---
 title: "AgentTrust — Database Architecture"
-status: proposed
+status: superseded
 date: 2026-07-22
+superseded_by: docs/architecture/target-architecture.md
 depends_on:
   - schemas/*.schema.json (RFC-0001 core vocabulary)
   - spec/RFC-0001-core-vocabulary.md
@@ -10,6 +11,15 @@ supersedes: "in-memory dict/JSON-file stores in registry/, audit/, vault/, agent
 ---
 
 # AgentTrust — Database Architecture
+
+> **Superseded on 2026-08-26.** This document records the original PostgreSQL
+> proposal and is retained for design history. Its opening current-state claims
+> no longer match the implemented repository. Use
+> [`current-state-inventory.md`](current-state-inventory.md) for implemented
+> storage and [`target-architecture.md`](target-architecture.md) for the
+> authoritative consolidation target. Do not edit previously applied
+> migrations to make them match this proposal; corrections require new forward
+> migrations.
 
 ## 0. Why this document exists
 

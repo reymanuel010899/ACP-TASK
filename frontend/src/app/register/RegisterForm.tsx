@@ -519,8 +519,9 @@ export default function RegisterForm() {
     const sessionKeypair = generateKeypair();
     const sessionPublicKeyB64 = b64encode(sessionKeypair.publicKey);
     const assertion = buildSessionAssertion(id, privateKey, sessionPublicKeyB64);
+    let webSession;
     try {
-      await establishWebSession(assertion);
+      webSession = await establishWebSession(assertion);
     } catch {
       finalizingRef.current = false;
       setErrorMessage("Could not establish a secure session. Please try again.");
@@ -533,6 +534,11 @@ export default function RegisterForm() {
       sessionPublicKey: sessionPublicKeyB64,
       sessionPrivateKey: b64encode(sessionKeypair.privateKey),
       assertion,
+      // Server-owned cutoffs (30 min idle / 12 h absolute), mirroring
+      // LoginForm -- never the assertion's own one-shot 15-minute TTL.
+      absoluteExpiresAt: webSession.expires_at,
+      idleTtlSeconds: webSession.idle_ttl_seconds,
+      lastActivityAt: Math.floor(Date.now() / 1000),
     });
 
     // Best-effort, non-blocking (mirrors LoginForm's KTD8 pattern).

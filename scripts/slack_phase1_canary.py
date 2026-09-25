@@ -19,10 +19,13 @@ Usage::
     scripts/slack_phase1_canary.py --jobs 20 --compare      # chaining study
     scripts/slack_phase1_canary.py --baseline-only          # report, run nothing
 
-Reads are enabled by ``TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED``; message
-jobs additionally need ``TESSERA_SLACK_WRITES_ENABLED``. When writes are off
-the canary still runs its read jobs and says plainly which half it skipped,
-rather than reporting a partial run as a whole one.
+Which halves run is read from the tenant control plane, not from the
+environment: the canary must exercise exactly what the product would do for
+this account, and an environment variable set only in the canary's own shell
+would measure a configuration nobody is running. Read jobs need one of the
+read families enabled; message jobs additionally need ``slack_messaging``.
+When writes are off the canary still runs its read jobs and says plainly
+which half it skipped, rather than reporting a partial run as a whole one.
 """
 
 import argparse
@@ -38,32 +41,37 @@ from agents.orchestrator.conversation_state import ConciergeConversationStore
 from agents.orchestrator.dynamic_workflow_service import DynamicWorkflowService
 from agents.orchestrator.workflow_repository import WorkflowRepository
 from libs.integrations.catalog import provider_definitions
+from libs.integrations.control_plane import build_tenant_control_plane
 from services.oauth.repository import OAuthRepository
 
 TERMINAL_STATES = {"succeeded", "ready", "failed", "retryable_failure",
                    "unknown_outcome", "cancelled", "expired", "closed"}
 
 
-def _flag(name, default="false"):
-    return os.environ.get(name, default).lower() == "true"
+READ_FAMILIES = (
+    "slack_channel_discovery", "slack_conversation_reads",
+    "slack_private_reads",
+)
 
 
 def build_service(workflows):
+    connections = OAuthRepository(
+        os.environ.get("OAUTH_DATABASE", "tessera-oauth.db")
+    )
+    control_plane = build_tenant_control_plane(
+        connections, provider_definitions()
+    )
     return DynamicWorkflowService(
         make_brain(),
         provider_definitions(),
-        OAuthRepository(os.environ.get("OAUTH_DATABASE", "tessera-oauth.db")),
+        connections,
         workflows,
         rollout_version=os.environ.get(
             "TESSERA_CAPABILITY_ROLLOUT_VERSION", "production-v1"
         ),
         shadow_mode=False,
         conversation_store=ConciergeConversationStore(workflows),
-        conversational_reads_enabled=_flag(
-            "TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED"
-        ),
-        slack_writes_enabled=_flag("TESSERA_SLACK_WRITES_ENABLED"),
-        slack_dms_enabled=_flag("TESSERA_SLACK_DMS_ENABLED"),
+        control_plane=control_plane,
     )
 
 
@@ -214,16 +222,21 @@ def main(argv=None):
 
     service = build_service(workflows)
     store = service.conversation_store
-    writes = _flag("TESSERA_SLACK_WRITES_ENABLED")
-    reads = _flag("TESSERA_SLACK_CONVERSATIONAL_READS_ENABLED")
+    families = service.control_plane.family_flags(args.tenant)
+    stopped = service.control_plane.emergency_stop(args.tenant)
+    writes = families.get("slack_messaging") is True
+    reads = any(families.get(name) is True for name in READ_FAMILIES)
 
     print("=== Canary Phase 1 ===")
     print("  tenant=%s  canal=#%s  jobs=%d" % (args.tenant, args.channel, args.jobs))
     print("  lecturas=%s  escrituras=%s" % (reads, writes))
+    if stopped:
+        print("  AVISO: la cuenta esta detenida (parada de emergencia). No se")
+        print("         despacha nada; no hay baseline que medir.")
     if not writes:
-        print("  AVISO: TESSERA_SLACK_WRITES_ENABLED=false — los jobs de mensaje")
-        print("         se omiten. El embudo preview/aprobacion/completado no se")
-        print("         mide, asi que el baseline resultante es parcial.")
+        print("  AVISO: la familia slack_messaging esta apagada — los jobs de")
+        print("         mensaje se omiten. El embudo preview/aprobacion/completado")
+        print("         no se mide, asi que el baseline resultante es parcial.")
 
     read_jobs, message_jobs, chained, composed = [], [], [], []
     for index in range(args.jobs):

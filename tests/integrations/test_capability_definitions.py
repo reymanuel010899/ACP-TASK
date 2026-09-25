@@ -6,17 +6,20 @@ import pytest
 from libs.integrations.catalog import (
     REFRESHED_OAUTH_CREDENTIAL,
     SEALED_TOKEN_DOCUMENT_CREDENTIAL,
+    STATIC_ACCOUNT_CREDENTIAL,
     CapabilityUnavailable,
     ConnectionCapabilitySnapshot,
     ExternalAgentOffer,
     ProviderRuntime,
     ProviderRuntimeRegistry,
     TrustedCapabilityDefinition,
+    contacts_definitions,
     credential_strategy_for,
     google_definitions,
     provider_definitions,
     registered_providers,
     slack_definitions,
+    twilio_definitions,
 )
 
 
@@ -228,10 +231,19 @@ def test_slack_capabilities_declare_allowlisted_output_fields():
 
 def test_every_provider_is_registered_in_exactly_one_place():
     """A composition site asks the registry, never a hardcoded pair."""
-    assert set(registered_providers()) == {"google", "slack"}
-    assert provider_definitions() == google_definitions() + slack_definitions()
+    # "contacts" is first-party and has no external service behind it, but it
+    # is registered here like any other provider: the registry is what makes a
+    # capability executable, and carving an exception into it would grow a
+    # second authority join.
+    assert set(registered_providers()) == {"google", "slack", "contacts", "twilio"}
+    assert provider_definitions() == (
+        google_definitions() + slack_definitions() + contacts_definitions()
+        + twilio_definitions()
+    )
+    assert provider_definitions("contacts") == contacts_definitions()
     assert provider_definitions("slack") == slack_definitions()
     assert provider_definitions("google") == google_definitions()
+    assert provider_definitions("twilio") == twilio_definitions()
     assert {
         definition.provider for definition in provider_definitions()
     } == set(registered_providers())
@@ -239,14 +251,15 @@ def test_every_provider_is_registered_in_exactly_one_place():
 
 def test_an_unregistered_provider_yields_nothing_rather_than_a_default():
     with pytest.raises(CapabilityUnavailable):
-        provider_definitions("twilio")
+        provider_definitions("unregistered")
     with pytest.raises(CapabilityUnavailable):
-        credential_strategy_for("twilio")
+        credential_strategy_for("unregistered")
 
 
 def test_a_providers_credential_shape_is_declared_not_branched_on():
     assert credential_strategy_for("google") is REFRESHED_OAUTH_CREDENTIAL
     assert credential_strategy_for("slack") is SEALED_TOKEN_DOCUMENT_CREDENTIAL
+    assert credential_strategy_for("twilio") is STATIC_ACCOUNT_CREDENTIAL
 
 
 def test_a_sealed_document_is_read_as_authority_without_a_refresh_exchange():

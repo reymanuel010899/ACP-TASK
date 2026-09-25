@@ -125,6 +125,16 @@ class PlanCompiler(object):
             safe_input, step_disclosures = self._authorize_data_flow(
                 step.input, definition.provider, step.step_id
             )
+            if definition.provider == "twilio" and definition.effect == "write":
+                referenced = {
+                    path[0] for path, _reference in
+                    _references_with_paths(safe_input) if path
+                }
+                protected = set(definition.preview_fields)
+                if referenced.intersection(protected):
+                    raise PlanRejected(
+                        "Twilio write preview fields must be literal"
+                    )
             disclosures.extend(step_disclosures)
             try:
                 jsonschema.validate(

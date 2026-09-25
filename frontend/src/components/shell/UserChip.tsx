@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useSession } from "@/lib/SessionProvider";
+import { readStoredCsrfToken, revokeWebSession } from "@/lib/agentSession";
 
 /**
  * Truncates a base64 principal id for display on the new-device / no-username
@@ -24,9 +25,18 @@ export default function UserChip() {
   const displayName = session?.username || displayPrincipalId(principalId);
 
   function handleLogout() {
-    // Client-only: sessions are stateless, self-expiring assertions with no
-    // server-side revocation endpoint in this design, so "logging out" is
-    // just discarding the local session and sending the user back to /login.
+    // Revoke server-side too, not just locally. The session cookie now
+    // outlives this tab by up to 12 hours (`services/session/app.py`), so
+    // dropping only the local record would leave a live, usable session
+    // behind on the machine -- exactly what someone clicking "Log out"
+    // means to prevent. Captured before `clearSession()`, which wipes the
+    // CSRF token this call needs.
+    const csrfToken = readStoredCsrfToken();
+    if (csrfToken) {
+      // Deliberately not awaited: a failed revocation must never trap the
+      // user in a signed-in UI. The local session goes regardless.
+      void revokeWebSession(csrfToken).catch(() => {});
+    }
     clearSession();
     router.replace("/login");
   }

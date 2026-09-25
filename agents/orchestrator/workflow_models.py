@@ -12,7 +12,58 @@ _SLACK_PROVIDER_ID = re.compile(
 _AUTHORITY_FIELD_MARKERS = (
     "approval", "capability", "connection", "credential", "provider_id",
     "scope", "token", "team_id", "channel_id", "user_id", "message_ts",
+    # Destination-shaped field names. A slot the model *names* for a
+    # destination is refused before its value is even looked at, because the
+    # only lawful way one of these is filled is from a resolver output that
+    # the server binds — never from a slot the model proposed.
+    "phone", "msisdn", "e164", "destination", "recipient", "address",
+    "contact_id", "branch_id", "list_id", "tag_id", "segment_id",
+    "campaign_id",
 )
+
+#: Namespaces a model may name an operation in. Membership here buys nothing
+#: on its own — the operation still has to exist in the trusted catalog — it
+#: only bounds what is worth looking up.
+TRUSTED_OPERATION_NAMESPACES = ("slack.", "contacts.")
+
+#: Identifier namespaces that are always resolver output. A model that emits
+#: one has either guessed or replayed something it saw; both must fail here
+#: rather than at a store that would happily accept a well-formed identifier.
+_RESOLVED_IDENTIFIER = re.compile(
+    r"^(?:contact|address|branch|list|tag|segment|campaign):",
+    re.IGNORECASE,
+)
+#: A channel-qualified destination, the form Twilio and WhatsApp both use.
+_CHANNEL_DESTINATION = re.compile(
+    r"^(?:whatsapp|sms|mms|tel|voice|fax|sip):", re.IGNORECASE,
+)
+#: One mailbox and nothing else. Anchored, so a Slack handle (``@maria``) and
+#: a message body that happens to mention an address both pass untouched — the
+#: rule is about a scalar that *is* a destination, not one that contains one.
+_MAILBOX = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+_DIALLING_SEPARATORS = " \t-(). ‐‑‒–—"
+
+
+def _looks_like_a_telephone_number(value):
+    """Whether this scalar is a dialable number rather than prose.
+
+    Anchored on the whole value on purpose. A draft that says "llámame al
+    +34600111222" is a message body and must still reach Slack; a slot whose
+    entire value is those digits is a destination and must not reach anything.
+
+    Two thresholds, because the leading plus is itself a claim: with it, seven
+    digits is already an international number. Without it, nine is the point
+    below which ordinary scalars — years, quantities, a compacted ISO date —
+    stop being distinguishable from a national subscriber number.
+    """
+    text = str(value).strip()
+    plus = text.startswith("+")
+    digits = text[1:] if plus else text
+    for separator in _DIALLING_SEPARATORS:
+        digits = digits.replace(separator, "")
+    if not digits.isdigit():
+        return False
+    return len(digits) >= (7 if plus else 9) and len(digits) <= 15
 
 
 def _authority_free_name(value):
@@ -23,10 +74,30 @@ def _authority_free_name(value):
 
 
 def _authority_free_scalar(value):
+    """Refuse every scalar a model could turn into a destination.
+
+    The original rule covered provider identifiers, where invention fails
+    harmlessly: a hallucinated Slack channel id matches nothing and the
+    provider says so. A hallucinated telephone number is different in kind —
+    it is syntactically valid, it belongs to somebody, the message arrives,
+    and it is billed. So the identifiers that address a person are refused
+    here on the same footing, leaving a resolver output as the only path from
+    natural language to a destination.
+    """
     if isinstance(value, str):
         normalized = value.strip()
-        if not normalized or _SLACK_PROVIDER_ID.match(normalized.lstrip("#@")):
+        if not normalized:
             raise ValueError("Slack provider identifiers are not model input")
+        if _SLACK_PROVIDER_ID.match(normalized.lstrip("#@")):
+            raise ValueError("Slack provider identifiers are not model input")
+        if _RESOLVED_IDENTIFIER.match(normalized):
+            raise ValueError("resolved identifiers are not model input")
+        if (
+            _CHANNEL_DESTINATION.match(normalized)
+            or _MAILBOX.match(normalized)
+            or _looks_like_a_telephone_number(normalized)
+        ):
+            raise ValueError("destinations are not model input")
         return normalized
     return value
 
@@ -44,8 +115,8 @@ class SlackOperationCandidate(BaseModel):
     @classmethod
     def validate_operation_id(cls, value):
         value = str(value or "").strip()
-        if not value.startswith("slack."):
-            raise ValueError("operation_id must use the Slack namespace")
+        if not value.startswith(TRUSTED_OPERATION_NAMESPACES):
+            raise ValueError("operation_id must use a trusted namespace")
         return value
 
 

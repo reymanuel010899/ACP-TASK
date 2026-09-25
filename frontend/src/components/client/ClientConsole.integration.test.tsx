@@ -8,14 +8,14 @@ import ClientConsole from "./ClientConsole";
 
 afterEach(() => {
   cleanup();
-  sessionStorage.clear();
+  sessionStorage.clear(); localStorage.clear();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 it("carries a grounded clarification into one exact tenant-bound approval", async () => {
   HTMLElement.prototype.scrollTo = vi.fn();
-  sessionStorage.setItem("tessera-csrf", "csrf-test");
+  localStorage.setItem("tessera-csrf", "csrf-test");
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(Response.json({
       state: "needs_input", conversationId: "conversation:e2e",

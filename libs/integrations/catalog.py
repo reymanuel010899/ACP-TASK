@@ -14,6 +14,16 @@ class CapabilityUnavailable(Exception):
     """A descriptor or live connection snapshot is not executable."""
 
 
+#: Which authority a dispatch acts as.
+#:
+#: ``bot`` acts as the installation, ``user`` as one person who consented,
+#: ``enterprise_admin`` as an org-wide administrator. ``account`` acts as the
+#: tenant's provider account itself: there is no consenting person and no
+#: installation, only an account identifier and an auth token whose authority
+#: is whatever the account has been verified to hold.
+AUTHORITY_PROFILES = ("bot", "user", "enterprise_admin", "account")
+
+
 @dataclass(frozen=True)
 class TrustedCapabilityDefinition:
     capability_id: str
@@ -43,7 +53,7 @@ class TrustedCapabilityDefinition:
             raise ValueError("effect must be read or write")
         if self.effect == "write" and not self.preview_fields:
             raise ValueError("write capabilities require preview fields")
-        if self.authority_profile not in ("bot", "user", "enterprise_admin"):
+        if self.authority_profile not in AUTHORITY_PROFILES:
             raise ValueError("unsupported authority profile")
 
 
@@ -53,6 +63,16 @@ class ConnectionCapabilitySnapshot:
     tenant_id: str
     capability_id: str
     capability_version: str
+    #: Custody generation of the sealed secret, counted from one.
+    #:
+    #: It answers exactly one question: is the secret this binding was made
+    #: against still the secret the connection holds? It therefore moves only
+    #: when the secret material is replaced — an OAuth refresh rotation, or an
+    #: operator re-sealing a manually rotated static credential after changing
+    #: it in the provider's console. It deliberately does not move when
+    #: authority changes, because authority lives in ``effective_scopes``:
+    #: bumping it to express a lawful narrowing would fail every queued effect
+    #: on the whole connection with a tampering-shaped reason.
     credential_version: int
     effective_scopes: FrozenSet[str]
     health: str
@@ -85,12 +105,176 @@ class ExternalAgentOffer:
     capability_version: str
 
 
+#: Dimensions a synthetic scope can name besides a capability family. A
+#: sending identity, a destination geography, and an approved message template
+#: are the three things a provider verifies independently of any consent.
+SENDER_DIMENSION = "sender"
+GEO_DIMENSION = "geo"
+TEMPLATE_DIMENSION = "template"
+#: The branch of the contacts tree an effect is allowed to touch. Unlike the
+#: three above it names authority inside our own store rather than at a
+#: provider, which is exactly why it is a scope and not a bespoke check: a
+#: branch the requester may not view is then absent from the connection's
+#: effective scopes, and every subset test already on the dispatch path
+#: refuses the effect without knowing what a branch is.
+BRANCH_DIMENSION = "branch"
+
+#: An account is authority-bearing only while it is verified. ``unavailable``
+#: is the fail-closed state: the account could not be checked, so it holds no
+#: authority rather than its last known authority.
+ACCOUNT_STATUSES = ("verified", "unverified", "suspended", "unavailable")
+
+
+def synthetic_scope(provider, dimension, value):
+    """Name one unit of authority a provider with no scope system still has.
+
+    The whole authority spine is scope-shaped — both the policy evaluator and
+    the runtime registry decide by asking whether a definition's required
+    scopes are a subset of the connection's effective scopes — so a provider
+    that issues no scopes cannot express authority at all until its authority
+    is given scope shape. These are that shape: namespaced, flat strings that
+    travel through the existing checks untouched.
+    """
+    parts = (provider, dimension, value)
+    if not all(isinstance(part, str) and part for part in parts):
+        raise ValueError("a synthetic scope needs provider, dimension and value")
+    if any(":" in part for part in parts[:2]):
+        raise ValueError("provider and dimension must not contain a separator")
+    return "%s:%s:%s" % parts
+
+
+@dataclass(frozen=True)
+class VerifiedSender:
+    """One sending identity the provider has verified for this account."""
+
+    sender_id: str
+    family: str
+    countries: FrozenSet[str] = frozenset()
+    #: Enablement is authority, not visibility. A disabled sender contributes
+    #: no scope at all, which is what makes disabling one expressible as the
+    #: removal of a single scope.
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class VerifiedAccountState:
+    """What a provider account verifiably holds, at one moment in time.
+
+    Read from the account, never from a consent callback, because a provider
+    authenticated by an account identifier and an auth token has no callback.
+    It is read at connection time and again on every re-verification, since
+    account state moves without anyone visiting a browser.
+    """
+
+    provider: str
+    account_id: str
+    status: str = "unavailable"
+    #: ``family:action`` pairs the account may perform, e.g. ``sms:send``.
+    families: FrozenSet[str] = frozenset()
+    senders: Tuple[VerifiedSender, ...] = ()
+    templates: FrozenSet[str] = frozenset()
+
+    def __post_init__(self):
+        if not self.provider or not self.account_id:
+            raise ValueError("a verified account needs a provider and an id")
+        if self.status not in ACCOUNT_STATUSES:
+            raise ValueError("unsupported provider account status")
+        for family in self.families:
+            name, separator, action = family.partition(":")
+            if not name or not separator or not action:
+                raise ValueError("a family must be named family:action")
+
+
+def account_state(value):
+    """Build verified account state from a connector's plain mapping.
+
+    Connectors stay free of catalog types; the catalog stays the only place
+    that decides what counts as verified authority.
+    """
+    if isinstance(value, VerifiedAccountState):
+        return value
+    if not isinstance(value, Mapping):
+        raise CapabilityUnavailable("verified account state is required")
+    senders = []
+    for sender in value.get("senders") or ():
+        if isinstance(sender, VerifiedSender):
+            senders.append(sender)
+            continue
+        if not isinstance(sender, Mapping):
+            raise CapabilityUnavailable("verified account state is malformed")
+        senders.append(VerifiedSender(
+            sender_id=sender.get("sender_id"),
+            family=sender.get("family"),
+            countries=frozenset(sender.get("countries") or ()),
+            enabled=bool(sender.get("enabled", True)),
+        ))
+    try:
+        return VerifiedAccountState(
+            provider=value["provider"],
+            account_id=value["account_id"],
+            status=value.get("status", "unavailable"),
+            families=frozenset(value.get("families") or ()),
+            senders=tuple(senders),
+            templates=frozenset(value.get("templates") or ()),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CapabilityUnavailable(
+            "verified account state is malformed"
+        ) from exc
+
+
+def derive_synthetic_scopes(state):
+    """Turn verified account state into the scopes that account may use.
+
+    Fails closed in both directions. An account that is not verified derives
+    nothing, so an unreachable provider account cannot dispatch. A disabled
+    sender derives nothing, so disabling one sender removes exactly one sender
+    scope — every in-flight binding naming it stops passing the subset check
+    that already guards dispatch, while bindings naming a different sender on
+    the same connection are untouched.
+    """
+    state = account_state(state)
+    if state.status != "verified":
+        return frozenset()
+    scopes = set()
+    live_families = set()
+    for family in state.families:
+        name, _separator, action = family.partition(":")
+        live_families.add(name)
+        scopes.add(synthetic_scope(state.provider, name, action))
+    for sender in state.senders:
+        if not sender.enabled:
+            continue
+        # A sender whose family is not live carries no authority: enabling the
+        # number and enabling the family are separate acts, and the narrower
+        # one wins.
+        if sender.family not in live_families:
+            continue
+        scopes.add(
+            synthetic_scope(state.provider, SENDER_DIMENSION, sender.sender_id)
+        )
+        for country in sender.countries:
+            scopes.add(
+                synthetic_scope(state.provider, GEO_DIMENSION, country)
+            )
+    for template in state.templates:
+        scopes.add(
+            synthetic_scope(state.provider, TEMPLATE_DIMENSION, template)
+        )
+    return frozenset(scopes)
+
+
 @dataclass(frozen=True)
 class ProviderAuthority:
     """Short-lived authority to act at one provider, plus what it may do."""
 
     access_token: str
     granted_scopes: FrozenSet[str] = frozenset()
+    #: Which provider account the token belongs to, for providers whose
+    #: identity is the account rather than an installation or a person. The
+    #: executor needs it to address the right account, and the policy
+    #: evaluator binds it so a dispatch cannot swap accounts after approval.
+    account_id: Optional[str] = None
 
 
 class CredentialStrategy(object):
@@ -153,8 +337,86 @@ class SealedTokenDocumentCredential(CredentialStrategy):
         )
 
 
+class StaticAccountCredential(CredentialStrategy):
+    """An account identifier plus a long-lived auth token, sealed together.
+
+    Nothing is exchanged and nothing is refreshed: the sealed document is both
+    the identity and the secret. The scopes it carries are the synthetic ones
+    derived from the account's verified state at connection or re-verification
+    time, not anything a consent screen returned — which is why re-verifying
+    an account is what changes authority here, and why the credential version
+    stays put while it does.
+    """
+
+    name = "static_account"
+
+    def authority(self, secret, connector=None):
+        del connector  # There is no exchange to make and no token to refresh.
+        try:
+            document = json.loads(secret.decode("utf-8"))
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise PermissionError(
+                "sealed credential document is invalid"
+            ) from exc
+        if not isinstance(document, dict):
+            raise PermissionError("sealed credential document is invalid")
+        account_id = document.get("account_id")
+        auth_token = document.get("auth_token")
+        if not isinstance(account_id, str) or not account_id:
+            raise PermissionError("provider account identity is unavailable")
+        if not isinstance(auth_token, str) or not auth_token:
+            raise PermissionError("provider access authority is unavailable")
+        return ProviderAuthority(
+            access_token=auth_token,
+            granted_scopes=frozenset(document.get("granted_scopes") or ()),
+            account_id=account_id,
+        )
+
+
+class FirstPartyStoreCredential(CredentialStrategy):
+    """There is no provider, so there is no provider authority to mint.
+
+    A first-party store is reached in-process through a tenant-bound
+    repository whose row-level security is the authority. Nothing is sealed,
+    nothing is exchanged, and nothing may be handed to an outbound HTTP path.
+    Refusing here rather than returning an empty token is deliberate: if a
+    contacts capability ever reaches the external dispatch path, the correct
+    outcome is a loud failure, not a request carrying a blank credential.
+    """
+
+    name = "first_party_store"
+
+    def authority(self, secret, connector=None):
+        del secret, connector
+        raise PermissionError(
+            "a first-party store issues no provider authority"
+        )
+
+
 REFRESHED_OAUTH_CREDENTIAL = RefreshedOAuthCredential()
 SEALED_TOKEN_DOCUMENT_CREDENTIAL = SealedTokenDocumentCredential()
+STATIC_ACCOUNT_CREDENTIAL = StaticAccountCredential()
+FIRST_PARTY_STORE_CREDENTIAL = FirstPartyStoreCredential()
+
+
+class FirstPartyStore(object):
+    """Stands where an external connector would, and refuses to act as one.
+
+    ``ProviderRuntime`` requires a connector, because every provider so far
+    has had one. This one exists to make the absence explicit rather than to
+    supply a ``None`` that some later branch would have to special-case.
+    """
+
+    provider = None
+
+    def __init__(self, provider):
+        self.provider = provider
+
+    def refresh(self, *args, **kwargs):
+        del args, kwargs
+        raise PermissionError(
+            "a first-party store has no credential to refresh"
+        )
 
 
 @dataclass(frozen=True)
@@ -534,6 +796,519 @@ def slack_definitions():
     ) for capability_id, (scope, effect, preview, verifier) in matrix.items())
 
 
+#: The first-party contacts directory. Not a provider in the sense the other
+#: two are -- there is no external service, no installation, and no consent
+#: screen -- but it must be one here, because every executable capability in
+#: this codebase is reached through the same registry, and carving an
+#: exception into that registry is how the authority join grows a second
+#: implementation.
+CONTACTS_PROVIDER = "contacts"
+TWILIO_PROVIDER = "twilio"
+
+
+def twilio_definitions():
+    address = {"type": "string", "pattern": r"^\+?[1-9][0-9]{7,14}$"}
+    common = {
+        "contact_id": {"type": "string", "minLength": 1},
+        "contact_version": {"type": "string", "minLength": 1},
+        "address_id": {"type": "string", "minLength": 1},
+        "to": address,
+        "from": address,
+        "status_callback": {"type": "string", "pattern": "^https://"},
+        "purpose": {"type": "string", "minLength": 1},
+    }
+    schemas = {
+        "twilio.voice.call": {
+            "type": "object",
+            "required": ["contact_id", "contact_version", "address_id", "to", "from",
+                         "status_callback", "twiml_url", "purpose", "definition_hash",
+                         "maximum_duration_seconds", "ring_timeout_seconds", "recording"],
+            "properties": dict(common,
+                twiml_url={"type": "string", "pattern": "^https://"},
+                definition_hash={"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                maximum_duration_seconds={"type": "integer", "minimum": 15, "maximum": 7200},
+                ring_timeout_seconds={"type": "integer", "minimum": 5, "maximum": 600},
+                recording={"type": "boolean"},
+            ), "additionalProperties": False,
+        },
+        "twilio.sms.send": {
+            "type": "object", "required": list(common) + ["body"],
+            "properties": dict(common, body={"type": "string", "minLength": 1, "maxLength": 1600}),
+            "additionalProperties": False,
+        },
+        "twilio.whatsapp.freeform.send": {
+            "type": "object", "required": list(common) + ["body"],
+            "properties": dict(common, body={"type": "string", "minLength": 1, "maxLength": 4096}),
+            "additionalProperties": False,
+        },
+        "twilio.whatsapp.template.send": {
+            "type": "object", "required": list(common) + ["content_sid", "content_variables", "template_category"],
+            "properties": dict(common,
+                content_sid={"type": "string", "pattern": "^HX[0-9a-fA-F]{32}$"},
+                content_variables={"type": "object", "additionalProperties": {"type": "string"}},
+                template_category={"type": "string", "enum": ["marketing", "utility", "authentication"]},
+            ), "additionalProperties": False,
+        },
+    }
+    required_scope = {
+        "twilio.voice.call": "twilio:voice:call",
+        "twilio.sms.send": "twilio:sms:send",
+        "twilio.whatsapp.freeform.send": "twilio:whatsapp:freeform",
+        "twilio.whatsapp.template.send": "twilio:whatsapp:template",
+    }
+    definitions = []
+    for capability_id, schema in schemas.items():
+        definitions.append(TrustedCapabilityDefinition(
+            capability_id=capability_id, version="1.0.0", provider=TWILIO_PROVIDER,
+            input_schema=schema,
+            output_schema={
+                "type": "object", "required": ["provider", "capability_id", "provider_id", "status"],
+                "properties": {
+                    "provider": {"const": "twilio"},
+                    "capability_id": {"const": capability_id},
+                    "provider_id": {"type": "string"}, "status": {"type": "string"},
+                }, "additionalProperties": False,
+            },
+            required_scopes=frozenset({required_scope[capability_id]}),
+            effect="write", risk="high", retry_policy="reconcile",
+            preview_fields=(
+                "contact_id", "contact_version", "to", "from", "definition_hash",
+                "maximum_duration_seconds", "recording",
+            ) if capability_id == "twilio.voice.call" else (
+                "contact_id", "contact_version", "to", "from", "body"
+            ) if "body" in schema["properties"] else (
+                "contact_id", "contact_version", "to", "from",
+                "content_sid", "content_variables",
+            ),
+            verifier="twilio.delivery", authority_profile="account",
+        ))
+    return tuple(definitions)
+
+#: Families the contacts store verifiably holds for every bound tenant. They
+#: exist for the same reason Twilio's do: the authority spine is scope-shaped,
+#: so an authority that issues no scopes cannot be expressed until it is given
+#: scope shape (KTD2). Reads and writes are separate families so an account
+#: can hold the read surface without the propose surface.
+CONTACTS_FAMILIES = (
+    "directory:read",
+    "grouping:read",
+    "consent:read",
+    "activity:read",
+    "audience:preview",
+    "proposal:write",
+    "grouping:write",
+)
+
+#: A first-party connection has no sealed secret, so it has no custody
+#: generation to count. It is pinned at one rather than left at zero because
+#: ``resolve`` and the policy evaluator both refuse a non-positive credential
+#: version, and because a value that never moves is the honest description:
+#: there is no secret whose replacement could move it.
+FIRST_PARTY_CREDENTIAL_VERSION = 1
+
+#: Identifier shapes the contacts capabilities accept. They are patterns, not
+#: prose, because this is the second half of the guard in
+#: ``agents/orchestrator/workflow_models.py``: that one stops a model emitting
+#: a destination, and this one stops anything that is not a resolver output
+#: from reaching an input named for one. A phone number does not match any of
+#: these, so it cannot enter through a slot that was meant to hold an id.
+_ULID = "[0-9A-HJKMNP-TV-Z]{26}"
+CONTACT_ID_PATTERN = "^contact:%s$" % _ULID
+BRANCH_ID_PATTERN = "^branch:%s$" % _ULID
+ADDRESS_ID_PATTERN = "^address:%s$" % _ULID
+LIST_ID_PATTERN = "^list:%s$" % _ULID
+TAG_ID_PATTERN = "^tag:%s$" % _ULID
+SEGMENT_ID_PATTERN = "^segment:%s$" % _ULID
+#: A server-issued handle on text the requester typed, minted where the turn
+#: is received. A proposal names one of these instead of an address, so the
+#: only path from natural language to a destination runs through a capture the
+#: model never saw and cannot invent.
+ADDRESS_CAPTURE_PATTERN = "^capture:%s$" % _ULID
+
+
+def contacts_account_state(tenant_id, families=CONTACTS_FAMILIES):
+    """What the contacts store verifiably holds for one bound tenant.
+
+    Bound is the whole condition. There is no provider to ask, so the fact
+    being verified is that a tenant was resolved at all -- which is precisely
+    the failure KTD11 names, where an unmapped principal silently lands in a
+    local tenant. Here an unbound principal derives an account that is not
+    verified, an unverified account derives no scopes, and no scopes means no
+    contacts capability resolves.
+    """
+    bound = isinstance(tenant_id, str) and bool(tenant_id.strip())
+    return VerifiedAccountState(
+        provider=CONTACTS_PROVIDER,
+        account_id=tenant_id if bound else "unbound",
+        status="verified" if bound else "unavailable",
+        families=frozenset(families or ()),
+    )
+
+
+def contacts_scopes(tenant_id, branch_ids=(), families=CONTACTS_FAMILIES):
+    """Derive one tenant's contacts authority, families plus branches.
+
+    The family scopes come out of U3's derivation untouched. The branch scopes
+    are composed on top rather than folded into ``VerifiedAccountState``,
+    because a branch is not a sending identity, a geography, or a template,
+    and widening that dataclass to hold a fourth unrelated dimension would
+    make Twilio's verified state carry a field it can never populate.
+    """
+    scopes = set(derive_synthetic_scopes(contacts_account_state(
+        tenant_id, families,
+    )))
+    if not scopes:
+        # An unbound tenant holds nothing at all, so it cannot hold branches
+        # either. Adding them here would hand out exactly the authority the
+        # unverified account was refused.
+        return frozenset()
+    for branch_id in branch_ids or ():
+        scopes.add(
+            synthetic_scope(CONTACTS_PROVIDER, BRANCH_DIMENSION, branch_id)
+        )
+    return frozenset(scopes)
+
+
+def first_party_connection_id(provider, tenant_id):
+    return "first-party:%s:%s" % (provider, tenant_id)
+
+
+def first_party_connection_snapshot(
+    tenant_id, capability_id, capability_version, rollout_version,
+    branch_ids=(), families=CONTACTS_FAMILIES, provider=CONTACTS_PROVIDER,
+):
+    """Mint the connection a first-party store does not have.
+
+    ``ProviderRuntimeRegistry.resolve`` demands a connection identifier, a
+    positive credential version, effective scopes, health, and a matching
+    rollout -- every one of which describes an external integration the
+    contacts directory does not have. Declaring the operations ``local`` is
+    not an escape, because a local operation may not declare a capability
+    recipe and therefore may not execute anything.
+
+    So the connection is synthesised, per tenant, from what is actually
+    verifiable about a first-party store: which tenant is bound, which
+    branches that tenant's requester may act on, and the fact that there is no
+    secret to have rotated. It travels through every existing check unchanged.
+    """
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        raise CapabilityUnavailable("a bound tenant is required")
+    scopes = contacts_scopes(tenant_id, branch_ids, families)
+    if not scopes:
+        raise CapabilityUnavailable("first-party account holds no authority")
+    return ConnectionCapabilitySnapshot(
+        connection_id=first_party_connection_id(provider, tenant_id),
+        tenant_id=tenant_id,
+        capability_id=capability_id,
+        capability_version=capability_version,
+        credential_version=FIRST_PARTY_CREDENTIAL_VERSION,
+        effective_scopes=scopes,
+        health="healthy",
+        rollout_version=rollout_version,
+    )
+
+
+def contacts_definitions():
+    """The read and propose surface, carved by entity kind and verb.
+
+    There is no ``contacts.create`` and no ``contacts.update``. An agent-side
+    mutation is one capability per mutation class that always lands in the
+    review queue, rather than a pair of "with approval" and "without approval"
+    variants of every verb -- which is how a surface acquires a path that
+    skips the human by construction. The two organizational writes are the
+    stated exception: adding someone to a list and applying a tag are
+    reversible, carry no consent semantics, and reach nobody.
+    """
+    contact_id = {"type": "string", "pattern": CONTACT_ID_PATTERN}
+    branch_id = {"type": "string", "pattern": BRANCH_ID_PATTERN}
+    list_id = {"type": "string", "pattern": LIST_ID_PATTERN}
+    tag_id = {"type": "string", "pattern": TAG_ID_PATTERN}
+    segment_id = {"type": "string", "pattern": SEGMENT_ID_PATTERN}
+    channel = {"type": "string", "enum": ["sms", "whatsapp", "voice", "email"]}
+    purpose = {
+        "type": "string",
+        "enum": [
+            "marketing", "utility", "authentication", "transactional",
+            "service",
+        ],
+    }
+    query = {"type": "string", "minLength": 1, "maxLength": 200}
+    limit = {"type": "integer", "minimum": 1, "maximum": 200}
+
+    masked_destination = {
+        "type": "object",
+        "required": ["channel", "text", "fingerprint"],
+        "properties": {
+            "channel": {"type": "string"},
+            "text": {"type": "string"},
+            "country_code": {"type": ["string", "null"]},
+            "digit_count": {"type": ["integer", "null"]},
+            "visible_tail": {"type": ["string", "null"]},
+            "fingerprint": {"type": "string"},
+            "branch_path": {"type": ["string", "null"]},
+            "last_contacted_at": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    candidate = {
+        "type": "object",
+        "required": [
+            "contact_id", "record_version", "display_name", "branch_path",
+            "destinations", "consent", "effect_ready",
+        ],
+        "properties": {
+            "contact_id": {"type": "string"},
+            "record_version": {"type": "string"},
+            "display_name": {"type": "string"},
+            "branch_path": {"type": ["string", "null"]},
+            "destinations": {"type": "array", "items": masked_destination},
+            "consent": {"type": "object"},
+            "effect_ready": {"type": "boolean"},
+            "matched_by": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    receipt = {
+        "type": "object",
+        "required": ["provider", "capability_id", "proposal_id", "state"],
+        "properties": {
+            "provider": {"type": "string", "const": CONTACTS_PROVIDER},
+            "capability_id": {"type": "string"},
+            "proposal_id": {"type": "string"},
+            "state": {"type": "string"},
+            "contact_id": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    grouping_receipt = {
+        "type": "object",
+        "required": ["provider", "capability_id", "contact_id", "grouping_id"],
+        "properties": {
+            "provider": {"type": "string", "const": CONTACTS_PROVIDER},
+            "capability_id": {"type": "string"},
+            "contact_id": {"type": "string"},
+            "grouping_id": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+
+    def obj(properties, required=()):
+        return {
+            "type": "object",
+            "required": list(required),
+            "properties": dict(properties),
+            "additionalProperties": False,
+        }
+
+    matrix = (
+        (
+            "contacts.search", "directory:read", "read",
+            obj({"query": query, "limit": limit}, ("query",)),
+            obj(
+                {
+                    "candidates": {"type": "array", "items": candidate},
+                    "partial": {"type": "boolean"},
+                },
+                ("candidates", "partial"),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.resolve", "directory:read", "read",
+            obj(
+                {"query": query, "channel": channel, "purpose": purpose},
+                ("query",),
+            ),
+            obj(
+                {
+                    "outcome": {"type": "string"},
+                    "candidates": {"type": "array", "items": candidate},
+                    "matched_by": {"type": ["string", "null"]},
+                    "reason": {"type": ["string", "null"]},
+                },
+                ("outcome", "candidates", "matched_by", "reason"),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.get", "directory:read", "read",
+            obj({"contact_id": contact_id}, ("contact_id",)),
+            obj({"candidate": candidate}, ("candidate",)),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.tree.read", "directory:read", "read",
+            obj({"branch_id": branch_id}, ()),
+            obj(
+                {
+                    "branches": {"type": "array", "items": {"type": "object"}},
+                    "partial": {"type": "boolean"},
+                },
+                ("branches", "partial"),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.list.members", "grouping:read", "read",
+            obj({"list_id": list_id}, ("list_id",)),
+            obj(
+                {
+                    "candidates": {"type": "array", "items": candidate},
+                    "partial": {"type": "boolean"},
+                },
+                ("candidates", "partial"),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.consent.read", "consent:read", "read",
+            obj(
+                {"contact_id": contact_id, "channel": channel},
+                ("contact_id", "channel"),
+            ),
+            obj({"axes": {"type": "array", "items": {"type": "object"}}},
+                ("axes",)),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.activity.read", "activity:read", "read",
+            obj({"contact_id": contact_id, "limit": limit}, ("contact_id",)),
+            obj(
+                {
+                    "events": {"type": "array", "items": {"type": "object"}},
+                    "partial": {"type": "boolean"},
+                },
+                ("events", "partial"),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.segment.preview", "audience:preview", "read",
+            obj(
+                {
+                    "segment_id": segment_id,
+                    "channel": channel,
+                    "purpose": purpose,
+                },
+                ("segment_id", "channel", "purpose"),
+            ),
+            obj(
+                {
+                    "total": {"type": "integer"},
+                    "eligible": {"type": "integer"},
+                    "excluded": {"type": "integer"},
+                    "exclusion_reasons": {"type": "object"},
+                    "redacted": {"type": "boolean"},
+                },
+                (
+                    "total", "eligible", "excluded", "exclusion_reasons",
+                    "redacted",
+                ),
+            ),
+            (), None, "low", "safe",
+        ),
+        (
+            "contacts.propose", "proposal:write", "write",
+            obj(
+                {
+                    "display_name": {
+                        "type": "string", "minLength": 1, "maxLength": 200,
+                    },
+                    "primary_branch_id": branch_id,
+                    "channel": channel,
+                    "address_capture_ref": {
+                        "type": "string", "pattern": ADDRESS_CAPTURE_PATTERN,
+                    },
+                    "note": {"type": "string", "maxLength": 500},
+                },
+                (
+                    "display_name", "primary_branch_id", "channel",
+                    "address_capture_ref",
+                ),
+            ),
+            receipt,
+            (
+                "display_name", "primary_branch_id", "channel",
+                "address_capture_ref",
+            ),
+            "contacts.proposal", "medium", "reconcile",
+        ),
+        (
+            "contacts.update.propose", "proposal:write", "write",
+            obj(
+                {
+                    "contact_id": contact_id,
+                    "record_version": {
+                        "type": "string", "minLength": 8, "maxLength": 64,
+                    },
+                    "changes": {"type": "object"},
+                },
+                ("contact_id", "record_version", "changes"),
+            ),
+            receipt,
+            ("contact_id", "record_version", "changes"),
+            "contacts.proposal", "medium", "reconcile",
+        ),
+        (
+            "contacts.list.add", "grouping:write", "write",
+            obj(
+                {"list_id": list_id, "contact_id": contact_id},
+                ("list_id", "contact_id"),
+            ),
+            grouping_receipt,
+            ("list_id", "contact_id"),
+            "contacts.grouping", "low", "idempotent",
+        ),
+        (
+            "contacts.tag.apply", "grouping:write", "write",
+            obj(
+                {"tag_id": tag_id, "contact_id": contact_id},
+                ("tag_id", "contact_id"),
+            ),
+            grouping_receipt,
+            ("tag_id", "contact_id"),
+            "contacts.grouping", "low", "idempotent",
+        ),
+    )
+    definitions = []
+    for (
+        capability_id, family, effect, input_schema, output_schema,
+        preview_fields, verifier, risk, retry_policy,
+    ) in matrix:
+        name, _separator, action = family.partition(":")
+        definitions.append(TrustedCapabilityDefinition(
+            capability_id=capability_id,
+            version="1.0.0",
+            provider=CONTACTS_PROVIDER,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            required_scopes=frozenset({
+                synthetic_scope(CONTACTS_PROVIDER, name, action)
+            }),
+            effect=effect,
+            risk=risk,
+            retry_policy=retry_policy,
+            preview_fields=preview_fields,
+            verifier=verifier,
+            # There is no consenting person and no installation, only the
+            # tenant's own account -- the same shape U3 introduced for a
+            # provider authenticated by an account rather than by a grant.
+            authority_profile="account",
+        ))
+    return tuple(definitions)
+
+
+def build_contacts_runtime(executor, connector=None):
+    """Register the contacts store as a provider runtime like any other."""
+    return ProviderRuntime(
+        provider=CONTACTS_PROVIDER,
+        connector=connector or FirstPartyStore(CONTACTS_PROVIDER),
+        executor=executor,
+        definitions=contacts_definitions(),
+        credential_strategy=FIRST_PARTY_STORE_CREDENTIAL,
+    )
+
+
 @dataclass(frozen=True)
 class ProviderRegistration:
     """Everything provider-specific that is not a secret, in one place.
@@ -564,6 +1339,20 @@ PROVIDER_REGISTRATIONS = (
         # document is the authority rather than a way of getting one.
         credential_strategy=SEALED_TOKEN_DOCUMENT_CREDENTIAL,
         manifest_version="slack.operations.v1",
+    ),
+    ProviderRegistration(
+        provider=CONTACTS_PROVIDER,
+        definitions=contacts_definitions,
+        # No secret, so nothing to exchange and nothing to refresh. Asking for
+        # provider authority here is an error rather than a no-op.
+        credential_strategy=FIRST_PARTY_STORE_CREDENTIAL,
+        manifest_version="contacts.operations.v1",
+    ),
+    ProviderRegistration(
+        provider=TWILIO_PROVIDER,
+        definitions=twilio_definitions,
+        credential_strategy=STATIC_ACCOUNT_CREDENTIAL,
+        manifest_version="twilio.operations.v1",
     ),
 )
 

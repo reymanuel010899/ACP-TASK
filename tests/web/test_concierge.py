@@ -1,14 +1,485 @@
+import http.client
+import json
+import threading
+
+import pytest
+
+from libs.tenancy import UnmappedPrincipalError
+from libs.contacts_repository import record_version
+from libs.contacts_import import StaleContactRecord
 from web.concierge import (
+    _contact_branch_tree, _make_handler,
     _classified_recovery, _conversation_response, _is_slack_turn,
-    _slack_turn_text, _tenant_resolver, _turn_response,
+    _request_tenant, _slack_turn_text, _tenant_resolver, _turn_response,
 )
 
 
-def test_explicit_local_tenant_fallback_survives_principal_rotation(monkeypatch):
+class _Directory:
+    def children(self, tenant_id, parent_branch_id=None):
+        assert tenant_id == "org:local"
+        rows = {
+            None: [{"branch_id": "branch:root", "parent_branch_id": None,
+                    "name": "General", "path": "/general",
+                    "kind": "organization", "depth": 0}],
+            "branch:root": [{"branch_id": "branch:clients",
+                              "parent_branch_id": "branch:root",
+                              "name": "Clientes", "path": "/general/clientes",
+                              "kind": "folder", "depth": 1}],
+            "branch:clients": [],
+        }
+        return rows[parent_branch_id]
+
+    def contacts_in_branch(self, tenant_id, branch_id):
+        assert tenant_id == "org:local"
+        return [{
+            "contact_id": "contact:1", "display_name": "Rey Ferreras",
+            "given_name": "Rey", "family_name": "Ferreras",
+            "company_name": "Tessera", "job_title": "AI Engineer",
+            "status": "active", "source": "manual",
+        }] if branch_id == "branch:clients" else []
+
+    def addresses(self, tenant_id, contact_id):
+        assert tenant_id == "org:local"
+        assert contact_id == "contact:1"
+        return []
+
+
+def test_contact_branch_tree_is_tenant_bound_and_browser_safe():
+    tree = _contact_branch_tree(_Directory(), "org:local")
+
+    assert tree == [{
+        "branchId": "branch:root", "parentBranchId": None,
+        "name": "General", "path": "/general", "kind": "organization",
+        "depth": 0, "contactCount": 0,
+        "children": [{
+            "branchId": "branch:clients", "parentBranchId": "branch:root",
+            "name": "Clientes", "path": "/general/clientes", "kind": "folder",
+            "depth": 1, "contactCount": 1, "children": [],
+        }],
+    }]
+    assert "tenant" not in str(tree).lower()
+
+
+class _ContactSessions:
+    def __init__(self, principal_id="principal:margo"):
+        self.principal_id = principal_id
+
+    def resolve(self, session_id, _now):
+        if session_id == "valid-session":
+            return {"principal_id": self.principal_id}
+        return None
+
+    def csrf_matches(self, session_id, token):
+        return session_id == "valid-session" and token == "valid-csrf"
+
+
+class _WritableDirectory(_Directory):
+    def __init__(self):
+        self.created = []
+
+    def children(self, tenant_id, parent_branch_id=None):
+        assert tenant_id == "org:local"
+        return []
+
+    def create_branch(
+        self, tenant_id, name, kind, parent_branch_id=None, slug=None,
+        owner_principal_id=None,
+    ):
+        self.created.append((
+            tenant_id, name, kind, parent_branch_id, slug, owner_principal_id,
+        ))
+        return {
+            "branch_id": "branch:new", "parent_branch_id": parent_branch_id,
+            "name": name, "slug": slug or "general",
+            "path": "/%s" % (slug or "general"), "kind": kind, "depth": 0,
+        }
+
+
+def _contacts_request(
+    method, path, directory, body=None, csrf=None, cookie=True, permissions=None,
+    contact_directory=None, principal_id="principal:margo",
+):
+    handler = _make_handler(
+        None, "rule", "http://runner.invalid",
+        session_repository=_ContactSessions(principal_id), contacts_repository=directory,
+        contacts_permissions=permissions,
+        contact_directory=contact_directory,
+        tenant_resolver=lambda principal_id: "org:local",
+    )
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(*server.server_address)
+        headers = {"Content-Type": "application/json"}
+        if cookie:
+            headers["Cookie"] = "tessera_session=valid-session"
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
+        connection.request(
+            method, path, body=json.dumps(body).encode() if body else None,
+            headers=headers,
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class _ContactDirectoryWriter:
+    def __init__(self):
+        self.created = []
+        self.updated = []
+
+    def create_contact(self, tenant_id, actor, branch_id, display_name, **values):
+        self.created.append((tenant_id, actor.principal_id, branch_id, display_name, values))
+        return {"contact_id": "contact:new", "address_id": "address:new"}
+
+    def update_contact(
+        self, tenant_id, actor, contact_id, record_version, changes,
+    ):
+        self.updated.append((
+            tenant_id, actor.principal_id, contact_id, record_version, changes,
+        ))
+        return {"contact_id": contact_id, "record_version": "version:new"}
+
+
+def test_manual_contact_endpoint_creates_inside_the_selected_branch():
+    writer = _ContactDirectoryWriter()
+    status, payload = _contacts_request(
+        "POST", "/contacts", _Directory(), csrf="valid-csrf",
+        contact_directory=writer,
+        body={
+            "branchId": "branch:clients",
+            "values": {"displayName": "Ana", "givenName": "Ana"},
+            "channel": "sms",
+            "address": "+15165550100",
+        },
+    )
+
+    assert status == 201
+    assert payload == {"contactId": "contact:new", "addressId": "address:new"}
+    assert writer.created[0][:4] == (
+        "org:local", "principal:margo", "branch:clients", "Ana",
+    )
+
+
+def test_contact_edit_endpoint_updates_identity_with_the_read_version():
+    writer = _ContactDirectoryWriter()
+    status, payload = _contacts_request(
+        "PATCH", "/contacts/contact%3A1", _Directory(), csrf="valid-csrf",
+        contact_directory=writer,
+        body={
+            "recordVersion": "version:read",
+            "values": {
+                "displayName": "Rey M. Ferreras",
+                "givenName": "Rey",
+                "familyName": "Ferreras",
+                "companyName": "Tessera",
+                "jobTitle": "AI Lead",
+            },
+        },
+    )
+
+    assert status == 200
+    assert payload == {
+        "contactId": "contact:1", "recordVersion": "version:new",
+    }
+    assert writer.updated == [(
+        "org:local", "principal:margo", "contact:1", "version:read",
+        {
+            "display_name": "Rey M. Ferreras",
+            "given_name": "Rey",
+            "family_name": "Ferreras",
+            "company_name": "Tessera",
+            "job_title": "AI Lead",
+        },
+    )]
+
+
+def test_contact_edit_requires_csrf_before_calling_the_directory():
+    writer = _ContactDirectoryWriter()
+    status, payload = _contacts_request(
+        "PATCH", "/contacts/contact%3A1", _Directory(),
+        contact_directory=writer,
+        body={"recordVersion": "version:read", "values": {"displayName": "Rey"}},
+    )
+
+    assert status == 403
+    assert payload == {"error": "invalid CSRF token"}
+    assert writer.updated == []
+
+
+def test_stale_contact_edit_is_a_conflict_that_requires_a_fresh_read():
+    class StaleWriter(_ContactDirectoryWriter):
+        def update_contact(self, *args, **kwargs):
+            raise StaleContactRecord()
+
+    status, payload = _contacts_request(
+        "PATCH", "/contacts/contact%3A1", _Directory(), csrf="valid-csrf",
+        contact_directory=StaleWriter(),
+        body={"recordVersion": "version:old", "values": {"displayName": "Rey"}},
+    )
+
+    assert status == 409
+    assert "Vuelve a abrirlo" in payload["error"]
+
+
+def test_manual_contact_endpoint_converts_local_consent_time_to_utc():
+    writer = _ContactDirectoryWriter()
+    status, _payload = _contacts_request(
+        "POST", "/contacts", _Directory(), csrf="valid-csrf",
+        contact_directory=writer,
+        body={
+            "branchId": "branch:clients",
+            "values": {"displayName": "Ana"},
+            "channel": "sms",
+            "address": "+15165550100",
+            "consent": {
+                "purposes": ["service"],
+                "evidence": {
+                    "captureMethod": "verbal_recorded",
+                    "capturedAtLocal": "2026-08-08T12:25",
+                    "captureTimezone": "America/New_York",
+                    "jurisdiction": "US",
+                    "disclosureText": "Autorizo mensajes de servicio.",
+                    "legalBasis": "consent",
+                    "defaultUnchecked": True,
+                },
+            },
+        },
+    )
+
+    assert status == 201
+    consent = writer.created[0][4]["consent"]
+    assert consent["captured_at"].isoformat() == "2026-08-08T16:25:00+00:00"
+    assert consent["captured_at_local"] == "2026-08-08T12:25"
+
+
+def test_contacts_branches_require_a_session_and_return_the_tenant_tree():
+    assert _contacts_request("GET", "/contacts/branches", _Directory(), cookie=False) == (
+        401, {"error": "authentication required"},
+    )
+    status, payload = _contacts_request("GET", "/contacts/branches", _Directory())
+    assert status == 200
+    assert payload["branches"][0]["branchId"] == "branch:root"
+
+
+def test_creating_a_branch_requires_csrf_and_uses_the_session_tenant():
+    directory = _WritableDirectory()
+    assert _contacts_request(
+        "POST", "/contacts/branches", directory,
+        body={"name": "General", "kind": "organization"},
+    ) == (403, {"error": "invalid CSRF token"})
+
+    status, payload = _contacts_request(
+        "POST", "/contacts/branches", directory,
+        body={"name": "General", "kind": "organization"}, csrf="valid-csrf",
+    )
+    assert status == 201
+    assert payload["branch"]["branchId"] == "branch:new"
+    assert directory.created[0][:4] == (
+        "org:local", "General", "organization", None,
+    )
+    assert directory.created[0][4].startswith("general-")
+    assert directory.created[0][5] == "principal:margo"
+
+
+class _PersonalDirectories:
+    def __init__(self):
+        self.roots = []
+
+    def children(self, tenant_id, parent_branch_id=None):
+        assert tenant_id == "org:local"
+        if parent_branch_id is not None:
+            return []
+        return list(self.roots)
+
+    def create_branch(
+        self, tenant_id, name, kind, parent_branch_id=None, slug=None,
+        owner_principal_id=None,
+    ):
+        branch = {
+            "branch_id": "branch:%s" % (len(self.roots) + 1),
+            "parent_branch_id": parent_branch_id,
+            "name": name,
+            "slug": slug,
+            "path": "/%s" % slug,
+            "kind": kind,
+            "depth": 0,
+            "owner_principal_id": owner_principal_id,
+        }
+        self.roots.append(branch)
+        return branch
+
+
+class _PersonalDirectoryPermissions:
+    def __init__(self):
+        self.decisions = []
+
+    def decisions_on_branch(self, tenant_id, branch_id):
+        return [
+            row for row in self.decisions
+            if row["tenant_id"] == tenant_id and row["branch_id"] == branch_id
+        ]
+
+    def grant(
+        self, tenant_id, branch_id, principal_id, dimension, _actor, reason=None,
+    ):
+        self.decisions.append({
+            "tenant_id": tenant_id,
+            "branch_id": branch_id,
+            "principal_id": principal_id,
+            "dimension": dimension,
+            "effect": "grant",
+            "reason": reason,
+        })
+
+
+def test_two_users_can_create_personal_roots_with_the_same_visible_name():
+    directory = _PersonalDirectories()
+    permissions = _PersonalDirectoryPermissions()
+
+    first = _contacts_request(
+        "POST", "/contacts/branches", directory,
+        body={"name": "Contactos", "kind": "organization"},
+        csrf="valid-csrf", permissions=permissions,
+        principal_id="principal:margo",
+    )
+    second = _contacts_request(
+        "POST", "/contacts/branches", directory,
+        body={"name": "Contactos", "kind": "organization"},
+        csrf="valid-csrf", permissions=permissions,
+        principal_id="principal:lucia",
+    )
+
+    assert first[0] == 201
+    assert second[0] == 201
+    assert first[1]["branch"]["path"] == "/contactos"
+    assert second[1]["branch"]["path"] == "/contactos"
+    assert [root["name"] for root in directory.roots] == ["Contactos", "Contactos"]
+    assert len({root["slug"] for root in directory.roots}) == 2
+
+
+def test_one_user_cannot_accidentally_create_a_second_personal_root():
+    directory = _PersonalDirectories()
+    permissions = _PersonalDirectoryPermissions()
+    request = dict(
+        method="POST", path="/contacts/branches", directory=directory,
+        body={"name": "Contactos", "kind": "organization"},
+        csrf="valid-csrf", permissions=permissions,
+        principal_id="principal:margo",
+    )
+
+    assert _contacts_request(**request)[0] == 201
+    assert _contacts_request(**request) == (
+        409, {"error": "a personal directory root already exists"},
+    )
+
+
+class _DeniedBranchAdministration:
+    def require(self, tenant_id, principal_id, branch_id, dimension):
+        from libs.contacts_permissions import PermissionDenied
+        raise PermissionDenied(dimension)
+
+
+class _AllowedBranchView:
+    def require(self, tenant_id, principal_id, branch_id, dimension):
+        return True
+
+    def authorized_branches(self, tenant_id, principal_id, dimension):
+        return []
+
+    def effective(self, tenant_id, principal_id, branch_id):
+        return {"edit": True}
+
+
+def test_another_users_hidden_root_looks_like_an_empty_personal_directory():
+    status, payload = _contacts_request(
+        "GET", "/contacts/branches", _Directory(),
+        permissions=_AllowedBranchView(),
+    )
+
+    assert status == 200
+    assert payload == {"branches": []}
+
+
+def test_contacts_table_endpoint_lists_only_the_named_visible_branch():
+    status, payload = _contacts_request(
+        "GET", "/contacts?branchId=branch%3Aclients", _Directory(),
+        permissions=_AllowedBranchView(),
+    )
+
+    assert status == 200
+    contact = _Directory().contacts_in_branch(
+        "org:local", "branch:clients"
+    )[0]
+    assert payload == {"contacts": [{
+        "contactId": "contact:1", "displayName": "Rey Ferreras",
+        "givenName": "Rey", "familyName": "Ferreras",
+        "companyName": "Tessera", "jobTitle": "AI Engineer",
+        "status": "active", "source": "manual",
+        "recordVersion": record_version(contact, []),
+        "canEdit": True,
+    }]}
+
+
+def test_creating_a_subbranch_requires_inherited_administration_permission():
+    directory = _WritableDirectory()
+    status, payload = _contacts_request(
+        "POST", "/contacts/branches", directory,
+        body={"name": "Clientes", "kind": "folder", "parentBranchId": "branch:root"},
+        csrf="valid-csrf", permissions=_DeniedBranchAdministration(),
+    )
+
+    assert status == 403
+    assert payload == {"error": "branch administration permission required"}
+    assert directory.created == []
+
+
+def test_a_rotated_principal_no_longer_inherits_the_local_tenant(monkeypatch):
+    """The inverse of what this asserted until U5.
+
+    It used to prove that a principal absent from the configured mapping
+    still resolved -- to `TESSERA_LOCAL_TENANT_ID`. That was the behaviour
+    that made a rotated identifier keep working, and it is the same behaviour
+    that would hand the local tenant's contact directory to any principal
+    nobody had mapped (KTD11). Rotation now has to be configured, and an
+    unmapped principal is refused.
+    """
     monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
     monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
 
+    with pytest.raises(UnmappedPrincipalError):
+        _tenant_resolver()("new-principal")
+
+
+def test_the_local_tenant_is_reached_by_being_mapped_like_any_other(monkeypatch):
+    monkeypatch.setenv(
+        "TESSERA_PRINCIPAL_TENANTS_JSON", '{"new-principal": "org:local"}',
+    )
+    monkeypatch.delenv("TESSERA_LOCAL_TENANT_ID", raising=False)
+
     assert _tenant_resolver()("new-principal") == "org:local"
+
+
+def test_an_unmapped_principal_reaches_the_handlers_no_tenant_branch(monkeypatch):
+    """Refused, and refused in the shape the caller cannot learn from.
+
+    Every call site guards on a falsy tenant and answers not-found. Letting
+    the exception escape instead would surface as a 500, which is its own
+    signal, and letting it through as a tenant would be the leak.
+    """
+    monkeypatch.setenv("TESSERA_PRINCIPAL_TENANTS_JSON", "{}")
+    monkeypatch.setenv("TESSERA_LOCAL_TENANT_ID", "org:local")
+    resolver = _tenant_resolver()
+
+    assert _request_tenant(resolver, {"principal_id": "new-principal"}) is None
+    assert _request_tenant(
+        None, {"principal_id": "p", "tenant_id": "org:acme"},
+    ) == "org:acme"
 
 
 def test_natural_channel_message_is_routed_to_typed_slack_conversation():

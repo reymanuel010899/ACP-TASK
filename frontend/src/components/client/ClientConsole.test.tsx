@@ -67,6 +67,21 @@ describe("ClientConsole inactivity", () => {
     expect(screen.getByText("Coordinar entrevista")).toBeVisible();
   });
 
+  it("survives a bare workflow handle for a run already in flight", async () => {
+    // `_start_slack_entity_resolution` and `_conversation_response` both send
+    // `workflow` as {workflowId, revisionId} with no steps -- rendering that as
+    // a preview crashed the whole console on `workflow.steps.map`.
+    vi.stubGlobal("fetch", vi.fn(async () => ({ json: async () => ({
+      state: "retrieving", conversationId: "conversation:9", reply: "Buscando el canal…",
+      workflow: { workflowId: "w2", revisionId: "r2" },
+    }) })));
+    render(<ClientConsole />); fireEvent.click(screen.getByLabelText("Open concierge"));
+    fireEvent.change(screen.getByPlaceholderText("¿Qué necesitas?"), { target: { value: "¿qué dijo María?" } });
+    await act(async () => { fireEvent.click(screen.getByText("Send")); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByText("Buscando el canal…")).toBeVisible();
+    expect(screen.queryByLabelText("Workflow preview")).not.toBeInTheDocument();
+  });
+
   it("keeps the conversation id across clarification turns and offers accessible candidates", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({

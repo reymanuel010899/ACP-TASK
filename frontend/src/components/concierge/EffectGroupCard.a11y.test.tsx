@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { axe } from "vitest-axe";
 import * as matchers from "vitest-axe/matchers";
 
+
 import EffectGroupCard, { type EffectGroup } from "./EffectGroupCard";
 
 expect.extend(matchers);

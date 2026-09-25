@@ -11,11 +11,15 @@ export default function SlackEvidenceCard({
   citations,
   period,
   partial = false,
+  partialReason,
 }: {
   answer: string;
   citations: SlackCitation[];
   period?: { oldest?: string; latest?: string; label?: string };
   partial?: boolean;
+  // Why the review stopped short. A partial answer that will not say why is
+  // indistinguishable from a complete one that happens to be thin.
+  partialReason?: string;
 }) {
   return (
     <section aria-label="Slack answer" className="min-w-0 text-[12px] text-[var(--ag-text)]">
@@ -27,7 +31,7 @@ export default function SlackEvidenceCard({
       ) : null}
       {partial ? (
         <p role="status" className="mt-2 text-[10px] text-amber-300">
-          Resultados parciales: Slack o el límite de seguridad acotó la revisión.
+          Resultados parciales: {partialReason ?? "Slack o el límite de seguridad acotó la revisión."}
         </p>
       ) : null}
       {citations.length ? (

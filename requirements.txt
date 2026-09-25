@@ -7,4 +7,5 @@ psycopg[binary,pool]
 redis
 anthropic
 pydantic
+websockets>=15,<16
 treessera @ git+https://github.com/reymanuel010899/treessera-python.git@701bd59

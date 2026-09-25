@@ -106,6 +106,7 @@ Run: ``python -m registry.app --port 8090 [--verification-url URL]
 import argparse
 import hmac
 import json
+import os
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
@@ -163,6 +164,7 @@ class RegistryService(object):
         app_registry=None,
         audit_url=None,
         require_signatures=False,
+        default_organization_id=None,
     ):
         # type: (IndexStore, Optional[object], Optional[str], Optional[str], float, Optional[UserIndex], Optional[AgentIndex], Optional[AppRegistry], Optional[str], bool) -> None
         self.index = index
@@ -175,6 +177,7 @@ class RegistryService(object):
         self.admin_token = admin_token
         self.http_timeout = http_timeout
         self.user_index = user_index if user_index is not None else UserIndex()
+        self.default_organization_id = default_organization_id
         self.agent_index = (
             agent_index if agent_index is not None else AgentIndex()
         )
@@ -582,9 +585,10 @@ class RegistryService(object):
             return 422, {"error": "'public_key' must be a string if provided"}
 
         # Create user
-        user = self.user_index.create_user(
-            principal_id, username=username, public_key=public_key
-        )
+        registration = {"username": username, "public_key": public_key}
+        if self.default_organization_id:
+            registration["home_organization_id"] = self.default_organization_id
+        user = self.user_index.create_user(principal_id, **registration)
         reputation = self.user_index.get_aggregated_reputation(principal_id)
 
         self.audit_client.log(principal_id, "principal.register")
@@ -620,6 +624,23 @@ class RegistryService(object):
             "principal_id": principal_id,
             "reputation": reputation,
             "user": user,
+        }
+
+    def resolve_username(self, username):
+        # type: (Optional[str]) -> Tuple[int, dict]
+        """Resolve an exact username to the principal needed for keyring login."""
+        if not isinstance(username, str) or not username:
+            return 400, {"error": "missing 'username' query parameter"}
+        users = self.user_index.find_users_by_username(username)
+        if not users:
+            return 404, {"error": "username not found"}
+        if len(users) > 1:
+            return 409, {
+                "error": "username is ambiguous; sign in with principal_id"
+            }
+        return 200, {
+            "username": username,
+            "principal_id": users[0]["principal_id"],
         }
 
     def get_user(self, principal_id):
@@ -941,6 +962,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
             service_type = query.get("type", [None])[0]
             status, body = self.service.list_services(service_type)
             self._send_json(status, body)
+        elif segments == ["auth", "resolve"]:
+            query = parse_qs(parts.query)
+            username = query.get("username", [None])[0]
+            status, body = self.service.resolve_username(username)
+            self._send_json(status, body)
         elif len(segments) == 2 and segments[0] == "apps":
             # GET /apps/{app_id} — P2P endpoint discovery (U6)
             status, body = self.service.get_registered_app(segments[1])
@@ -1120,6 +1146,7 @@ def main(argv=None):
         user_index=user_index,
         audit_url=args.audit_url,
         require_signatures=args.require_signatures,
+        default_organization_id=os.environ.get("TESSERA_LOCAL_TENANT_ID"),
     )
     rate_limiter = None
     if args.rate_limit > 0:

@@ -131,7 +131,12 @@ def test_a_confirmed_unknown_write_reconciles_to_completed_with_one_provider_cre
     assert workflows.get_step_receipt(
         revision_id, "send", "org:acme"
     )["provider_id"] == "1700.1"
-    assert actions.get("proposal:%s:send" % revision_id)["status"] == "completed"
+    # Reading the proposal now names the account that owns it: the row holds
+    # the resolved destination and the message body, so a proposal id alone
+    # is no longer enough to read one back.
+    assert actions.get(
+        "proposal:%s:send" % revision_id, tenant_id="org:acme"
+    )["status"] == "completed"
     assert slack.created == ["Hola"]
 
 
